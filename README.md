@@ -17,7 +17,16 @@ See [how it compares to GPT4All, Khoj, Basic Memory, and others](#comparison-to-
 The long-horizon goal is larger: a private, trust-weighted alternative to the feed — your knowledge
 enriched by what the people you trust have found, with provenance at every hop. The foundation for
 that is built in from day one: content-addressed documents, per-chunk provenance, and stores as
-first-class shareable units. See [VISION.md](VISION.md).
+first-class shareable units. **Start with the [project vision](docs/vision.md)** — the whole picture
+in plain language.
+
+Whatever the scale — a personal knowledge base, an AI agent's memory served back over MCP (see
+[docs/agent-memory.md](docs/agent-memory.md)), or a document collection running to millions of pages
+— your data stays on your machine, and you decide what, if anything, ever leaves it.
+
+localdb also continues a long-running thread: its author previously built and ran
+[ipfs-search.com](https://github.com/ipfs-search) — open-source, decentralized search for the IPFS
+network — for seven years.
 
 **Status:** hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS
@@ -69,6 +78,14 @@ not there yet.
    Use the absolute path — MCP clients spawn the binary directly, without your shell's PATH, so a
    bare `localdb` often fails to launch. See [docs/mcp.md](docs/mcp.md) for other clients and the
    remote/HTTP setup.
+
+   Optionally, install the [localdb agent skill](skills/localdb/SKILL.md) — a crib sheet that
+   teaches any skill-capable agent (Claude Code, Cursor, Codex, …) the CLI, citation shape, and MCP
+   tools:
+
+   ```bash
+   npx skills add dokterbob/localdb
+   ```
 
 ---
 
@@ -131,7 +148,7 @@ behind, ahead, or predates the migration framework (exit 2) rather than silently
 | [specs/04-search-pipeline.md](specs/04-search-pipeline.md) | Ingestion, chunking, embeddings, BM25+dense RRF                                           |
 | [specs/05-surfaces.md](specs/05-surfaces.md)               | CLI command tree, REST API, MCP tools, error taxonomy                                     |
 | [specs/06-roadmap.md](specs/06-roadmap.md)                 | Phase ordering, federation, packaging                                                     |
-| [VISION.md](VISION.md)                                     | Long-horizon direction: peer-to-peer store sharing                                        |
+| [docs/vision.md](docs/vision.md)                           | Long-horizon direction: the plain-language project vision                                 |
 | [skills/localdb/SKILL.md](skills/localdb/SKILL.md)         | Agent skill definition for localdb-aware AI assistants                                    |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                         | Development setup, test gates, contribution guidelines                                    |
 

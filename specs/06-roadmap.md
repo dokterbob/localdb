@@ -1,6 +1,6 @@
 # Spec 06 — Roadmap & Federation Direction
 
-> Status: accepted draft, 2026-06-10. Phases are ordered; dates are deliberately absent. Everything
+> Status: accepted draft, 2026-09-06. Phases are ordered; dates are deliberately absent. Everything
 > beyond Phase 1 is direction, revisable as usage teaches us.
 
 ## 1. Phase ordering
@@ -18,19 +18,87 @@
 Note: Phase 4 (Message connectors) from the old roadmap is now split: the framework is Phase 1.5
 (current), individual connectors are Phase 2.
 
-Also tracked but unscheduled: entities/graph layer (metadata-only entities first; graph extraction
-only after baseline retrieval quality is proven).
+The formerly unscheduled entities/graph layer is now scheduled — see §2 (mid-term).
 
-## 2. Federation requirements (summary of [VISION.md](../VISION.md))
+## 2. Capability roadmap (near / mid / long-term)
 
-When Phase 6 opens, the design must satisfy:
+Orthogonal to the phase ordering above: the capability pillars the project grows along. Each is
+stress-tested against two workload classes — large heterogeneous document collections
+(public-records corpora, scanned archives, thousands of books) and agent-memory workloads (a
+persistent knowledge layer an AI agent reads and, eventually, writes). Every pillar has a tracking
+issue carrying the research and open design questions.
 
-- **Credential/capability propagation with direct connections.** Shares carry store references +
-  introductions; the recipient obtains its own credential from each store's **origin** and connects
-  directly. **No content relay through intermediaries** — an offline friend must never break access
-  to a third party's store.
+**Near-term**
+
+- **First-class OCR** (#344) — scanned PDFs and images become indexable instead of being rejected by
+  `is_scanned_pdf()`; candidate paths range from `pdf_oxide`'s dormant `ocr` feature through
+  platform OCR (Apple Vision) to an owned PP-OCRv5 ONNX pipeline on the runtime infrastructure
+  `embed` already ships.
+- **Store sharing: federated access between localdb servers** (#345) — a user grants other localdb
+  instances direct, credentialed access to stores they host; later, stores-of-stores as curated
+  _reference_ lists (pointers plus introductions, never relayed content). This pulls the Phase 5
+  direction into a scoped ticket; the §3 requirements below constrain the design. This is access
+  federation, **not** import/export — backup/export/import remains a separate later item (§6).
+- **Identical and near-identical document grouping** (#346) — exact grouping via content hash
+  (builds on #95), "soft dedup" of re-scans/re-OCRs/redaction variants via vector proximity.
+- **Agent / second-brain memory over MCP** — the read side works today and is documented as a recipe
+  ([docs/agent-memory.md](../docs/agent-memory.md)); the MCP write path is tracked as (#349).
+- **Minimal read-only web UI** (#273) — basic search and browse on the existing HTTP API; the first
+  slice of the Phase 3 web surface (§1), pulled forward because private local access (including via
+  local AI models) is the primary use case and deserves a zero-terminal entry point.
+
+**Mid-term**
+
+- **Knowledge-graph layer** (#347) — entity/relationship extraction with a local small-model default
+  and hosted opt-in (mirroring the embedder provider pattern), SQLite-first graph storage, and
+  graph-derived candidates as a third RRF leg. The previous ordering rationale is preserved:
+  metadata-only entities first; graph extraction only after baseline retrieval quality is proven.
+- **Entity resolution & provenance** (#348) — explicit, evidence-carrying
+  `same_as`/`possible_same_as`/`not_same_as` assertions, no silent merges; depends on #347.
+
+**Long-term**
+
+- **Audio/video transcription** — transcript formats (SRT/VTT/Whisper output) are already a Phase 2
+  connector target (§1); the long-term item is the transcription pipeline itself.
+- **Scale-out** beyond the single-node embedded design. The current architecture already handles
+  multi-thousand-book collections well; corpora in the millions of pages will eventually stress
+  single-node indexing and storage.
+- **Minimal native app (Swift)** — a macOS-native interface over the same local API, once the
+  read-only web UI has settled what the minimal surface is.
+
+## 3. Federation requirements
+
+[The project vision](../docs/vision.md) (published on the docs site) tells the sharing story in
+plain language; this section holds the technical version of it, and is what Phase 6 designs are
+judged against.
+
+**Sharing propagates; content does not relay.** The defining constraint is **direct connections, no
+indirection**. When Alice shares a list of stores with Bob — some hosted on her node, some that were
+shared _to_ her from Carol — Bob's node does not pull Carol's content through Alice. Alice's server
+may be a laptop that is asleep. Instead:
+
+1. Alice's share is a list of **store references + introductions**: for each store, where its origin
+   lives and a capability (or a way to request one) to access it.
+2. Bob's node contacts each remote store's **origin** (Carol's node) directly, presents the
+   delegated introduction, and requests its own credential.
+3. From then on Bob ↔ Carol is a **direct connection**. Alice being offline never breaks Bob's
+   access to Carol's store.
+
+What propagates through the social graph is **credentials and capabilities, not proxied traffic** —
+capability handoff in the OCAP/delegation tradition.
+
+**Mature authentication, or none.** Shared stores use mature, audited authentication mechanisms —
+OIDC/OAuth2 for client-server sharing, established capability-token systems for peer delegation.
+**No homegrown crypto, ever.** If a sharing feature would require inventing a protocol, the feature
+waits.
+
+The full requirements list:
+
+- **Credential/capability propagation with direct connections**, as above. **No content relay
+  through intermediaries** — an offline friend must never break access to a third party's store.
 - **Provenance & trust metadata** on every chunk, including the share-path (who shared what, via
-  whom) — fields reserved in [02-domain-model.md](02-domain-model.md) §4.
+  whom) — fields reserved in [02-domain-model.md](02-domain-model.md) §4. Trust signals are metadata
+  the user can filter and rank on, never a black-box score.
 - **Peer discovery and connectivity** across NATs.
 - **Mature auth/crypto only.**
 
@@ -39,7 +107,18 @@ connections, tickets), **UCAN** (delegated capability tokens), **Willow protocol
 **Matrix**. Evaluation criteria: maturity/audit status, Rust support, fit for
 capability-delegation-without-relay.
 
-## 3. Turso watch-item
+**What the MVP carries for this.** The MVP ships none of the federation behavior; it carries exactly
+four architectural hooks, each cheap now and expensive to retrofit
+([01-architecture.md](01-architecture.md) §5):
+
+| Hook                                                                                | Where specified                          |
+| ----------------------------------------------------------------------------------- | ---------------------------------------- |
+| Stable, content-addressed document/chunk IDs                                        | [02-domain-model.md](02-domain-model.md) |
+| Provenance metadata on every chunk                                                  | [02-domain-model.md](02-domain-model.md) |
+| Per-store visibility enum (`private` \| `shared`; only `private` functional in MVP) | [01-architecture.md](01-architecture.md) |
+| Store as first-class entity (multiple stores per instance)                          | [01-architecture.md](01-architecture.md) |
+
+## 4. Turso watch-item
 
 Turso is the future embedded direction for libsql — the hosted/sync layer on top of the same engine
 already in use. It becomes a candidate to join — not necessarily replace — the current embedded-only
@@ -50,7 +129,7 @@ libsql setup when **all** hold:
 2. Embedded ↔ Turso server sync story is documented and working from the **Rust** crate.
 3. Licensing and self-hosting story is confirmed compatible with the project's permissive stack.
 
-## 4. Packaging roadmap
+## 5. Packaging roadmap
 
 MVP: `cargo install` + GitHub release tarballs (macOS arm64, Linux x86_64/arm64). **Delivered since
 v0.1.0:** the dist release pipeline (tarballs + shell installer + attestations) and the **Homebrew**
@@ -59,27 +138,27 @@ daemon (launchd on macOS, systemd under brew on Linux) — see `docs/release-eng
 ahead: a bare **systemd** unit for non-brew Linux installs; web UI assets embedded in the binary at
 Phase 3. Model files are never bundled ([04-search-pipeline.md](04-search-pipeline.md) §4).
 
-## 5. Consolidated "later" list
+## 6. Consolidated "later" list
 
-Deferred items referenced by other specs, in one place: reranking stage; original-file line mapping
-for citations; OCR / scanned PDFs; additional ebook formats (see below); OS keychain secret storage;
-interactive CLI browse; gRPC (if demanded); entities/graph; backup/export/import strategy (with
-Phase 4); metrics/tracing endpoints (structured logs ship in MVP; Prometheus metrics arrive with the
-daemon-centric Phase 4); per-format native block extraction (beyond `markdown_to_blocks()`
-conversion); per-host max-concurrency alongside `fetch::http::HostLimiter`'s rate pacing (a no-op
-today, since ingestion is fully sequential — would need a companion semaphore, and only earns its
-keep once ingestion goes concurrent); a per-host circuit breaker to short-circuit a feed once every
-entry is coming back rate-limited, rather than paying the per-entry retry cost for each one; the
-scheduler's multi-source starvation, where several URL sources in one store coming due in the same
-60 s tick means only the first wins the per-store in-flight guard and the rest fail submission and
-are never stamped `last_refreshed` (that happens only on completion), so they retry next tick and
-refresh less often than configured overall — pre-existing, amplified by per-host pacing making jobs
-run longer, not fixed by this work; emitting a progress event before the fetch rather than only
-after it returns, so a slow document is visible as in-flight instead of showing nothing until
-`DocumentStarted`/`DocumentFinished` land back-to-back; a job-duration watchdog, now that per-host
-pacing and retry make "slow but fine" and "actually stuck" harder to tell apart from the outside;
-and sub-1-req/s pacing via `governor`'s `Quota::with_period`, should the integer-only
-`requests_per_second` ever prove too coarse.
+Deferred items referenced by other specs, in one place (OCR and the entities/graph layer have moved
+to the §2 capability roadmap): reranking stage; original-file line mapping for citations; additional
+ebook formats (see below); OS keychain secret storage; interactive CLI browse; gRPC (if demanded);
+backup/export/import strategy (with Phase 4); metrics/tracing endpoints (structured logs ship in
+MVP; Prometheus metrics arrive with the daemon-centric Phase 4); per-format native block extraction
+(beyond `markdown_to_blocks()` conversion); per-host max-concurrency alongside
+`fetch::http::HostLimiter`'s rate pacing (a no-op today, since ingestion is fully sequential — would
+need a companion semaphore, and only earns its keep once ingestion goes concurrent); a per-host
+circuit breaker to short-circuit a feed once every entry is coming back rate-limited, rather than
+paying the per-entry retry cost for each one; the scheduler's multi-source starvation, where several
+URL sources in one store coming due in the same 60 s tick means only the first wins the per-store
+in-flight guard and the rest fail submission and are never stamped `last_refreshed` (that happens
+only on completion), so they retry next tick and refresh less often than configured overall —
+pre-existing, amplified by per-host pacing making jobs run longer, not fixed by this work; emitting
+a progress event before the fetch rather than only after it returns, so a slow document is visible
+as in-flight instead of showing nothing until `DocumentStarted`/`DocumentFinished` land
+back-to-back; a job-duration watchdog, now that per-host pacing and retry make "slow but fine" and
+"actually stuck" harder to tell apart from the outside; and sub-1-req/s pacing via `governor`'s
+`Quota::with_period`, should the integer-only `requests_per_second` ever prove too coarse.
 
 ### Document & ebook formats
 

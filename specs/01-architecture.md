@@ -68,7 +68,7 @@ extracted and buffered per-document logic directly inside `core`.
    in-process, MIT-licensed) — a single engine providing DiskANN vector search, FTS5 for BM25, and
    relational metadata in one file. Qdrant server becomes the remote-mode adapter on the roadmap;
    **Qdrant Edge** (in-process, pre-GA ~0.6.x as of early 2026) is a watch-item
-   ([06-roadmap.md](06-roadmap.md) §3). Hybrid fusion (RRF) is done in our code above the trait, not
+   ([06-roadmap.md](06-roadmap.md) §4). Hybrid fusion (RRF) is done in our code above the trait, not
    delegated ([04-search-pipeline.md](04-search-pipeline.md) §5). **Rejected:** Qdrant as local
    default — Qdrant has no embedded mode (server-only), which would force a daemon-always model and
    contradict §3.
@@ -112,7 +112,7 @@ Two concepts, deliberately separated:
   field (`private` | `shared` — enum exists in MVP, only `private` is functional), ACL hooks (empty
   in MVP), its own sources, and its own indexing policy ([03-config.md](03-config.md) §2).
   **Multiple stores per instance from day one** — e.g. files vs. bookmarks vs. (later) email. Stores
-  are the unit of sharing and federation ([VISION.md](../VISION.md)).
+  are the unit of sharing and federation ([docs/vision.md](../docs/vision.md)).
 - A **backend** (physical): an implementation of `RetrievalStore` that holds a store's index. MVP:
   `libsql` (embedded, single engine with DiskANN vectors and FTS5). Roadmap: `qdrant` (remote
   server), possibly Qdrant Edge. A store declares its backend in config; default is `libsql`.
@@ -127,8 +127,8 @@ indexing. The term "document" is retired from the domain model in favor of "reso
 
 ## 5. Federation-readiness constraints (design constraints only)
 
-MVP implements none of the federation behavior in [VISION.md](../VISION.md), but every MVP component
-must respect:
+MVP implements none of the federation behavior envisioned in [the project vision](../docs/vision.md)
+and specified in [06-roadmap.md](06-roadmap.md) §3, but every MVP component must respect:
 
 1. **Stable, content-addressed IDs** for resources and chunks
    ([02-domain-model.md](02-domain-model.md) §3) — IDs must be meaningful outside the node that

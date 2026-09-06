@@ -228,11 +228,12 @@ In the interest of the same honesty as [Known gaps](architecture.md#known-gaps):
   that needs to change indexed content can re-add the source and let incremental re-index pick up
   the change, which is a smaller, more auditable surface than exposing note-editing verbs the way
   Basic Memory does.
-- **No knowledge graph / entity layer yet.** An entities/graph layer is tracked in
-  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)
-  ("tracked but unscheduled: entities/graph layer, metadata-only entities first, graph extraction
-  only after baseline retrieval quality is proven") but is not designed or built. Basic Memory
-  already has one.
+- **No knowledge graph / entity layer yet.** An entities/graph layer is now scheduled mid-term on
+  the capability roadmap
+  ([specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md) §2,
+  [#347](https://github.com/dokterbob/localdb/issues/347) — metadata-only entities first, graph
+  extraction only after baseline retrieval quality is proven) but is not designed or built. Basic
+  Memory already has one.
 - **File-watch-triggered re-indexing isn't live yet.** `POST /v1/jobs` itself runs real ingestion
   through the daemon's async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)),
   and `localdb index` (embedded or daemon-attached) drives it with live progress — but nothing yet
@@ -244,11 +245,10 @@ In the interest of the same honesty as [Known gaps](architecture.md#known-gaps):
 
 ## Where localdb is headed that nobody else is
 
-Per [VISION.md](https://github.com/dokterbob/localdb/blob/main/VISION.md), the long-horizon goal is
-**federation**: the ability to search datasets far larger than any one person could assemble alone,
-by securely sharing direct, credentialed access to stores — someone's curated book collection, a
-Wikipedia-scale corpus, a friend's notes — without proxying content through intermediaries or
-inventing homegrown crypto.
+Per the [project vision](vision.md), the long-horizon goal is **federation**: the ability to search
+datasets far larger than any one person could assemble alone, by securely sharing direct,
+credentialed access to stores — someone's curated book collection, a Wikipedia-scale corpus, a
+friend's notes — without proxying content through intermediaries or inventing homegrown crypto.
 
 **None of the eight projects surveyed above do this at all.** Each is scoped to a single user's (or
 single organization's) own content. This is the one dimension of this comparison with no current

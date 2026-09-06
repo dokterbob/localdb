@@ -3,6 +3,8 @@ name: verify
 description:
   Drive the real localdb binary end-to-end against an isolated temp config/data dir to verify a
   change at the CLI surface.
+metadata:
+  internal: true
 ---
 
 # Verifying localdb changes at the CLI surface

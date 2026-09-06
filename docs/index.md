@@ -9,7 +9,9 @@ title: localdb docs
   <p>
     Search your files with citations, from the terminal or an AI assistant. localdb indexes notes,
     PDFs, EPUBs, Office documents, HTML, and plain text into a private hybrid search store with
-    structured citations and MCP access.
+    structured citations and MCP access. New here? Read the
+    <a href="{{ '/vision.html' | relative_url }}">vision</a> — where localdb is going, in plain
+    language.
   </p>
   <div class="hero-actions">
     <a class="button primary" href="{{ '/quickstart.html' | relative_url }}">Start with the quickstart</a>
@@ -69,6 +71,8 @@ title: localdb docs
   </div>
 
   <div class="link-list">
+    <a href="{{ '/vision.html' | relative_url }}">Vision</a>
+    <a href="{{ '/agent-memory.html' | relative_url }}">Agent memory</a>
     <a href="{{ '/configuration.html' | relative_url }}">Configuration</a>
     <a href="{{ '/architecture.html' | relative_url }}">Architecture</a>
     <a href="{{ '/http-api.html' | relative_url }}">HTTP API</a>
