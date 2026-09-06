@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/dokterbob/localdb"
@@ -106,15 +106,15 @@ httpdate = "1.0"
 http = "1"
 
 # Internal crates
-localdb-core = { path = "core", version = "0.1.1" }
-localdb-extract = { path = "extract", version = "0.1.1" }
-localdb-fetch = { path = "fetch", version = "0.1.1" }
-localdb-ingest = { path = "ingest", version = "0.1.1" }
-localdb-store-libsql = { path = "store-libsql", version = "0.1.1" }
-localdb-embed = { path = "embed", version = "0.1.1" }
-localdb-server = { path = "server", version = "0.1.1" }
-localdb-mcp = { path = "mcp", version = "0.1.1" }
-localdb-cli = { path = "cli", version = "0.1.1" }
+localdb-core = { path = "core", version = "0.2.0" }
+localdb-extract = { path = "extract", version = "0.2.0" }
+localdb-fetch = { path = "fetch", version = "0.2.0" }
+localdb-ingest = { path = "ingest", version = "0.2.0" }
+localdb-store-libsql = { path = "store-libsql", version = "0.2.0" }
+localdb-embed = { path = "embed", version = "0.2.0" }
+localdb-server = { path = "server", version = "0.2.0" }
+localdb-mcp = { path = "mcp", version = "0.2.0" }
+localdb-cli = { path = "cli", version = "0.2.0" }
 
 [profile.dev]
 opt-level = 0

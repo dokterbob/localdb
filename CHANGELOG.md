@@ -4,40 +4,73 @@ All notable changes to this project are documented in this file.
 
 The format follows [Common Changelog](https://common-changelog.org).
 
-## [0.1.1] - 2026-09-06
+## [0.2.0] - 2026-09-06
+
+Indexing gets dramatically cheaper on unchanged content: conditional GETs, a feed entry recheck
+gate, and metadata-aware skips mean a re-index run now touches the network and the embedder only
+for documents that actually changed. Search grows metadata filters, including all four date axes.
+
+**Upgrading:** this release adds two schema migrations (v7: nullable source-claimed `modified_at`
+plus `index_updated_at`; v8: conditional-GET validators and `last_checked_at`). Run
+`localdb db migrate` once — localdb never migrates on open and refuses with a hint until you do.
+
+### Added
+
+- Search filters, identical across CLI, HTTP, and MCP: `--path`, `--mime`, and `-after`/`-before`
+  bounds on all four date axes (`added`, `updated`, `modified`, `document`)
+  ([#247](https://github.com/dokterbob/localdb/pull/247),
+  [#298](https://github.com/dokterbob/localdb/pull/298),
+  [#303](https://github.com/dokterbob/localdb/pull/303))
+- Conditional GET for URL and feed fetches: `ETag`/`Last-Modified` validators are captured and
+  replayed, so an unchanged document costs a `304` instead of a refetch and re-extraction
+  ([#307](https://github.com/dokterbob/localdb/pull/307),
+  [#308](https://github.com/dokterbob/localdb/pull/308),
+  [#309](https://github.com/dokterbob/localdb/pull/309),
+  [#310](https://github.com/dokterbob/localdb/pull/310))
+- A recheck gate on feed entries: an entry whose feed claim is unchanged and whose last successful
+  origin contact is within the recheck floor (the source’s refresh interval, floored at 24h) is
+  skipped without any HTTP request, reported as "N rechecks deferred"; a quiet `304`-answering feed
+  still drains overdue entries through a bounded due-entry revisit
+  ([#331](https://github.com/dokterbob/localdb/pull/331),
+  [#333](https://github.com/dokterbob/localdb/pull/333),
+  [#334](https://github.com/dokterbob/localdb/pull/334),
+  [#335](https://github.com/dokterbob/localdb/pull/335))
+- `localdb index --refetch`: bypass the recheck gate and feed validators for one run, forcing a
+  full re-check even when nothing looks stale
+  ([#336](https://github.com/dokterbob/localdb/pull/336))
+- Feed sources register with the daemon’s refresh scheduler, so a running daemon re-polls them on
+  their configured interval ([#311](https://github.com/dokterbob/localdb/pull/311))
+- A bounded liveness sweep under `index --delete` probes feed entries that scrolled off the feed
+  window and prunes the ones the origin confirms gone (404/410)
+  ([#312](https://github.com/dokterbob/localdb/pull/312))
+- Document dates as first-class metadata: `dc:date` (with provenance) extracted from PDF, Office,
+  HTML, EPUB and Markdown front matter, exposed on every document surface alongside the other
+  three axes ([#280](https://github.com/dokterbob/localdb/pull/280),
+  [#282](https://github.com/dokterbob/localdb/pull/282))
 
 ### Changed
 
-- T171: Register feed sources with the refresh scheduler ([#311](https://github.com/dokterbob/localdb/pull/311)) ([`1d0ca08`](https://github.com/dokterbob/localdb/commit/1d0ca088d68b5d61adf7ed64afbaab1244ec85b0))
-- Share one ONNX model cache across embed tests; retry transient model-download failures ([#276](https://github.com/dokterbob/localdb/pull/276)) ([#290](https://github.com/dokterbob/localdb/pull/290)) ([`d7fb480`](https://github.com/dokterbob/localdb/commit/d7fb480c1dd4b3db7cfcc8ddf426b704bbf776b5))
-- T250: spec the four date axes; file ingestor added_at from ingestion clock ([#278](https://github.com/dokterbob/localdb/pull/278)) ([`db8d33f`](https://github.com/dokterbob/localdb/commit/db8d33f782d4891a506a218fa99a3be2625ca634))
-- T329: Gate feed entry fetches on the recheck floor ([#335](https://github.com/dokterbob/localdb/pull/335)) ([`cebe837`](https://github.com/dokterbob/localdb/commit/cebe837dac47e61f80b5a8ff9ebe00b8b06e1ee8))
-- Pin the Rust toolchain, and fix the lints the newer stable flags ([#257](https://github.com/dokterbob/localdb/pull/257)) ([`4ae121b`](https://github.com/dokterbob/localdb/commit/4ae121b1601978237694f5bf4c307b0bd16a585d))
-- Extract transient state from the repo: delete issue drafts, design-question and branch-coordination files ([#271](https://github.com/dokterbob/localdb/pull/271)) ([#294](https://github.com/dokterbob/localdb/pull/294)) ([`800be28`](https://github.com/dokterbob/localdb/commit/800be28356a9b0f954d74ab5a9f81151947e26d7))
-- T250: metadata-aware incremental skip; metadata-only store update ([#176](https://github.com/dokterbob/localdb/pull/176)) ([#281](https://github.com/dokterbob/localdb/pull/281)) ([`e29a095`](https://github.com/dokterbob/localdb/commit/e29a0952dfab075b0980d4bdd24c7622d618d235))
-- T250: extract dc:date + date_source for office, HTML, and markdown front matter ([#282](https://github.com/dokterbob/localdb/pull/282)) ([`c7289aa`](https://github.com/dokterbob/localdb/commit/c7289aafc63411922e4f1498a3828d354824285e))
-- T250: source-claimed modified_at is nullable end-to-end ([#283](https://github.com/dokterbob/localdb/pull/283)) ([#286](https://github.com/dokterbob/localdb/pull/286)) ([`7c31f51`](https://github.com/dokterbob/localdb/commit/7c31f5108e107d0c84326627aa4e609ca98654d0))
-- T247: bind search filter values as SQL parameters ([#255](https://github.com/dokterbob/localdb/pull/255)) ([#295](https://github.com/dokterbob/localdb/pull/295)) ([`74420d1`](https://github.com/dokterbob/localdb/commit/74420d13eb0ee96b113465d757b6ee0613f56801))
-- T247: replace hand-rolled date arithmetic with chrono ([#297](https://github.com/dokterbob/localdb/pull/297)) ([`8ca547d`](https://github.com/dokterbob/localdb/commit/8ca547de420d333f01d8fa46d1e68c307f716e93))
-- T247: Add DateAxis so all four date axes are filterable ([#298](https://github.com/dokterbob/localdb/pull/298)) ([`a95bd1c`](https://github.com/dokterbob/localdb/commit/a95bd1ccb1fe804fa6bb59d6a7726d6edb9c274e))
-- T171: Report the validators a 304 response carries ([#308](https://github.com/dokterbob/localdb/pull/308)) ([`aaa6fd2`](https://github.com/dokterbob/localdb/commit/aaa6fd2f4e25daef0a14b920b659b6de9aa1433a))
-- T171: Capture and replay conditional-GET validators ([#309](https://github.com/dokterbob/localdb/pull/309)) ([`e117b35`](https://github.com/dokterbob/localdb/commit/e117b35ade89324cf0becffd8e084ddbea113826))
-- T171: Make the feed document's own fetch conditional ([#310](https://github.com/dokterbob/localdb/pull/310)) ([`bf57941`](https://github.com/dokterbob/localdb/commit/bf57941c9f3cddb545b1d442283c4819eeedaf23))
-- T171: Prune confirmed-gone feed entries with a bounded liveness sweep ([#312](https://github.com/dokterbob/localdb/pull/312)) ([`b7ba669`](https://github.com/dokterbob/localdb/commit/b7ba66939e1482b11430de96a95fb2e13254e27b))
-- T329: Add touch_resource_checked and surface last_checked_at on DocumentRecord ([#331](https://github.com/dokterbob/localdb/pull/331)) ([`6c17bdb`](https://github.com/dokterbob/localdb/commit/6c17bdb824bba39668f18f99c4dcfedbf1bdf97c))
-- T329: Extract the shared recheck-floor derivation from the liveness sweep ([#332](https://github.com/dokterbob/localdb/pull/332)) ([`0b9bd1e`](https://github.com/dokterbob/localdb/commit/0b9bd1ee4d6f0be9b0a1e771add335d47664a0c4))
-- T329: Advance last_checked_at on every successful origin contact ([#333](https://github.com/dokterbob/localdb/pull/333)) ([`83e2731`](https://github.com/dokterbob/localdb/commit/83e2731e4474c4b20184eef012203e13a0f90950))
-- T329: Add the recheck_is_due hook and the refetch bypass ([#334](https://github.com/dokterbob/localdb/pull/334)) ([`380bf05`](https://github.com/dokterbob/localdb/commit/380bf053a0a024736bb0050afcd9035e06183f57))
-- T329: Document the recheck gate and the new meaning of last_checked_at ([#337](https://github.com/dokterbob/localdb/pull/337)) ([`71291ab`](https://github.com/dokterbob/localdb/commit/71291abb1905885d3b689f5f8f5185c58b3622dc))
-- Make `localdb init` honest and optional ([#225](https://github.com/dokterbob/localdb/pull/225)) ([#256](https://github.com/dokterbob/localdb/pull/256)) ([`b574ef4`](https://github.com/dokterbob/localdb/commit/b574ef424b18ce507ec3681c09a8da7987607f4d))
-- Print --json error envelopes to stdout instead of stderr ([#263](https://github.com/dokterbob/localdb/pull/263)) ([`c56b759`](https://github.com/dokterbob/localdb/commit/c56b759168b9d4b2a985dbafa8b732bccf505223))
-- T250: migration v7 index_updated_at; persist real modified_at; preserve added_at on policy reindex ([#279](https://github.com/dokterbob/localdb/pull/279)) ([`10bbba0`](https://github.com/dokterbob/localdb/commit/10bbba03b8307647f0a14af93f260cf52652232d))
-- T250: populate date_original/date_parsed + external_id/external_etag; expose dates on document surfaces ([#280](https://github.com/dokterbob/localdb/pull/280)) ([`4ef6411`](https://github.com/dokterbob/localdb/commit/4ef6411ae7332e25803914bff737d8034b1feb1a))
-- Capture child output in the concurrent store-list test ([#181](https://github.com/dokterbob/localdb/pull/181)) ([#291](https://github.com/dokterbob/localdb/pull/291)) ([`de56ad3`](https://github.com/dokterbob/localdb/commit/de56ad30c3af68552727a04871c9963fba85341e))
-- T247: fix search flags typed after the query being swallowed as text ([#296](https://github.com/dokterbob/localdb/pull/296)) ([`d134d4e`](https://github.com/dokterbob/localdb/commit/d134d4ec92cb1790d31a997d2e684d47b62e9940))
-- T247: Add search filters to the CLI, HTTP, and MCP surfaces ([#247](https://github.com/dokterbob/localdb/pull/247)) ([#303](https://github.com/dokterbob/localdb/pull/303)) ([`8a5b439`](https://github.com/dokterbob/localdb/commit/8a5b4395bfb4565b582baff366fa76dbcbf0b96d))
-- T171: Add schema v8 — conditional-GET and liveness columns ([#307](https://github.com/dokterbob/localdb/pull/307)) ([`3c1eb1d`](https://github.com/dokterbob/localdb/commit/3c1eb1d94215986bae5cb31eb86ad9724ccb6b40))
-- T329: Add index --refetch and report deferred rechecks ([#336](https://github.com/dokterbob/localdb/pull/336)) ([`5e159c3`](https://github.com/dokterbob/localdb/commit/5e159c32f4ed261e6a3bb69f880a58e2c793bae7))
+- Incremental indexing is metadata-aware: a metadata-only change (title, authors, dates) updates
+  the stored document without refetching, re-extracting, or re-embedding its content
+  ([#176](https://github.com/dokterbob/localdb/pull/176),
+  [#279](https://github.com/dokterbob/localdb/pull/279),
+  [#281](https://github.com/dokterbob/localdb/pull/281))
+- A source that claims no modification time no longer gets a fabricated one: `modified_at` is
+  nullable end-to-end ([#283](https://github.com/dokterbob/localdb/pull/283),
+  [#286](https://github.com/dokterbob/localdb/pull/286))
+- `localdb init` is optional and honest: every command scaffolds implicitly on first use, and
+  `init` reports exactly what it did ([#225](https://github.com/dokterbob/localdb/pull/225),
+  [#256](https://github.com/dokterbob/localdb/pull/256))
+
+### Fixed
+
+- Search filter values are bound as SQL parameters instead of being interpolated
+  ([#255](https://github.com/dokterbob/localdb/pull/255),
+  [#295](https://github.com/dokterbob/localdb/pull/295))
+- Search flags typed after the query words are parsed as flags instead of being swallowed into
+  the query text ([#296](https://github.com/dokterbob/localdb/pull/296))
+- `--json` error envelopes print to stdout, where the rest of the JSON output goes
+  ([#263](https://github.com/dokterbob/localdb/pull/263))
 
 
 ## [0.1.0] - 2026-08-18
