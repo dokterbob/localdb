@@ -265,21 +265,42 @@ under `--delete`.
 Entries whose URI is the synthetic link-less shape (`{feed_url}#entry:...`) are excluded — there is
 nothing to fetch.
 
-The revisit is capped per run at the same batch bound the liveness sweep uses (25, oldest-first by
-`last_checked_at`), so a long-idle source drains its backlog across successive runs instead of
-turning one quiet `304` into an unbounded fetch storm.
+The revisit is capped per run at the same batch bound the liveness sweep uses (25), selected in
+**random order** rather than oldest-first, so a long-idle source drains its backlog across
+successive runs instead of turning one quiet `304` into an unbounded fetch storm. The order differs
+from the sweep's deliberately: a revisit honors no-touch-on-error (above), so a deterministic
+oldest-first pick would let a head-of-queue clique of permanently failing entries — their
+`last_checked_at` never advancing — occupy all 25 slots on every run and starve everything younger
+behind them; random selection gives every due entry a chance each run. The sweep keeps oldest-first
+because it is immune to that starvation — a probe advances the entry's clock on _every_ outcome
+("What a probe writes", below), so its queue head always moves. The backlog still drains: each
+successfully revisited entry gets its `last_checked_at` stamped and leaves the due pool, so random
+draws without replacement cover the whole backlog across successive runs — only entries that keep
+failing remain due, and bounding their retries is open follow-up work, not this cap's job.
 
 This is what makes the floor an actual ceiling: without it, a feed that keeps answering `304` never
 re-verifies a single entry, however long it has gone unchecked.
 
-**Accepted cost.** A silent page edit the feed does not announce — no `updated` bump, no title or
-author change — is noticed within one floor-length window of the origin's next successful contact:
-the ordinary entry loop on a fresh `200`, or the due-entry revisit above on a `304`, whichever comes
-first. It is never indefinitely deferred by a quiet feed. Three escape hatches bypass it:
-`--refetch` ([05-surfaces.md](05-surfaces.md)), which bypasses check (c) for the run; a feed-side
-`updated` or author change — or a title change, but only while the resource still has no stored
-title for the feed's fallback to fill — which changes the claim compared in check (b) and reopens
-the gate on its own; and a `policy_version` bump, which fails check (a).
+**Accepted cost.** For an entry **still in the feed window**, a silent page edit the feed does not
+announce — no `updated` bump, no title or author change — is noticed within one floor-length window
+of the origin's next successful contact: the ordinary entry loop on a fresh `200`, or the due-entry
+revisit above on a `304`, whichever comes first. It is never indefinitely deferred by a quiet feed.
+An entry that has **aged out of the window** gets a weaker guarantee: the ordinary entry loop never
+emits it, and the revisit above triggers only on a `304`, so on a feed that keeps answering `200`
+its only origin contact is the liveness sweep's probe — which keeps deletion decisions current but
+deliberately discards the body a `200` returns, so drift on such an entry is not re-indexed. That
+asymmetry is the disclosed accepted trade-off of the gate — see gap #20 in
+[docs/architecture.md](../docs/architecture.md#known-gaps).
+
+Three escape hatches bypass the gate for an in-window entry: `--refetch`
+([05-surfaces.md](05-surfaces.md)), which bypasses check (c) for the run; a change to any part of
+the connector's claim — `external_id`, `modified_at_override`, or the supplied enrichment
+(`updated`/`published`, authors, …) — that alters the merged `metadata_hash`, which fails check (b)
+and reopens the gate on its own; and a `policy_version` bump, which fails check (a). Check (b)
+inherits two asymmetries from the merge (`MetadataEnrichment::apply_to`): a title change only alters
+the hash while the resource still has no stored title for the feed's fallback to fill, and a
+creators list going non-empty → empty never changes the stored creators — the merge only replaces
+them on non-empty input — so an author _removal_ alone does not reopen the gate.
 
 A discovery entry currently served from embedded feed content carries the same bounded-staleness
 cost one level down: if the entry's RSS description or Atom content changes with no accompanying
