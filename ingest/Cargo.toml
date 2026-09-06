@@ -14,9 +14,9 @@ description = "Content-acquisition ingestors implementing core::ingestor::Ingest
 name = "ingest"
 
 [dependencies]
-localdb-core = { path = "../core", version = "0.1.0" }
-localdb-extract = { path = "../extract", version = "0.1.0" }
-localdb-fetch = { path = "../fetch", version = "0.1.0" }
+localdb-core = { path = "../core", version = "0.2.0" }
+localdb-extract = { path = "../extract", version = "0.2.0" }
+localdb-fetch = { path = "../fetch", version = "0.2.0" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

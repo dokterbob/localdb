@@ -14,14 +14,14 @@ description = "CLI command implementations, thin layer on core / daemon client"
 name = "cli"
 
 [dependencies]
-localdb-core = { path = "../core", version = "0.1.0" }
-localdb-store-libsql = { path = "../store-libsql", version = "0.1.0" }
-localdb-extract = { path = "../extract", version = "0.1.0" }
-localdb-ingest = { path = "../ingest", version = "0.1.0" }
-localdb-embed = { path = "../embed", version = "0.1.0", features = ["local-onnx"] }
-localdb-fetch = { path = "../fetch", version = "0.1.0" }
-localdb-mcp = { path = "../mcp", version = "0.1.0" }
-localdb-server = { path = "../server", version = "0.1.0" }
+localdb-core = { path = "../core", version = "0.2.0" }
+localdb-store-libsql = { path = "../store-libsql", version = "0.2.0" }
+localdb-extract = { path = "../extract", version = "0.2.0" }
+localdb-ingest = { path = "../ingest", version = "0.2.0" }
+localdb-embed = { path = "../embed", version = "0.2.0", features = ["local-onnx"] }
+localdb-fetch = { path = "../fetch", version = "0.2.0" }
+localdb-mcp = { path = "../mcp", version = "0.2.0" }
+localdb-server = { path = "../server", version = "0.2.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
@@ -41,7 +41,7 @@ futures = { workspace = true }
 # On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)
 # picks up ANE/GPU acceleration without needing --features. Cargo unions this with the
 # local-onnx feature above; Linux never pulls objc2/block2/etc.
-localdb-embed = { path = "../embed", version = "0.1.0", features = ["local-coreml"] }
+localdb-embed = { path = "../embed", version = "0.2.0", features = ["local-coreml"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
