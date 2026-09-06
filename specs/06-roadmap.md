@@ -91,7 +91,8 @@ The full requirements list:
 - **Credential/capability propagation with direct connections**, as above. **No content relay
   through intermediaries** — an offline friend must never break access to a third party's store.
 - **Provenance & trust metadata** on every chunk, including the share-path (who shared what, via
-  whom) — fields reserved in [02-domain-model.md](02-domain-model.md) §4.
+  whom) — fields reserved in [02-domain-model.md](02-domain-model.md) §4. Trust signals are metadata
+  the user can filter and rank on, never a black-box score.
 - **Peer discovery and connectivity** across NATs.
 - **Mature auth/crypto only.**
 

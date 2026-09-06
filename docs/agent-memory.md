@@ -50,11 +50,11 @@ The emerging evidence in the agent-memory space points one way: the durable, que
 layer — not the model — is what carries long-term agent capability.
 [gbrain](https://github.com/garrytan/gbrain) (Garry Tan) is a production system built on precisely
 this loop: agents write markdown memory, a hybrid index with a typed knowledge graph serves it back
-as cited answers. WikiSkill ([arXiv 2608.27454](https://arxiv.org/abs/2608.27454), Google Research)
-shows experimentally that a persistent knowledge layer between an agent's raw experience and its
-skills is the component that carries the performance gains. localdb gives you the retrieval half of
-that layer today — local, provenance-carrying, harness-agnostic — with the citations that let an
-agent (or you) verify where a remembered "fact" actually came from.
+as cited answers. WikiSkill ([arXiv 2608.27454](https://arxiv.org/abs/2608.27454), Google Research
+and Virginia Tech) shows experimentally that a persistent knowledge layer between an agent's raw
+experience and its skills is the component that carries the performance gains. localdb gives you the
+retrieval half of that layer today — local, provenance-carrying, harness-agnostic — with the
+citations that let an agent (or you) verify where a remembered "fact" actually came from.
 
 ## The current boundary: reads only
 
