@@ -116,6 +116,16 @@ impl Default for Metadata {
     }
 }
 
+/// The `date_source` provenance stamp for dates a feed entry supplies.
+///
+/// One shared constant rather than a scattered literal because two sides
+/// must agree on it exactly: the feed ingestor stamps it when it claims a
+/// date, and the due-entry revisit replays a persisted date as the
+/// connector's claim only when the stored stamp matches — any other value
+/// (`"pdf-info"`, `"html-json-ld"`, …) marks a date the extraction
+/// produced, which is never the connector's to replay.
+pub const FEED_ENTRY_DATE_SOURCE: &str = "feed-entry";
+
 /// What a connector knows about a resource independently of the resource's
 /// own content — a feed entry's title, authors, publication date, and the
 /// feed that carried it.

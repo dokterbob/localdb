@@ -983,6 +983,14 @@ impl IngestCallback for PipelineCallback<'_> {
             .doc_index
             .for_source(&self.source.id)
             .filter(|r| !r.uri.starts_with(&synthetic_prefix))
+            // Only http(s) URIs are fetchable by the entry fetcher — the
+            // same predicate `list_stale_feed_resources` applies in SQL for
+            // the liveness sweep's candidates, and the exclusion
+            // `DueRecheckEntry::locator`'s contract promises. A feed can
+            // carry a `mailto:` or `ftp:` entry link; handing it to the
+            // HTTP fetcher would fail identically on every run, and
+            // no-touch-on-error would keep it due forever.
+            .filter(|r| r.uri.starts_with("http://") || r.uri.starts_with("https://"))
             .filter(|r| {
                 r.policy_version != self.config.policy_version
                     || r.last_checked_at
@@ -992,12 +1000,20 @@ impl IngestCallback for PipelineCallback<'_> {
             .cloned()
             .collect();
 
-        // Oldest-first, `None` leading — the same ordering the liveness
-        // sweep's own candidate query uses, and for the same reason: a
-        // long-idle source drains its backlog across successive runs instead
-        // of being capped forever by whichever candidates happen to sort
-        // first.
-        candidates.sort_by(|a, b| a.last_checked_at.cmp(&b.last_checked_at));
+        // Random order per run, deliberately NOT the liveness sweep's
+        // oldest-first (specs/04-search-pipeline.md §1 "Due-entry revisit
+        // on a feed 304"): a revisit never advances `last_checked_at` on a
+        // failed outcome, so a deterministic oldest-first pick would let a
+        // batch-sized clique of permanently failing entries pin the queue
+        // head on every run and starve everything younger behind it. The
+        // sweep can afford oldest-first because a probe advances the clock
+        // on every outcome, so its queue head always moves. Sorting by a
+        // randomly seeded hash of the URI shuffles without a new
+        // dependency; each successfully revisited entry gets stamped and
+        // leaves the due pool, so random draws still drain the backlog
+        // across successive runs.
+        let shuffle = std::hash::RandomState::new();
+        candidates.sort_by_key(|r| std::hash::BuildHasher::hash_one(&shuffle, &r.uri));
         // Same batch bound the liveness sweep uses
         // (specs/04-search-pipeline.md §1 "Aged-out feed entries: the
         // liveness sweep" → "Candidates") — one shared cap keeps a quiet
@@ -1046,12 +1062,27 @@ impl IngestCallback for PipelineCallback<'_> {
             // the identical merge the ordinary entry loop uses reproduces
             // exactly the stored state — "revisit with this claim" and "keep
             // what is already stored" are the same operation here.
+            //
+            // Except the date: only a feed-stamped one is the connector's
+            // claim to replay. A persisted date the *extraction* produced
+            // (`"pdf-info"`, `"html-json-ld"`, …) replayed as a claim would
+            // stomp whatever a fresh `200`'s parse extracts — `apply_to`
+            // lets a claimed date overwrite the extracted one — pinning the
+            // stored date at its stale value forever. Sending no date claim
+            // instead leaves the fresh parse (on a `200`) and the persisted
+            // value (on a `304`) alone.
             let dc = record.metadata.dublin_core();
+            let (date, date_source) =
+                if dc.date_source.as_deref() == Some(crate::metadata::FEED_ENTRY_DATE_SOURCE) {
+                    (dc.date.clone(), dc.date_source.clone())
+                } else {
+                    (None, None)
+                };
             let enrichment = crate::metadata::MetadataEnrichment {
                 title_fallback: dc.title.clone(),
                 creator: dc.creator.clone(),
-                date: dc.date.clone(),
-                date_source: dc.date_source.clone(),
+                date,
+                date_source,
                 provenance_source: dc.source.clone(),
             };
 

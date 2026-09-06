@@ -6880,6 +6880,42 @@ mod unified_pipeline {
     }
 
     #[tokio::test]
+    async fn due_entries_for_source_excludes_non_http_uris() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        // The scheme exclusion happens before any store read.
+        let store = PanicOnResourceReadStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let mut doc_index = DocumentIndex::new();
+        // Both would otherwise qualify (past the floor) if not for their
+        // schemes — a feed is free to carry entry links like these, but the
+        // revisit hands its candidates to the HTTP fetcher.
+        doc_index.upsert(gate_doc_record(
+            &source,
+            "mailto:editor@example.com",
+            &config.policy_version,
+            Some(rfc3339_ago(chrono::Duration::hours(25))),
+        ));
+        doc_index.upsert(gate_doc_record(
+            &source,
+            "ftp://example.com/archive/entry.txt",
+            &config.policy_version,
+            Some(rfc3339_ago(chrono::Duration::hours(25))),
+        ));
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
+        let due = callback.due_entries_for_source().await;
+
+        assert!(
+            due.is_empty(),
+            "a non-http(s) entry URI is not fetchable by the entry fetcher \
+             and must never become a revisit candidate"
+        );
+    }
+
+    #[tokio::test]
     async fn due_entries_for_source_skips_a_candidate_whose_store_record_is_gone() {
         let store_id = "store-1";
         let source = make_feed_source_with_refresh(store_id, None);
@@ -6991,6 +7027,71 @@ mod unified_pipeline {
     }
 
     #[tokio::test]
+    async fn due_entries_for_source_never_replays_a_page_derived_date_as_a_claim() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let mut doc_index = DocumentIndex::new();
+
+        let uri = "https://example.com/page-dated-entry.html";
+        let mut resource = make_resource_with_blocks(
+            uri,
+            &source.id,
+            &config.store_id,
+            vec![Block {
+                seq: 0,
+                kind: BlockKind::Text,
+                text: "Body.".to_string(),
+                location: None,
+            }],
+        );
+        resource.metadata = Metadata::Document(DocumentMetadata {
+            dublin_core: DublinCoreMetadata {
+                title: Some("Stored Title".to_string()),
+                creator: vec!["Jane Doe".to_string()],
+                date: Some("2026-01-01T00:00:00Z".to_string()),
+                date_source: Some("html-json-ld".to_string()),
+                source: Some("https://example.com/feed.xml".to_string()),
+                ..Default::default()
+            },
+            page_count: None,
+            word_count: None,
+        });
+
+        seed_due_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            resource,
+            Some(rfc3339_ago(chrono::Duration::hours(25))),
+        )
+        .await;
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
+        let due = callback.due_entries_for_source().await;
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].enrichment,
+            crate::metadata::MetadataEnrichment {
+                title_fallback: Some("Stored Title".to_string()),
+                creator: vec!["Jane Doe".to_string()],
+                date: None,
+                date_source: None,
+                provenance_source: Some("https://example.com/feed.xml".to_string()),
+            },
+            "a persisted date the extraction produced is not the connector's \
+             claim: replaying it would let `apply_to` stomp the fresh parse \
+             on every revisit, pinning the stored date at its stale value"
+        );
+    }
+
+    #[tokio::test]
     async fn due_entries_for_source_only_returns_this_source() {
         let store_id = "store-1";
         let source_a = make_feed_source_with_refresh(store_id, None);
@@ -7049,7 +7150,7 @@ mod unified_pipeline {
     }
 
     #[tokio::test]
-    async fn due_entries_for_source_caps_and_orders_oldest_first() {
+    async fn due_entries_for_source_caps_at_the_batch_limit_without_starving_any_candidate() {
         let store_id = "store-1";
         let source = make_feed_source_with_refresh(store_id, None);
         let config = make_ingestion_config(store_id);
@@ -7058,12 +7159,15 @@ mod unified_pipeline {
         let mut doc_index = DocumentIndex::new();
 
         // FEED_LIVENESS_BATCH_LIMIT (25) + 2 stale candidates, each with a
-        // distinct `last_checked_at`, all past the bare 24h floor. Index 0
-        // is the oldest (checked longest ago); index 26 is the newest of
-        // the batch, and both index 25 and 26 must be dropped by the cap.
+        // distinct `last_checked_at`, all past the bare 24h floor. The
+        // selection is random per run (a deliberate contrast to the
+        // sweep's oldest-first — see `due_entries_for_source`'s ordering
+        // comment), so no single call pins which two get dropped.
         let total = FEED_LIVENESS_BATCH_LIMIT + 2;
-        for i in 0..total {
-            let uri = format!("https://example.com/entry-{i:02}.html");
+        let all_uris: Vec<String> = (0..total)
+            .map(|i| format!("https://example.com/entry-{i:02}.html"))
+            .collect();
+        for (i, uri) in all_uris.iter().enumerate() {
             let minutes_ago = 1500 - i as i64;
             seed_due_candidate(
                 &source,
@@ -7071,25 +7175,45 @@ mod unified_pipeline {
                 &store,
                 &embedder,
                 &config,
-                make_resource(&uri, "Body.", &source.id, &config.store_id),
+                make_resource(uri, "Body.", &source.id, &config.store_id),
                 Some(rfc3339_ago(chrono::Duration::minutes(minutes_ago))),
             )
             .await;
         }
 
-        let mut callback =
-            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
-        let due = callback.due_entries_for_source().await;
-
-        assert_eq!(due.len(), FEED_LIVENESS_BATCH_LIMIT);
-        let expected: Vec<String> = (0..FEED_LIVENESS_BATCH_LIMIT)
-            .map(|i| format!("https://example.com/entry-{i:02}.html"))
-            .collect();
-        let actual: Vec<String> = due.iter().map(|e| e.uri.as_str().to_string()).collect();
+        // Every call must cap at the batch limit and return only known
+        // candidates; across repeated draws (a fresh random seed each), the
+        // union must reach ALL candidates — the starvation the random order
+        // exists to prevent is exactly a candidate that never gets drawn.
+        // 40 draws each omitting 2 of 27 leaves a candidate never-drawn
+        // with probability ~(2/27)^40 — not a flakiness concern.
+        let candidate_set: std::collections::HashSet<&str> =
+            all_uris.iter().map(String::as_str).collect();
+        let mut drawn: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let mut callback = make_pipeline_callback_over(
+                &source,
+                &mut doc_index,
+                &store,
+                &embedder,
+                &config,
+                false,
+            );
+            let due = callback.due_entries_for_source().await;
+            assert_eq!(due.len(), FEED_LIVENESS_BATCH_LIMIT);
+            for entry in &due {
+                assert!(candidate_set.contains(entry.uri.as_str()));
+                drawn.insert(entry.uri.as_str().to_string());
+            }
+            if drawn.len() == total {
+                break;
+            }
+        }
         assert_eq!(
-            actual, expected,
-            "the batch must keep the 25 oldest candidates, oldest first, \
-             dropping the two most-recently-checked ones"
+            drawn.len(),
+            total,
+            "random batch selection must eventually draw every due \
+             candidate; a candidate that can never be drawn is starved"
         );
     }
 }

@@ -184,7 +184,12 @@ impl MetadataWriteOutcome {
 /// [`crate::metadata::MetadataEnrichment::apply_to`] reproduces exactly what
 /// is already there, because that merge is idempotent — so "revisit with
 /// this claim" and "keep the stored feed-derived metadata" are the same
-/// thing here.
+/// thing here. The one field held back is a date the *extraction* produced
+/// (its `date_source` is anything but
+/// [`crate::metadata::FEED_ENTRY_DATE_SOURCE`]): that date was never the
+/// connector's claim, and replaying it as one would overwrite whatever a
+/// fresh `200`'s parse extracts, so the rebuilt enrichment carries no date
+/// claim at all for such a resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueRecheckEntry {
     /// The fetchable locator to pass to the `UrlFetcher`, exactly as
