@@ -662,7 +662,7 @@ async fn process_discovery_entry(
         // `<pubDate>` still needs the stamp, or the 304 seam cannot tell the
         // date it wrote on an earlier run from one the linked page supplied,
         // and a withdrawn feed date would stand forever.
-        date_source: Some("feed-entry".to_string()),
+        date_source: Some(localdb_core::metadata::FEED_ENTRY_DATE_SOURCE.to_string()),
         // The feed's own modification claim, preferring `updated` (that's
         // what it means) over `published`; `dc.date` above keeps the
         // opposite preference (creation/publication semantics). Unlike
