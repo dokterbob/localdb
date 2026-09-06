@@ -134,6 +134,7 @@ async fn run_once(
     policy_version: &str,
     stored_digest: Option<String>,
     entry_urls: &[&str],
+    refetch: bool,
 ) -> (FetchMetadata, IngestionResult) {
     let mut bodies = HashMap::new();
     bodies.insert(FEED_URL.to_string(), atom_feed(entry_urls));
@@ -188,6 +189,7 @@ async fn run_once(
                 last_modified: None,
             },
             stored_inputs_digest: stored_digest,
+            refetch,
             // Retaining run: the liveness sweep never fires, so this must
             // never be reached.
             fetcher: &UnreachableFetcher,
@@ -207,7 +209,7 @@ fn baseline_digest() -> String {
 }
 
 async fn run_baseline_with(stored_digest: Option<String>) -> FetchMetadata {
-    run_once(Some(10), true, "policy-v1", stored_digest, &[])
+    run_once(Some(10), true, "policy-v1", stored_digest, &[], false)
         .await
         .0
 }
@@ -226,9 +228,16 @@ async fn matching_inputs_replay_the_stored_validators() {
 async fn a_changed_policy_version_suppresses_the_replay() {
     // Same stored digest, different policy: the digest no longer describes
     // this run's inputs.
-    let received = run_once(Some(10), true, "policy-v2", Some(baseline_digest()), &[])
-        .await
-        .0;
+    let received = run_once(
+        Some(10),
+        true,
+        "policy-v2",
+        Some(baseline_digest()),
+        &[],
+        false,
+    )
+    .await
+    .0;
     assert_eq!(
         received,
         FetchMetadata::default(),
@@ -239,17 +248,31 @@ async fn a_changed_policy_version_suppresses_the_replay() {
 
 #[tokio::test]
 async fn a_changed_fetch_full_content_suppresses_the_replay() {
-    let received = run_once(Some(10), false, "policy-v1", Some(baseline_digest()), &[])
-        .await
-        .0;
+    let received = run_once(
+        Some(10),
+        false,
+        "policy-v1",
+        Some(baseline_digest()),
+        &[],
+        false,
+    )
+    .await
+    .0;
     assert_eq!(received, FetchMetadata::default());
 }
 
 #[tokio::test]
 async fn a_changed_max_entries_suppresses_the_replay() {
-    let received = run_once(Some(5), true, "policy-v1", Some(baseline_digest()), &[])
-        .await
-        .0;
+    let received = run_once(
+        Some(5),
+        true,
+        "policy-v1",
+        Some(baseline_digest()),
+        &[],
+        false,
+    )
+    .await
+    .0;
     assert_eq!(received, FetchMetadata::default());
 }
 
@@ -269,8 +292,15 @@ async fn an_absent_stored_digest_suppresses_the_replay() {
 /// come back into use.
 #[tokio::test]
 async fn the_run_reports_the_current_inputs_digest_for_persistence() {
-    let (_received, result) =
-        run_once(Some(5), true, "policy-v1", Some(baseline_digest()), &[]).await;
+    let (_received, result) = run_once(
+        Some(5),
+        true,
+        "policy-v1",
+        Some(baseline_digest()),
+        &[],
+        false,
+    )
+    .await;
     assert_eq!(
         result.document_inputs_digest.as_deref(),
         Some(compute_feed_inputs_digest("policy-v1", true, Some(5)).as_str())
@@ -290,6 +320,59 @@ async fn a_narrowed_max_entries_still_processes_entries() {
         "policy-v1",
         Some(baseline_digest()),
         &entries,
+        false,
+    )
+    .await;
+
+    assert_eq!(received, FetchMetadata::default());
+    assert!(
+        result.docs_seen > 0,
+        "the entry loop must have run: a replayed validator would have 304'd \
+         and reported nothing at all"
+    );
+}
+
+/// `--refetch` takes the exact same suppression path as a digest mismatch,
+/// even though the inputs digest matches perfectly here — mirrors
+/// `a_changed_policy_version_suppresses_the_replay` above, with `refetch`
+/// varied instead of `policy_version`. Bypassing only the recheck gate
+/// (`core::ingestion::pipeline::callback::PipelineCallback::recheck_is_due`)
+/// would still dead-end at this feed document's own 304 before the entry
+/// loop ever ran — this is the other half of the escape hatch.
+#[tokio::test]
+async fn refetch_suppresses_the_replay_even_with_matching_inputs() {
+    let received = run_once(
+        Some(10),
+        true,
+        "policy-v1",
+        Some(baseline_digest()),
+        &[],
+        true,
+    )
+    .await
+    .0;
+    assert_eq!(
+        received,
+        FetchMetadata::default(),
+        "--refetch must force an unconditional fetch of the feed document \
+         even when the inputs digest still matches"
+    );
+}
+
+/// The other half of the same behavior, pinned the way
+/// `a_narrowed_max_entries_still_processes_entries` pins the digest-mismatch
+/// case: `--refetch` must not merely drop the header, it must let the entry
+/// loop run.
+#[tokio::test]
+async fn refetch_still_processes_entries_despite_matching_inputs() {
+    let entries = ["https://feed.example.com/e0", "https://feed.example.com/e1"];
+    let (received, result) = run_once(
+        Some(10),
+        true,
+        "policy-v1",
+        Some(baseline_digest()),
+        &entries,
+        true,
     )
     .await;
 

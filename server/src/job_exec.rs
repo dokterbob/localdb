@@ -305,6 +305,11 @@ pub async fn run_job(
             deletion,
             document_validators,
             stored_inputs_digest: rt_source.feed_inputs_digest.clone(),
+            // `--refetch`'s bypass is threaded through `CreateJobRequest` →
+            // `run_scoped_job`/`run_job` → here. The job request body this
+            // loop reads from carries no such field, so every job submitted
+            // through the HTTP API runs without the bypass.
+            refetch: false,
             // The feed liveness sweep's own probe of an aged-out entry's
             // link must use the destination-restricted client — the same
             // trust-boundary split `build_ingestor_for_spec` already
