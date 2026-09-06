@@ -139,7 +139,7 @@ behind, ahead, or predates the migration framework (exit 2) rather than silently
 | [specs/04-search-pipeline.md](specs/04-search-pipeline.md) | Ingestion, chunking, embeddings, BM25+dense RRF                                           |
 | [specs/05-surfaces.md](specs/05-surfaces.md)               | CLI command tree, REST API, MCP tools, error taxonomy                                     |
 | [specs/06-roadmap.md](specs/06-roadmap.md)                 | Phase ordering, federation, packaging                                                     |
-| [VISION.md](VISION.md)                                     | Long-horizon direction: peer-to-peer store sharing                                        |
+| [docs/vision.md](docs/vision.md)                           | Long-horizon direction: the plain-language project vision                                 |
 | [skills/localdb/SKILL.md](skills/localdb/SKILL.md)         | Agent skill definition for localdb-aware AI assistants                                    |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                         | Development setup, test gates, contribution guidelines                                    |
 

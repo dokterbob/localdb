@@ -63,8 +63,9 @@ issue carrying the research and open design questions.
 
 ## 3. Federation requirements
 
-[VISION.md](../VISION.md) (full text on the docs site) tells the sharing story in plain language;
-this section holds the technical version of it, and is what Phase 6 designs are judged against.
+[The project vision](../docs/vision.md) (published on the docs site) tells the sharing story in
+plain language; this section holds the technical version of it, and is what Phase 6 designs are
+judged against.
 
 **Sharing propagates; content does not relay.** The defining constraint is **direct connections, no
 indirection**. When Alice shares a list of stores with Bob — some hosted on her node, some that were

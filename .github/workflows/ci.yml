@@ -206,7 +206,7 @@ jobs:
             --offline --include-fragments --no-progress
             --exclude-path docs/index.md
             --exclude-path docs/_layouts
-            README.md CLAUDE.md CONTRIBUTING.md VISION.md
+            README.md CLAUDE.md CONTRIBUTING.md
             'docs/**/*.md' 'specs/**/*.md'
 
   # Demonstrate the coverage gate: this job has a dummy function with a test.
