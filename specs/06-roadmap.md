@@ -43,6 +43,9 @@ issue carrying the research and open design questions.
   (builds on #95), "soft dedup" of re-scans/re-OCRs/redaction variants via vector proximity.
 - **Agent / second-brain memory over MCP** — the read side works today and is documented as a recipe
   ([docs/agent-memory.md](../docs/agent-memory.md)); the MCP write path is tracked as (#349).
+- **Minimal read-only web UI** (#273) — basic search and browse on the existing HTTP API; the first
+  slice of the Phase 3 web surface (§1), pulled forward because private local access (including via
+  local AI models) is the primary use case and deserves a zero-terminal entry point.
 
 **Mid-term**
 
@@ -60,6 +63,8 @@ issue carrying the research and open design questions.
 - **Scale-out** beyond the single-node embedded design. The current architecture already handles
   multi-thousand-book collections well; corpora in the millions of pages will eventually stress
   single-node indexing and storage.
+- **Minimal native app (Swift)** — a macOS-native interface over the same local API, once the
+  read-only web UI has settled what the minimal surface is.
 
 ## 3. Federation requirements
 

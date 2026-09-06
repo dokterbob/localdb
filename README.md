@@ -17,7 +17,8 @@ See [how it compares to GPT4All, Khoj, Basic Memory, and others](#comparison-to-
 The long-horizon goal is larger: a private, trust-weighted alternative to the feed — your knowledge
 enriched by what the people you trust have found, with provenance at every hop. The foundation for
 that is built in from day one: content-addressed documents, per-chunk provenance, and stores as
-first-class shareable units. See the [project vision](docs/vision.md).
+first-class shareable units. **Start with the [project vision](docs/vision.md)** — the whole picture
+in plain language.
 
 Whatever the scale — a personal knowledge base, an AI agent's memory served back over MCP (see
 [docs/agent-memory.md](docs/agent-memory.md)), or a document collection running to millions of pages
@@ -77,6 +78,14 @@ not there yet.
    Use the absolute path — MCP clients spawn the binary directly, without your shell's PATH, so a
    bare `localdb` often fails to launch. See [docs/mcp.md](docs/mcp.md) for other clients and the
    remote/HTTP setup.
+
+   Optionally, install the [localdb agent skill](skills/localdb/SKILL.md) — a crib sheet that
+   teaches any skill-capable agent (Claude Code, Cursor, Codex, …) the CLI, citation shape, and MCP
+   tools:
+
+   ```bash
+   npx skills add dokterbob/localdb
+   ```
 
 ---
 

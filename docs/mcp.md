@@ -14,6 +14,15 @@ For design rationale and the trust model see
 Using localdb as searchable memory for an AI agent? There's a dedicated recipe:
 [Agent memory with localdb](agent-memory.md).
 
+Alongside the MCP hookup, the repository ships an **agent skill** — a
+[SKILL.md](https://github.com/dokterbob/localdb/blob/main/skills/localdb/SKILL.md) crib sheet
+covering the CLI, the citation JSON shape, the five MCP tools, and common failure modes. Any
+skill-capable agent (Claude Code, Cursor, Codex, and others) can install it with:
+
+```bash
+npx skills add dokterbob/localdb
+```
+
 ---
 
 ## Setup

@@ -21,7 +21,8 @@ the source of truth for what the agent knows. That is exactly the shape localdb 
 2. **Wire the MCP server into the harness** so the agent can search its own memory. Follow the
    [MCP setup guide](mcp.md#setup) for your host — stdio for a local harness
    (`claude mcp add localdb -- $(which localdb) mcp`), or HTTP via `localdb serve` for a harness on
-   another machine.
+   another machine. Optionally add the localdb agent skill (`npx skills add dokterbob/localdb`) so
+   the agent knows the CLI, citation shape, and tool signatures without discovering them by trial.
 
 3. **Search from the agent.** The agent's `search` calls now return ranked excerpts from its own
    memory with structured citations — which file, which byte span, which content hash — combining

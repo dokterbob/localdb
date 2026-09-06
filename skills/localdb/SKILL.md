@@ -1,40 +1,47 @@
 ---
 name: localdb
 description:
-  Search and index local document collections with the localdb CLI or MCP server — hybrid search
-  with citations over markdown, text, and PDF files.
+  Search and index local document collections with the localdb CLI or MCP server — hybrid (keyword +
+  semantic) search with byte-exact citations over Markdown, HTML, PDF, Office, EPUB, and plain-text
+  files, URLs, and feeds.
+license: AGPL-3.0-or-later
 ---
 
 ## When to use
 
-Use localdb when you need to retrieve passages from a local corpus (Markdown, plain text, PDF, or
-indexed URLs) with verifiable citations. It returns structured `Citation` objects with the source
-URI, exact text snippet, byte span, relevance scores (BM25, dense, fused), and document metadata
-extracted from frontmatter. Hybrid search (BM25 + binary-quantized dense) runs entirely in-process —
-no daemon or GPU needed.
+Use localdb when you need to retrieve passages from a local corpus with verifiable citations. It
+indexes Markdown, plain text, HTML, text-layer PDF, Office documents (DOCX/PPTX/XLSX/XLS/CSV), EPUB,
+and URL/feed sources, and returns structured `Citation` objects with the source URI, exact snippet,
+byte span, per-component relevance scores (BM25, dense, RRF-fused), provenance hashes, and Dublin
+Core document metadata. Hybrid search runs entirely in-process — no daemon or GPU needed. The first
+indexing or search operation downloads the default local embedding model (~706 MB, one time, no API
+key).
 
 ---
 
 ## CLI crib sheet
 
 ```bash
-# 1. Create a runtime store
+# 0. Shortcut: create the default store, add a folder, and index it in one step
+localdb add ~/notes
+
+# 1. Or explicitly: create a store
 localdb store add notes
 
 # 2. Register a directory as a source on that store
 localdb source add ~/notes --store notes
 
-# 2a. Or index a URL source
+# 2a. Or a URL / feed source
 localdb source add https://example.com/doc --store notes
 
-# 3. Index all sources in the store
+# 3. Index all sources in the store (incremental; re-run any time)
 localdb index --store notes
 
-# 4. Search and get JSON citations
-localdb search "reciprocal rank fusion" --store notes --json
+# 4. Search and get JSON citations (flags go BEFORE the query text)
+localdb search --store notes --json "reciprocal rank fusion"
 
 # 5. Extract URI + snippet from each citation with jq
-localdb search "your query" --store notes --json \
+localdb search --store notes --json "your query" \
   | jq -r '.citations[] | "\(.uri)\n  \(.snippet)"'
 ```
 
@@ -42,46 +49,62 @@ localdb search "your query" --store notes --json \
 
 ## Reading citations
 
-`localdb search --json` returns an object with a `citations` array. Each citation:
+`localdb search --json` returns an object with a `citations` array. Key fields per citation:
 
-| Field          | Type           | Meaning                                                                                                                                       |
-| -------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uri`          | string         | `file://` URI of the source document                                                                                                          |
-| `snippet`      | string         | Extracted text passage matching the query                                                                                                     |
-| `span`         | `{start, end}` | Byte offsets of the snippet within the document                                                                                               |
-| `score.fused`  | float          | Reciprocal-rank-fusion score (higher = more relevant)                                                                                         |
-| `score.bm25`   | float          | BM25 component                                                                                                                                |
-| `score.dense`  | float          | Dense vector component — normalized Hamming similarity (`1 − dist/bits`) from the binary-quantized local ONNX embedder                        |
-| `document_id`  | string         | Blake3 content hash — pass to `get_document` MCP tool                                                                                         |
-| `heading_path` | array          | Markdown heading breadcrumbs (may be empty)                                                                                                   |
-| `metadata`     | object         | Dublin Core document metadata extracted from frontmatter: `title`, `creator`, `date`, `description`, etc. Fields are `null` when not present. |
+| Field                     | Type           | Meaning                                                                                                                     |
+| ------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `uri`                     | string         | `file://` (or `https://`) URI of the source document                                                                        |
+| `snippet`                 | string         | Extracted text passage matching the query                                                                                   |
+| `location.span`           | `{start, end}` | Byte offsets of the snippet within the document                                                                             |
+| `score.fused`             | float          | Reciprocal-rank-fusion score (higher = more relevant)                                                                       |
+| `score.bm25`              | float          | BM25 component                                                                                                              |
+| `score.dense`             | float          | Dense component — normalized Hamming similarity with the default binary-quantized local model; cosine for float32 embedders |
+| `resource_id`             | string         | Blake3 content-addressed document ID — pass as `get_document`'s `id` / `get_chunks`' `resource_id`                          |
+| `chunk_id`                | string         | Content-addressed ID of this specific chunk                                                                                 |
+| `provenance.content_hash` | string         | Blake3 hash of the source content, plus `provenance.fetched_at`                                                             |
+| `heading_path`            | array          | Heading breadcrumbs above the snippet (may be empty)                                                                        |
+| `store`                   | object         | `{ id, name }` of the store the hit came from                                                                               |
+| `metadata`                | object         | Dublin Core document metadata (`title`, `creator`, `date`, `format`, …); fields are `null`/empty when not present           |
+
+There is no top-level `document_id` or `span` field — use `resource_id` and `location.span`.
 
 ---
 
 ## MCP tool shapes
 
-When localdb is registered as an MCP server (`localdb mcp`, or over HTTP at `/mcp` on a running
-`localdb serve` daemon), four tools are available:
+When localdb is registered as an MCP server (`localdb mcp` over stdio, or HTTP at `/mcp` on a
+running `localdb serve` daemon), five read-only tools are available:
 
 ```
-search(query: string, stores?: string[], limit?: int, content_length?: int)
-  → citations array (same shape as CLI --json)
+search(query: string, stores?: string[], limit?: int, content_length?: int, ...filters)
+  → citations array (same shape as CLI --json). Filters include mime, path (URI
+    prefix), and added/modified/document date bounds (RFC 3339, partial dates,
+    or relative durations like "7d").
 
-get_document(id: string)
-  → { document_id, uri, text, title, chunk_count, provenance, store, metadata }
-  Note: uri-based lookup is NOT supported in v1; use document_id from a search result.
+get_document(id: string, store?: string)
+  → { resource_id, uri, text, title, chunk_count, provenance, store, metadata }
+  Lookup is by content-addressed ID (a search result's resource_id); URI-based
+  lookup is not supported. `store` (id or name) disambiguates an ID present in
+  several stores.
 
-get_chunks(document_id: string, offset?: int, limit?: int)
-  → { document_id, uri, title, store, total_chunks, offset, limit, returned, chunks }
-  Paginated; an out-of-range offset returns an empty chunks array, not an error.
+get_chunks(resource_id: string, store?: string, offset?: int, limit?: int,
+           anchor_chunk_id?: string, anchor_block_seq?: int)
+  → { resource_id, title, store, total_chunks, offset, limit, returned, chunks }
+  Paginated in storage order; anchor_* center the window on a position instead
+  of offset. An out-of-range offset returns an empty chunks array, not an error.
 
 list_stores()
   → { stores: [{ id, name, visibility, document_count, chunk_count }] }
+
+list_documents(store: string, source?: string, offset?: int, limit?: int)
+  → paginated listing of everything indexed in one store (store is REQUIRED here,
+    unlike the optional store/stores everywhere else).
 ```
 
 Tool results are returned as a `text` content item whose `text` field contains pretty-printed JSON.
-If `localdb serve` is already running, `localdb mcp` proxies to its `/mcp` route automatically
-rather than conflicting with it.
+All tools are read-only in v1 — `--allow-write` is accepted but registers no writing tools yet. If
+`localdb serve` is already running, `localdb mcp` proxies to its `/mcp` route automatically rather
+than conflicting with it.
 
 ---
 
@@ -101,11 +124,12 @@ Pass it to any command with `--config /path/to/config.yaml`.
 
 ## Troubleshooting
 
-| Symptom                                                     | Cause                                                                      | Fix                                                                                                                                            |
-| ----------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `error: store not found: handbook` on `localdb index`       | Store was declared in YAML config — YAML-declared stores cannot be indexed | Use `localdb store add handbook` to create a runtime store, then `localdb source add`                                                          |
-| `Database already open. Cannot acquire lock.`               | Another embedded-mode process opened the DB while the daemon also holds it | Prefer letting the daemon serve reads/MCP (`localdb mcp` proxies to it automatically); stop the daemon only if you need direct embedded access |
-| `error: daemon is unreachable` (exit 5)                     | Stale `daemon.sock` left after daemon crash or `SIGKILL`                   | `rm <data_dir>/daemon.sock`                                                                                                                    |
-| Empty search results                                        | Store has not been indexed yet                                             | Run `localdb index --store <name>`                                                                                                             |
-| `error: invalid request: store 'X' already exists` (exit 2) | `store add` called for a store that already exists                         | Use the existing store; list stores with `localdb store list`                                                                                  |
-| `source add` on a non-existent path succeeds                | Path existence is not validated at add time                                | The error will surface at index time                                                                                                           |
+| Symptom                                                     | Cause                                                             | Fix                                                                        |
+| ----------------------------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `error: store not found: handbook` (exit 3)                 | The store has not been created (stores are not declared in YAML)  | `localdb store add handbook`, then `localdb source add … --store handbook` |
+| `database schema version N is behind this build` (exit 2)   | The database predates this binary's schema; `open` never migrates | Run `localdb db migrate` (check first with `localdb db status`)            |
+| `error: daemon is unreachable` (exit 5)                     | Stale `daemon.sock` left after a daemon crash or `SIGKILL`        | `rm <data_dir>/daemon.sock`                                                |
+| Empty search results                                        | Store has not been indexed yet                                    | Run `localdb index --store <name>`                                         |
+| `error: invalid request: store 'X' already exists` (exit 2) | `store add` called for a store that already exists                | Use the existing store; list stores with `localdb store list`              |
+| `source add /does/not/exist` fails (exit 2)                 | Path existence is validated at add time                           | Fix the path; only existing files/directories can be registered            |
+| First search/index takes minutes                            | One-time ~706 MB embedding-model download on first use            | Wait for the download to finish; later runs reuse the cached model         |

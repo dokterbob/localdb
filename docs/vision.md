@@ -15,6 +15,13 @@ answer with exact quoted passages, each one pointing back to the document it cam
 words: in the project's code and technical specifications, a library is called a _store_. This page
 says library.)
 
+The primary way to use a library is not to search it by hand — it's to give an AI assistant access
+to it. Connect an assistant, and it can answer your questions from your own documents, quoting
+exactly and citing every source. That assistant can itself run entirely on your computer, on a local
+model (through tools like LM Studio or oMLX), so that even the questions you ask never leave your
+machine. Searching a library directly, from the terminal, works too — but the point is that your
+accumulated knowledge becomes something you can talk to, privately.
+
 You can keep as many libraries as you like, side by side: one for your own notes, one for your
 bookmarks, one for a research project, later ones for your email and conversations. Each library is
 separate, each has its own rules, and all of them live on your machine.
@@ -88,9 +95,10 @@ found, with every claim traceable to its source.
 ## Where the project is today
 
 Today, localdb is the personal foundation of that picture, and it stands on its own: point it at
-your files, search them from the terminal or from an AI assistant you already use, get cited
-answers. Sharing comes later and deliberately — pieces of it will appear only when they can be built
-on mature, well-tested foundations.
+your files, then ask questions through an AI assistant you already use — including one running fully
+locally — or search from the terminal; either way, every answer arrives with its sources. Sharing
+comes later and deliberately — pieces of it will appear only when they can be built on mature,
+well-tested foundations.
 
 Everything on this page beyond the personal foundation is direction, not commitment: it exists so
 that near-term decisions can be judged against the long-term goal.

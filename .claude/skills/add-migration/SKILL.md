@@ -4,6 +4,8 @@ description:
   Step-by-step checklist for adding a schema migration to store-libsql's migration chain (chain.rs +
   create_schema write-twice rule, weight-class choice, drift guard). Use when a change to localdb's
   unified database schema is needed.
+metadata:
+  internal: true
 ---
 
 ## When to use
