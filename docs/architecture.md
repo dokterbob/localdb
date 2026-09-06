@@ -657,12 +657,18 @@ next successful contact: the ordinary entry loop on a fresh `200`, or the due-en
 `304` (see below), whichever comes first. A feed that keeps answering `304` no longer defers a due
 entry indefinitely: the due-entry revisit walks entries this source has previously indexed past the
 recheck floor even when the feed document itself hasn't changed, capped at the same 25-per-run batch
-bound the liveness sweep uses. Three escape hatches reopen the gate early:
-`localdb index --refetch`; a feed-side `updated` or author change — or a title change, but only
-while the resource still has no stored title for the feed's fallback to fill, since
-`MetadataEnrichment::apply_to` only ever fills a missing title, never replaces one — which changes
-the claim the gate compares against the stored `metadata_hash`; and a `policy_version` bump. Under
-`--delete`, this interacts with the liveness sweep (gap #10 above): when guard 2's zero-seen
+bound the liveness sweep uses — drawn in random order rather than the sweep's oldest-first, since
+the revisit (unlike the sweep) never advances `last_checked_at` on a failed outcome, and a
+deterministic oldest-first pick would let a batch-sized clique of permanently failing entries starve
+everything behind it. Three escape hatches reopen the gate early: `localdb index --refetch`; a
+change to any part of the connector's claim — `external_id`, `modified_at_override`, or the supplied
+enrichment (`updated`/`published`, authors, …) — that alters the merged `metadata_hash` the gate
+compares; and a `policy_version` bump. The claim comparison inherits two asymmetries from
+`MetadataEnrichment::apply_to`: a title change only alters the hash while the resource still has no
+stored title for the feed's fallback to fill (the merge only ever fills a missing title, never
+replaces one), and a creators list going non-empty → empty never changes the stored creators (the
+merge only replaces them on non-empty input), so an author _removal_ alone does not reopen the gate.
+Under `--delete`, this interacts with the liveness sweep (gap #10 above): when guard 2's zero-seen
 backstop fires on a `304`'d feed document, a sweep probe of a still-in-window entry advances that
 entry's `last_checked_at` exactly like an ordinary probe, deferring by a full floor whichever
 mechanism would otherwise have rechecked it next — the ordinary entry loop's turn on a future `200`,
