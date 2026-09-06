@@ -307,6 +307,56 @@ async fn touch_resource_liveness_inner(
     Ok(())
 }
 
+/// Advance `resources.last_checked_at` for one resource to now, and write
+/// nothing else — not the validators, not `index_updated_at`. Backs
+/// `RetrievalStore::touch_resource_checked`.
+///
+/// The single-column counterpart to `touch_resource_liveness` above, used
+/// outside the feed liveness sweep (entry recheck gate, `url` sources,
+/// single-document feed mode) — see that trait method's doc comment for why
+/// it writes only this one column.
+pub(crate) async fn touch_resource_checked(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<(), Error> {
+    ensure_store_id(store, store_id, "touch_resource_checked")?;
+    let tx = store.conn().write_tx().await?;
+    let result = touch_resource_checked_inner(&tx, store_id, resource_id).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn touch_resource_checked_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<(), Error> {
+    // One write-time clock reading for this write, mirroring
+    // `touch_resource_liveness_inner`'s single `now_rfc3339()` call — bound
+    // to `last_checked_at` only; see this function's doc comment.
+    let last_checked_at = localdb_core::ingestion::now_rfc3339();
+    let rows_affected = conn
+        .execute(
+            "UPDATE resources SET last_checked_at = ?1 WHERE store_id = ?2 AND id = ?3",
+            params![
+                last_checked_at.as_str(),
+                store_id.to_string(),
+                resource_id.to_string()
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    if rows_affected == 0 {
+        // The row vanished — a concurrent delete raced this check. Report it
+        // rather than silently succeeding, mirroring
+        // `touch_resource_liveness_inner`'s same guard.
+        return Err(Error::ResourceNotFound {
+            id: resource_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn upsert_blocks(
     store: &TenantStore,
     resource_id: &str,

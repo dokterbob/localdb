@@ -43,6 +43,7 @@ fn document_index_upsert_and_get() {
         metadata_hash: "mhash-1".to_string(),
         external_etag: None,
         external_last_modified: None,
+        last_checked_at: None,
     };
     idx.upsert(rec.clone());
     let found = idx.get("file:///test.md").unwrap();
@@ -61,6 +62,7 @@ fn document_index_remove() {
         metadata_hash: "mhash-1".to_string(),
         external_etag: None,
         external_last_modified: None,
+        last_checked_at: None,
     };
     idx.upsert(rec);
     let removed = idx.remove("file:///test.md");
@@ -976,6 +978,7 @@ mod unified_pipeline {
             metadata_hash,
             external_etag: resource.external_etag.clone(),
             external_last_modified: resource.external_last_modified.clone(),
+            last_checked_at: None,
         }
     }
 
@@ -3727,6 +3730,7 @@ mod unified_pipeline {
             metadata_hash: "mhash-1".to_string(),
             external_etag: Some("\"abc\"".to_string()),
             external_last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            last_checked_at: None,
         });
 
         let mut callback =
@@ -3767,6 +3771,7 @@ mod unified_pipeline {
             metadata_hash: "mhash-1".to_string(),
             external_etag: Some("\"abc\"".to_string()),
             external_last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            last_checked_at: None,
         });
 
         let mut callback =
@@ -3842,6 +3847,7 @@ mod unified_pipeline {
             metadata_hash,
             external_etag: resource.external_etag.clone(),
             external_last_modified: resource.external_last_modified.clone(),
+            last_checked_at: None,
         }
     }
 
@@ -5113,6 +5119,7 @@ mod unified_pipeline {
                 metadata_hash: "mhash".to_string(),
                 external_etag: None,
                 external_last_modified: None,
+                last_checked_at: None,
             });
         }
 
