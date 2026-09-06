@@ -383,6 +383,56 @@ async fn create_job_rejects_non_bool_refetch() {
     assert_eq!(body["code"], "invalid_request");
 }
 
+/// A request without `content-type: application/json` never reaches body
+/// deserialization: `ApiJson` passes axum's stock `415` through untouched
+/// (the spec's error taxonomy has no code for it), the same response every
+/// plain-`Json` route on this daemon gives.
+#[tokio::test]
+async fn create_job_without_json_content_type_is_415_not_enveloped() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .body(Body::from(json!({"store_name": "test"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+/// A body over axum's default size limit likewise passes through as the
+/// stock `413`, not a misleading `invalid_request` 400 — the client's
+/// problem is the size, not the content.
+#[tokio::test]
+async fn create_job_with_oversized_body_is_413_not_enveloped() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    // Valid JSON either way — over the default 2MB body limit, the bytes
+    // are never even read to find out.
+    let oversized = format!(
+        r#"{{"store_name": "test", "padding": "{}"}}"#,
+        "x".repeat(3 * 1024 * 1024)
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 /// `refetch: true` is accepted (202), and the completed job's `stats`
 /// exposes `docs_recheck_deferred` — always present, default 0 for a
 /// `path` source (the recheck gate only ever applies to feed discovery
