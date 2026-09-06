@@ -27,7 +27,7 @@ use localdb_core::{IndexJobScope, IndexJobStats};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::common::{fake_yaml, test_state};
+use super::common::{fake_yaml, test_state, test_state_with_backend};
 use crate::job_exec::{run_job, JobExecDeps};
 use crate::state::AppState;
 
@@ -97,7 +97,11 @@ async fn aged_out_entry_probe_goes_through_the_restricted_entry_fetcher() {
     let entry_a_url = format!("{}/entry-a", server.uri());
     let entry_b_url = format!("{}/entry-b", server.uri());
 
-    let (dir, state) = test_state().await;
+    // `test_state_with_backend` (not plain `test_state`) because this test
+    // must reach past `AppState::backend()`'s `&dyn StoreBackend` to
+    // backdate a resource's `last_checked_at` below — see the comment at
+    // that backdating call for why.
+    let (dir, state, sqlite_backend) = test_state_with_backend().await;
     seed_two_entry_feed(&state, &feed_url).await;
     let store = state
         .backend()
@@ -132,6 +136,46 @@ async fn aged_out_entry_probe_goes_through_the_restricted_entry_fetcher() {
         stats1.docs_indexed, 2,
         "both entries must be indexed on run 1, via the embedded-content fallback"
     );
+
+    // Both entries were indexed via the embedded-content fallback (their
+    // links are blocked, never a real origin contact), so `on_resource_fallback`
+    // — not `on_resource` — is what ran for them, and it never calls
+    // `touch_resource_checked` (specs/04-search-pipeline.md §1 "Recheck
+    // gate": only a real 200/304 origin contact stamps `last_checked_at`).
+    // Confirm that end to end through the real libsql store before relying
+    // on it: `last_checked_at IS NULL` is exactly what already makes
+    // `list_stale_feed_resources` treat a never-checked row as a candidate
+    // (see that query's own doc comment), which is what the rest of this
+    // test's backdating step below is set up to demonstrate explicitly.
+    let retrieval_store = state.backend().retrieval_store(&store.id).await.unwrap();
+    let indexed_after_run1 = retrieval_store.list_indexed_documents().await.unwrap();
+    let entry_a_record = indexed_after_run1
+        .iter()
+        .find(|doc| doc.uri == entry_a_url)
+        .expect("entry A must have been indexed by run 1");
+    assert!(
+        indexed_after_run1
+            .iter()
+            .all(|doc| doc.last_checked_at.is_none()),
+        "embedded-content fallback must never stamp last_checked_at for either entry"
+    );
+
+    // Explicitly backdating (rather than relying on the NULL left by run 1)
+    // is what makes "A scrolled off the feed window a while ago" true in
+    // wall-clock terms, on top of "A is absent from this run's feed"
+    // (already true via the narrowed mock below) — a fixed past timestamp
+    // pins the sweep's candidate-selection behaviour on a stale
+    // `last_checked_at`, not merely a `NULL` one, so this test still proves
+    // something once a later fix (e.g. remembering fallback failures) stops
+    // leaving it `NULL`.
+    sqlite_backend
+        .set_last_checked_at_for_test(
+            &store.id,
+            &entry_a_record.resource_id,
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
 
     // Run 2: the feed narrows to just B — A has scrolled off the window,
     // so the liveness sweep (not the ordinary discovery loop, which never
