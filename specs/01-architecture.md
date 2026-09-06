@@ -68,7 +68,7 @@ extracted and buffered per-document logic directly inside `core`.
    in-process, MIT-licensed) — a single engine providing DiskANN vector search, FTS5 for BM25, and
    relational metadata in one file. Qdrant server becomes the remote-mode adapter on the roadmap;
    **Qdrant Edge** (in-process, pre-GA ~0.6.x as of early 2026) is a watch-item
-   ([06-roadmap.md](06-roadmap.md) §3). Hybrid fusion (RRF) is done in our code above the trait, not
+   ([06-roadmap.md](06-roadmap.md) §4). Hybrid fusion (RRF) is done in our code above the trait, not
    delegated ([04-search-pipeline.md](04-search-pipeline.md) §5). **Rejected:** Qdrant as local
    default — Qdrant has no embedded mode (server-only), which would force a daemon-always model and
    contradict §3.
@@ -127,8 +127,8 @@ indexing. The term "document" is retired from the domain model in favor of "reso
 
 ## 5. Federation-readiness constraints (design constraints only)
 
-MVP implements none of the federation behavior in [VISION.md](../VISION.md), but every MVP component
-must respect:
+MVP implements none of the federation behavior envisioned in [VISION.md](../VISION.md) and specified
+in [06-roadmap.md](06-roadmap.md) §3, but every MVP component must respect:
 
 1. **Stable, content-addressed IDs** for resources and chunks
    ([02-domain-model.md](02-domain-model.md) §3) — IDs must be meaningful outside the node that

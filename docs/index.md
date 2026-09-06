@@ -69,6 +69,8 @@ title: localdb docs
   </div>
 
   <div class="link-list">
+    <a href="{{ '/vision.html' | relative_url }}">Vision</a>
+    <a href="{{ '/agent-memory.html' | relative_url }}">Agent memory</a>
     <a href="{{ '/configuration.html' | relative_url }}">Configuration</a>
     <a href="{{ '/architecture.html' | relative_url }}">Architecture</a>
     <a href="{{ '/http-api.html' | relative_url }}">HTTP API</a>

@@ -202,5 +202,5 @@ does work — dist only needs the tag — but the changelog and version pins won
 - **CUDA**: today the ONNX sessions register no execution providers (CPU-only). A `local-cuda`
   feature and CUDA release artifact are tracked separately.
 - **launchd / systemd units outside brew**: `brew services` covers Homebrew installs; bare-tarball
-  installs still have no unit files. See `specs/06-roadmap.md §4`.
+  installs still have no unit files. See `specs/06-roadmap.md §5`.
 - **Windows**: no target yet.

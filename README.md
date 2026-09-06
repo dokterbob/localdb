@@ -17,7 +17,15 @@ See [how it compares to GPT4All, Khoj, Basic Memory, and others](#comparison-to-
 The long-horizon goal is larger: a private, trust-weighted alternative to the feed — your knowledge
 enriched by what the people you trust have found, with provenance at every hop. The foundation for
 that is built in from day one: content-addressed documents, per-chunk provenance, and stores as
-first-class shareable units. See [VISION.md](VISION.md).
+first-class shareable units. See the [project vision](docs/vision.md).
+
+Whatever the scale — a personal knowledge base, an AI agent's memory served back over MCP (see
+[docs/agent-memory.md](docs/agent-memory.md)), or a document collection running to millions of pages
+— your data stays on your machine, and you decide what, if anything, ever leaves it.
+
+localdb also continues a long-running thread: its author previously built and ran
+[ipfs-search.com](https://github.com/ipfs-search) — open-source, decentralized search for the IPFS
+network — for seven years.
 
 **Status:** hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS

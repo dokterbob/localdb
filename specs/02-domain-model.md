@@ -598,7 +598,7 @@ from content (Resource, Chunk) get **content-addressed blake3 IDs** as defined a
 
 **Rationale:** content-addressed IDs are the federation prerequisite — two nodes indexing the same
 content derive the same chunk identity, enabling dedup, provenance comparison, and integrity checks
-without coordination ([VISION.md](../VISION.md)). They also make re-indexing idempotent.
+without coordination ([06-roadmap.md](06-roadmap.md) §3). They also make re-indexing idempotent.
 **Rejected:** auto-increment rows (meaningless off-node); UUIDv4 for resources/chunks (stable only
 by table lookup, not by content).
 

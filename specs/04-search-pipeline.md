@@ -614,11 +614,12 @@ implementation matches glyph-run spans rather than lines and deletes body text f
 documents. Reported upstream as
 [pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022).
 
-**Out of scope (explicit):** OCR / scanned PDFs and images. EPUB is the only ebook format supported;
-**MOBI/AZW/AZW3** (PalmDOC/KF8 compression, frequent DRM — realistically need a Calibre shell-out)
-and **FB2/CBZ** (on `rbook`'s roadmap, not yet implemented) are deferred. Rationale and the full
-deferred list: [06-roadmap.md](06-roadmap.md) §5. Unsupported files are skipped and counted in
-IndexJob stats, not errors.
+**Out of scope (explicit):** OCR / scanned PDFs and images — now scheduled as a near-term capability
+([06-roadmap.md](06-roadmap.md) §2, #344), but not part of the v1 extraction matrix. EPUB is the
+only ebook format supported; **MOBI/AZW/AZW3** (PalmDOC/KF8 compression, frequent DRM —
+realistically need a Calibre shell-out) and **FB2/CBZ** (on `rbook`'s roadmap, not yet implemented)
+are deferred. Rationale and the full deferred list: [06-roadmap.md](06-roadmap.md) §6. Unsupported
+files are skipped and counted in IndexJob stats, not errors.
 
 **XLSX/XLS explicitly disabled:** Despite anytomd supporting XLSX/XLS in principle, extraction for
 these formats is disabled in `OfficeParser` pending an upstream performance fix.
@@ -833,9 +834,11 @@ implementation detail — the trait shape is stable regardless of how context is
 per-chunk embedding is the degenerate case (context ignored, one chunk per call batch).
 **Rationale:** contextualized/late-chunking models need the surrounding document to embed each
 chunk; retrofitting a flat trait later would touch every call site. The message-store case (thread
-as context for each turn window) is the same shape ([02-domain-model.md](02-domain-model.md) §5).
-**Rejected:** flat `embed(texts) -> vectors` trait — locks the architecture to context-free
-embedding.
+as context for each turn window) is the same shape ([02-domain-model.md](02-domain-model.md) §5) —
+and the motivating one: future message connectors (email, chat) produce chunks that are
+near-meaningless without their thread, so the interface is document-aware from day one rather than
+retrofitted when those connectors land. **Rejected:** flat `embed(texts) -> vectors` trait — locks
+the architecture to context-free embedding.
 
 ### Models and providers
 
@@ -1006,7 +1009,7 @@ interpolation (needs per-model calibration); backend-native fusion (backend-depe
   ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
   (`score: {fused, dense, bm25}`). Citations carry a **block reference** and chunk position within
   that block, not just a Markdown span.
-- **Reranking: explicitly post-MVP** ([06-roadmap.md](06-roadmap.md) §5). The pipeline leaves a seam
+- **Reranking: explicitly post-MVP** ([06-roadmap.md](06-roadmap.md) §6). The pipeline leaves a seam
   (rerank stage between fuse and shape) but ships nothing.
 - Query rewriting and answer generation are **not** backend-core concerns — they belong to
   downstream consumers (agents, future UI). URL/image as _query_ modes: out of scope v1.
