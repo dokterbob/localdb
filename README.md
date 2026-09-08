@@ -114,10 +114,12 @@ example calls.
 
 > **Privacy boundary:** localdb indexes, embeds, and searches your data locally, but MCP results are
 > delivered to the MCP client. If that client uses a cloud-hosted model, retrieved excerpts or full
-> documents may be sent to that provider under its data-handling policy. For a no-data-egress setup,
+> documents may be sent to that provider under its data-handling policy. To minimize data exposure,
 > use a local/self-hosted model and the stdio transport, and expose only the required stores with
-> `--store`. Store scoping reduces what the client can retrieve; it cannot control what the client
-> does with returned data. See [docs/mcp.md](docs/mcp.md#data-and-model-privacy).
+> `--store`. Preventing data egress also requires independently reviewing and restricting the client's
+> outbound networking, including telemetry, cloud memory, and plugins. Store scoping reduces what the
+> client can retrieve; neither it nor stdio controls what the client does with returned data.
+> See [docs/mcp.md](docs/mcp.md#data-and-model-privacy).
 
 ## Experimental HTTP daemon
 
