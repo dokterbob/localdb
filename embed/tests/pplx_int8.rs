@@ -8,7 +8,7 @@
 //! # Running
 //!
 //! ```sh
-//! HF_TOKEN=<your-token> cargo test -p embed --features local-onnx -- --ignored pplx_embed_v1_int8
+//! HF_TOKEN=<your-token> cargo test -p localdb-embed --features local-onnx -- --ignored pplx_embed_v1_int8
 //! ```
 //!
 //! `HF_TOKEN` is required on first run to download the gated model from
@@ -37,7 +37,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 /// Run locally with:
 ///
 /// ```sh
-/// HF_TOKEN=<token> cargo test -p embed --features local-onnx -- --ignored pplx_embed_v1_int8
+/// HF_TOKEN=<token> cargo test -p localdb-embed --features local-onnx -- --ignored pplx_embed_v1_int8
 /// ```
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~2.4 GB of ONNX model files on first run; run with --ignored"]

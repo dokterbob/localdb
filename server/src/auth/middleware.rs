@@ -2,9 +2,8 @@
 //! protected route (specs/05-surfaces.md §3.1).
 //!
 //! Applied in `daemon::build_router` *after* the `/mcp` `nest_service`, so
-//! it covers all of `/v1/*` and `/mcp`. None of the public routes from the
-//! spec §3.1 table (`/.well-known/*`, `/authorize`, `/token`, ...) exist yet
-//! (T4/T6/T7), so in T3 every registered route is protected.
+//! it covers management and retrieval routes plus `/mcp`. Public OAuth,
+//! discovery, and invite-redemption routes are mounted outside this layer.
 //!
 //! Behavior by mode:
 //! - [`AuthMode::Open`]: inserts `Principal::local_trust()` into the request
@@ -37,16 +36,16 @@
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 
-use localdb_core::{auth::Principal, Error};
+use localdb_core::{Error, auth::Principal};
 
 use crate::{error::ApiError, state::AppState};
 
-use super::{base_url::resolve_base_url, AuthMode};
+use super::{AuthMode, base_url::resolve_base_url};
 
 /// Extract the bearer secret from an `Authorization` header value.
 ///

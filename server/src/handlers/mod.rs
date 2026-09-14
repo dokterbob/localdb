@@ -12,10 +12,14 @@
 //!   GET  /stores/:name/sources    — list sources for a store
 //!   POST /stores/:name/sources    — add source to a store
 //!   DELETE /sources/:id           — remove a source by ID
+//!   GET  /stores/:name/documents  — list documents in a store
 //!   GET  /documents/:id           — get document by ID
 //!   POST /search                  — hybrid search
+//!   GET  /jobs                    — list every job
 //!   POST /jobs                    — submit index job
 //!   GET  /jobs/:id                — get job by ID
+//!   DELETE /jobs/:id              — cancel a queued or running job
+//!   GET  /jobs/:id/events         — stream live job progress (SSE)
 //!   GET  /status                  — daemon status
 //!   GET  /config                  — resolved config (startup snapshot; no hot-reload)
 //!   GET  /auth/me                 — the caller's authenticated principal
@@ -44,14 +48,16 @@ mod users;
 pub use auth::get_me;
 pub use config::get_config;
 pub use discovery::{oauth_authorization_server, oauth_protected_resource};
-pub use documents::get_document;
+
 pub use grants::{create_grant, delete_grant, list_grants};
 pub use invites::{
     approve_request as approve_access_request, create_invite, deny_request as deny_access_request,
     list_access_requests, list_invites, poll_request as poll_access_request,
     redeem_invite as redeem_invite_public, revoke_invite,
 };
-pub use jobs::{create_job, get_job};
+
+pub use documents::{get_document, list_documents};
+pub use jobs::{cancel_job, create_job, get_job, job_events, list_jobs};
 pub use keys::{create_key, list_keys, revoke_key};
 pub use search::search;
 pub use sources::{create_source, delete_source, list_sources};
@@ -105,6 +111,45 @@ pub(crate) fn parse_cursor(cursor: Option<&str>) -> Result<usize, ApiError> {
     }
 }
 
+/// Reject `?limit=0` on a list endpoint rather than reinterpreting it.
+///
+/// A zero limit truncates every page to empty while `PaginatedList::new`'s
+/// `next_cursor` still advances by the unchanged offset (`offset + 0 <
+/// total`), so a client following cursors would loop forever on the same
+/// empty page. Rejecting outright — rather than clamping up to 1 — matches
+/// the MCP `list_documents`/`get_chunks` tools' own `resolve_limit`
+/// (`mcp/src/tools/mod.rs`): clamping `0` up to `1` would silently return an
+/// item the caller did not ask for.
+pub(crate) fn parse_limit(limit: usize) -> Result<usize, ApiError> {
+    if limit == 0 {
+        return Err(ApiError(localdb_core::Error::InvalidRequest {
+            message: "limit must be at least 1".to_string(),
+        }));
+    }
+    Ok(limit)
+}
+
+#[cfg(test)]
+mod parse_limit_tests {
+    use super::parse_limit;
+
+    #[test]
+    fn zero_is_rejected_as_invalid_request() {
+        let err = parse_limit(0).expect_err("limit=0 must be rejected");
+        match err.0 {
+            localdb_core::Error::InvalidRequest { .. } => {}
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonzero_passes_through_unchanged() {
+        assert_eq!(parse_limit(1).unwrap(), 1);
+        assert_eq!(parse_limit(20).unwrap(), 20);
+        assert_eq!(parse_limit(usize::MAX).unwrap(), usize::MAX);
+    }
+}
+
 /// A paginated list response.
 #[derive(Debug, Serialize)]
 pub struct PaginatedList<T: Serialize> {
@@ -115,10 +160,19 @@ pub struct PaginatedList<T: Serialize> {
 
 impl<T: Serialize> PaginatedList<T> {
     pub(crate) fn new(mut items: Vec<T>, offset: usize, limit: usize, total: usize) -> Self {
-        let next_cursor = if offset + limit < total {
-            Some(format!("{}", offset + limit))
-        } else {
-            None
+        // `offset + limit` is unchecked-add territory (issue #187 review,
+        // finding G3, sibling of the same bug in `search_service`): a
+        // client-supplied `?cursor=` near `usize::MAX` combined with any
+        // `?limit=` could otherwise panic in debug or wrap in release. Unlike
+        // `/v1/search`'s `resolve_page_end`, an overflow here is never a
+        // usable page — the offset already exceeds any real list length — so
+        // it is treated as end-of-list (`next_cursor: None`) rather than
+        // rejected; the caller already sliced `items` with `.skip(offset)`,
+        // which degrades to empty instead of panicking, so silently reporting
+        // "no more pages" is consistent with the data actually returned.
+        let next_cursor = match offset.checked_add(limit) {
+            Some(page_end) if page_end < total => Some(format!("{page_end}")),
+            _ => None,
         };
         items.truncate(limit);
         Self {
@@ -127,4 +181,53 @@ impl<T: Serialize> PaginatedList<T> {
             total,
         }
     }
+}
+
+#[cfg(test)]
+mod paginated_list_tests {
+    use super::PaginatedList;
+
+    #[test]
+    fn new_computes_next_cursor_for_a_normal_page() {
+        let list = PaginatedList::new(vec!["a", "b"], 0, 2, 5);
+        assert_eq!(list.next_cursor.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn new_with_offset_and_limit_near_usize_max_does_not_panic_and_has_no_next_cursor() {
+        // A client-supplied `?cursor=` near `usize::MAX` paired with any
+        // `?limit=` must not panic on the unchecked `offset + limit` this
+        // regresses (issue #187 review, finding G3, sibling of the
+        // search_service bug). No real list is ever this long, so treating
+        // the overflow as end-of-list is correct, not just safe.
+        let list = PaginatedList::new(Vec::<&str>::new(), usize::MAX, 1, 5);
+        assert_eq!(list.next_cursor, None);
+        assert!(list.items.is_empty());
+
+        let list = PaginatedList::new(Vec::<&str>::new(), 10, usize::MAX, 5);
+        assert_eq!(list.next_cursor, None);
+    }
+}
+
+pub(super) async fn readable_store_names(
+    state: &crate::state::AppState,
+    principal: &localdb_core::auth::Principal,
+    requested: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let stores = state.backend().list_stores().await?;
+    for name in requested {
+        let store = stores
+            .iter()
+            .find(|s| &s.name == name)
+            .ok_or_else(|| localdb_core::Error::StoreNotFound { id: name.clone() })?;
+        principal.require_read_store(&store.name, store.visibility.clone())?;
+    }
+    Ok(stores
+        .into_iter()
+        .filter(|s| {
+            (requested.is_empty() || requested.contains(&s.name))
+                && principal.can_read_store(&s.name, s.visibility.clone())
+        })
+        .map(|s| s.name)
+        .collect())
 }

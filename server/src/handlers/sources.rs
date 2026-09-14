@@ -9,7 +9,7 @@ use localdb_core::auth::Principal;
 use localdb_core::types::StoreVisibility;
 use localdb_core::Error as CoreError;
 
-use super::{parse_cursor, require_principal, PaginatedList, PaginationParams};
+use super::{parse_cursor, parse_limit, require_principal, PaginatedList, PaginationParams};
 use crate::error::ApiError;
 use crate::state::{AppState, SourceRecord};
 
@@ -24,6 +24,7 @@ pub async fn list_sources(
 ) -> Result<Json<PaginatedList<SourceRecord>>, ApiError> {
     let principal = require_principal(principal)?;
     let offset = parse_cursor(pagination.cursor.as_deref())?;
+    let limit = parse_limit(pagination.limit)?;
 
     let store = state.get_store_by_name(&store_name).await?;
     let visibility = StoreVisibility::parse(&store.visibility).unwrap_or(StoreVisibility::Private);
@@ -39,12 +40,7 @@ pub async fn list_sources(
     let all = state.list_sources(&store_name).await?;
     let total = all.len();
     let page = all.into_iter().skip(offset).collect::<Vec<_>>();
-    Ok(Json(PaginatedList::new(
-        page,
-        offset,
-        pagination.limit,
-        total,
-    )))
+    Ok(Json(PaginatedList::new(page, offset, limit, total)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,13 +63,11 @@ pub async fn create_source(
     Path(store_name): Path<String>,
     Json(req): Json<CreateSourceRequest>,
 ) -> Result<(StatusCode, Json<SourceRecord>), ApiError> {
-    require_principal(principal)?
-        .require_admin()
-        .map_err(ApiError)?;
-    if req.kind != "path" && req.kind != "url" {
+    require_principal(principal)?.require_admin()?;
+    if req.kind != "path" && req.kind != "url" && req.kind != "feed" {
         return Err(ApiError(CoreError::InvalidRequest {
             message: format!(
-                "unknown source kind '{}'; expected 'path' or 'url'",
+                "unknown source kind '{}'; expected 'path', 'url', or 'feed'",
                 req.kind
             ),
         }));

@@ -11,10 +11,7 @@ use localdb_core::config::schema::{
     DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, RawConfig,
 };
 use serde_json::{json, Value};
-use server::{
-    build_router, mcp_bridge::AppStateStoreProvider, AppState, AuthMode, JobQueue,
-    UrlRefreshScheduler,
-};
+use server::{build_router, AppState, AuthMode, JobQueue, UrlRefreshScheduler};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -47,6 +44,7 @@ pub(crate) async fn make_app_with_mode_and_public_url(
     let state = AppState::new(
         yaml_config,
         dir.path().to_path_buf(),
+        dir.path().join("models"),
         queue.clone(),
         UrlRefreshScheduler::new(queue),
         mode,
@@ -54,18 +52,11 @@ pub(crate) async fn make_app_with_mode_and_public_url(
     .await
     .expect("fake daemon state should open a temp libsql database");
 
-    // The provider wraps a clone of `state` (cheap — `AppState` is
-    // `Arc`-backed) so it keeps resolving stores from the *same* live
-    // database `state`/the returned `Router` share, even after this
-    // function returns — this is what lets `mcp_route.rs`'s realtime test
-    // add a store via `POST /v1/stores` after the router is built and see
-    // it reflected in a later `list_stores` MCP call, no restart needed.
-    let mcp_provider: std::sync::Arc<dyn mcp::StoreProvider> =
-        std::sync::Arc::new(AppStateStoreProvider::new(state.clone()));
-
     let router = build_router(
         state.clone(),
-        mcp_provider,
+        std::sync::Arc::new(server::mcp_bridge::AppStateStoreProvider::new(
+            state.clone(),
+        )),
         // Dimension must match `fake_yaml_config`'s embedding policy
         // (provider "fake", model "default" -> 128-dim, see
         // `embed::infer_dim_encoding`/`SHAPES`) — this is the dimension the
@@ -81,9 +72,6 @@ pub(crate) async fn make_app_with_mode_and_public_url(
 
 fn fake_yaml_config() -> RawConfig {
     RawConfig {
-        version: 1,
-        server: Default::default(),
-        paths: Default::default(),
         defaults: DefaultsConfig {
             indexing: IndexingPolicyConfig {
                 chunking: Default::default(),
@@ -94,7 +82,7 @@ fn fake_yaml_config() -> RawConfig {
                 ..Default::default()
             },
         },
-        providers: vec![],
+        ..Default::default()
     }
 }
 

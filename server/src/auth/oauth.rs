@@ -15,15 +15,15 @@
 //! layer.
 
 use axum::{
+    Json,
     extract::{Form, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
-use localdb_core::auth::{self, AuthStore as _, RedeemOutcome, Role};
 use localdb_core::Error as CoreError;
+use localdb_core::auth::{self, AuthStore as _, RedeemOutcome, Role};
 
 use crate::state::AppState;
 
@@ -352,7 +352,7 @@ pub async fn post_authorize(
     let user_id = match resolve_credential(&state, credential.trim()).await {
         Ok(id) => id,
         Err(message) => {
-            return render_consent_page(&params, "", None, Some(&message)).into_response()
+            return render_consent_page(&params, "", None, Some(&message)).into_response();
         }
     };
 
@@ -645,7 +645,7 @@ async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
                 e,
                 "the authorization code is invalid, expired, already used, or does not match \
                  this client/redirect_uri/code_verifier",
-            )
+            );
         }
     };
 
@@ -843,8 +843,7 @@ mod tests {
     // than driving a real internal fault end-to-end through the HTTP route.
     // -----------------------------------------------------------------
 
-    const AUTH_CODE_GRANT_FAILURE_DESCRIPTION: &str =
-        "the authorization code is invalid, expired, already used, or does not match \
+    const AUTH_CODE_GRANT_FAILURE_DESCRIPTION: &str = "the authorization code is invalid, expired, already used, or does not match \
          this client/redirect_uri/code_verifier";
 
     #[tokio::test]

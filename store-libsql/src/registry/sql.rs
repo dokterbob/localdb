@@ -28,6 +28,7 @@ pub(super) fn kind_to_sql(k: &SourceKind) -> &'static str {
     match k {
         SourceKind::Path => "path",
         SourceKind::Url => "url",
+        SourceKind::Feed => "feed",
     }
 }
 
@@ -35,6 +36,7 @@ pub(super) fn kind_from_sql(s: &str) -> Result<SourceKind, Error> {
     match s {
         "path" => Ok(SourceKind::Path),
         "url" => Ok(SourceKind::Url),
+        "feed" => Ok(SourceKind::Feed),
         other => Err(Error::Internal {
             message: format!("unknown source kind in DB: {other}"),
             correlation_id: "rt_sources_kind".to_string(),
@@ -72,6 +74,10 @@ pub(super) fn row_to_source(row: &libsql::Row) -> Result<SourceRow, Error> {
     let preset: String = row.get(7).map_err(map_libsql_err)?;
     let refresh: Option<String> = row.get(8).map_err(map_libsql_err)?;
     let created_at: String = row.get(9).map_err(map_libsql_err)?;
+    let config_json: Option<String> = row.get(10).map_err(map_libsql_err)?;
+    let feed_etag: Option<String> = row.get(11).map_err(map_libsql_err)?;
+    let feed_last_modified: Option<String> = row.get(12).map_err(map_libsql_err)?;
+    let feed_inputs_digest: Option<String> = row.get(13).map_err(map_libsql_err)?;
     let include: Vec<String> =
         serde_json::from_str(&include_json).map_err(|e| Error::Internal {
             message: format!("invalid source.include JSON: {e}"),
@@ -93,5 +99,9 @@ pub(super) fn row_to_source(row: &libsql::Row) -> Result<SourceRow, Error> {
         preset,
         refresh,
         created_at,
+        config_json,
+        feed_etag,
+        feed_last_modified,
+        feed_inputs_digest,
     })
 }

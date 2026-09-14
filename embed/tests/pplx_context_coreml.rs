@@ -6,7 +6,7 @@
 //! never run in CI (which stays offline). Run them manually with:
 //!
 //! ```sh
-//! cargo test -p embed --features "local-onnx local-coreml" -- --ignored --test-threads=1
+//! cargo test -p localdb-embed --features "local-onnx local-coreml" -- --ignored --test-threads=1
 //! ```
 //!
 //! Use `--test-threads=1` on the first (cold-cache) run: both tests fetch the

@@ -5,8 +5,46 @@
 //!
 //! See specs/05-surfaces.md §2 for the full subcommand table.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use cli::CliContext;
+
+/// Build-stamp version strings, from the vergen-gitcl env vars emitted by
+/// `build.rs`. Git-less builds (source tarballs) degrade to `unknown`.
+mod version {
+    /// vergen's placeholder when a value could not be determined.
+    const IDEMPOTENT: &str = "VERGEN_IDEMPOTENT_OUTPUT";
+
+    fn stamp(v: Option<&'static str>) -> Option<&'static str> {
+        v.filter(|s| !s.is_empty() && *s != IDEMPOTENT)
+    }
+
+    fn commit() -> String {
+        match stamp(option_env!("VERGEN_GIT_SHA")) {
+            Some(sha) if stamp(option_env!("VERGEN_GIT_DIRTY")) == Some("true") => {
+                format!("{sha}-dirty")
+            }
+            Some(sha) => sha.to_string(),
+            None => "unknown".to_string(),
+        }
+    }
+
+    /// `-V`: `0.1.0 (abc1234)`.
+    pub fn short() -> String {
+        format!("{} ({})", env!("CARGO_PKG_VERSION"), commit())
+    }
+
+    /// `--version`: adds build timestamp and CI run number when known.
+    pub fn long() -> String {
+        let mut s = format!("{}\ncommit: {}", env!("CARGO_PKG_VERSION"), commit());
+        if let Some(ts) = stamp(option_env!("VERGEN_BUILD_TIMESTAMP")) {
+            s.push_str(&format!("\nbuilt: {ts}"));
+        }
+        if let Some(run) = option_env!("LOCALDB_CI_RUN_NUMBER") {
+            s.push_str(&format!("\nci build: {run}"));
+        }
+        s
+    }
+}
 
 /// localdb — local-first knowledge server with hybrid search.
 ///
@@ -16,7 +54,8 @@ use cli::CliContext;
 #[derive(Debug, Parser)]
 #[command(
     name = "localdb",
-    version,
+    version = version::short(),
+    long_version = version::long(),
     about = "Local-first knowledge server with hybrid search",
     long_about = None,
     propagate_version = true,
@@ -30,7 +69,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Operate on this store (repeatable; defaults to all stores).
+    /// Operate on these stores (repeatable); a filter, not a selector.
+    ///
+    /// Omitted, this means "all stores" for `search`, `status`, `store list`,
+    /// `source list`, `source remove <ULID>`, `index` and `mcp`; the store
+    /// named `default` for `source add` and the `add` alias (exit 2 if
+    /// absent). `source remove <path|url>` requires it (exit 2 without it).
+    /// It is rejected outright (exit 2) by `init`, `serve`, `store add`,
+    /// `store remove` and the `db` subcommands, which are not store-scoped.
+    /// An explicit name is always validated: unknown is exit 3. See `--help`
+    /// on the specific subcommand for its exact rule.
     #[arg(long = "store", short = 's', global = true, value_name = "NAME")]
     pub stores: Vec<String>,
 
@@ -47,18 +95,38 @@ pub struct Cli {
 /// See specs/05-surfaces.md §2.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Initialize config and data directory; prompt for first-run model download.
-    Init,
+    /// Optional bootstrap: write the config, create the data/models/logs
+    /// directories, and print the resolved paths.
+    ///
+    /// Never required — every command except `db status`/`migrate`/`downgrade`/`vacuum`
+    /// scaffolds on first use. Not store-scoped: passing `--store` exits 2.
+    Init {
+        /// Prepare the configured embedder now, downloading a local model up
+        /// front instead of on the first `index`/`search`.
+        #[arg(long)]
+        download_model: bool,
+    },
 
     /// Start the HTTP API daemon (file watching, scheduled refresh, REST API).
+    ///
+    /// The daemon serves every store in the database. Not store-scoped:
+    /// passing `--store` exits 2.
     Serve,
 
     /// Run the MCP server on stdio for use with AI agents.
+    ///
+    /// Exposes every store when `--store` is omitted; pass `--store <NAME>`
+    /// (repeatable) to limit the session to those stores. The limit is
+    /// enforced whether the server runs embedded or proxies to a running
+    /// daemon, and an unknown name exits 3. Note this is a guardrail, not a
+    /// security boundary: the daemon's MCP endpoint is unauthenticated, so a
+    /// client that bypasses `localdb mcp` can still reach every store.
     Mcp {
-        /// Enable write tools (reserved for future use; always rejected in v1).
+        /// Enable write tools (reserved for future use; no effect in v1).
         ///
-        /// Parsing this flag now makes the CLI stable for callers even though
-        /// the server rejects all mutating operations in v1.
+        /// v1 registers no mutating tool, so the tool set is identical with
+        /// and without this flag; passing it prints a warning. Parsing it now
+        /// makes the CLI stable for callers.
         #[arg(long)]
         allow_write: bool,
     },
@@ -71,15 +139,43 @@ pub enum Command {
     Store(StoreCommand),
 
     /// Manage sources on a store.
+    ///
+    /// With `--store` omitted, `list` and `remove <ULID>` span every store,
+    /// while `add` targets the store named `default` (exit 2 if absent) and
+    /// `remove <path|url>` exits 2 asking for `--store`.
     #[command(subcommand)]
     Source(SourceCommand),
 
-    /// Inspect or migrate a store's schema.
+    /// Read documents indexed into a store.
+    ///
+    /// With `--store` omitted, `list` spans every store; `get` looks up the
+    /// given document id across every store, disambiguating by scope when
+    /// the id exists in more than one.
+    #[command(subcommand)]
+    Document(DocumentCommand),
+
+    /// Inspect or migrate the database schema.
+    ///
+    /// Operates on the whole database file, not a single store: `--store` is
+    /// rejected outright (exit 2) on all four subcommands.
     // See specs/05-surfaces.md §2.1.
     #[command(subcommand)]
     Db(DbCommand),
 
+    /// Manage running/queued jobs on a daemon.
+    ///
+    /// Daemon-only: there is no embedded equivalent, since an embedded job
+    /// lives and dies within a single command invocation. `--store` is
+    /// rejected outright (exit 2) on every subcommand: `cancel` operates on
+    /// a job id, which is already globally unique; `list` spans every job
+    /// regardless of store.
+    #[command(subcommand)]
+    Job(JobCommand),
+
     /// Run a one-shot scan-and-index job.
+    ///
+    /// Indexes every store when `--store` is omitted; pass `--store <NAME>`
+    /// (repeatable) to index only the named store(s).
     Index {
         /// Limit to a specific source (by ID).
         #[arg(long, value_name = "SOURCE_ID")]
@@ -88,13 +184,36 @@ pub enum Command {
         /// Exit with code 2 if any document failed extraction (never aborts mid-run).
         #[arg(long)]
         strict: bool,
+
+        /// Remove indexed documents that no longer exist at their source.
+        ///
+        /// Off by default, like `rsync --delete`: indexing never removes
+        /// anything unless you ask. Without it, documents whose files were
+        /// deleted (or whose URLs now 404) stay searchable, and the run
+        /// reports how many could be pruned.
+        #[arg(long)]
+        delete: bool,
+
+        /// Re-check every feed entry with the origin, ignoring the recheck
+        /// floor and the feed document's cached validators.
+        ///
+        /// Off by default: a feed discovery entry that is already known,
+        /// inside its recheck floor, and whose feed-supplied claim still
+        /// reproduces its stored metadata is skipped without an HTTP
+        /// request. `--refetch` bypasses that floor check for the run and
+        /// suppresses the feed document's own conditional-GET validators, so
+        /// a silent origin edit the feed never announced is noticed
+        /// immediately instead of at the next floor. A no-op for `file`/
+        /// `url` sources.
+        #[arg(long)]
+        refetch: bool,
     },
 
     /// Hybrid search with citations.
     Search {
-        /// Natural language query (no quotes needed; everything after the
-        /// options is treated as the query).
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        /// Natural language query; may be given unquoted as multiple words.
+        /// A query word starting with `-` must be protected with `--`.
+        #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
 
         /// Maximum number of results to return (must be >= 1).
@@ -104,16 +223,39 @@ pub enum Command {
         /// Max characters of snippet text shown per result in human-readable output.
         #[arg(long, default_value = "1000", value_parser = clap::value_parser!(usize))]
         content_length: usize,
+
+        /// The ten metadata-filter flags, boxed and flattened: `Command` is a clap-derived
+        /// enum, so an unboxed 10-`Option<String>`-field variant here would make `Search`
+        /// dominate every other variant's size (clippy `large_enum_variant`) — boxing keeps
+        /// the common no-filters path just as cheap as any other subcommand.
+        #[command(flatten)]
+        filters: Box<SearchFilterArgs>,
     },
 
     /// Alias for `source add`: add one or more sources to a store.
+    ///
+    /// Defaults to the store named `default` when `--store` is omitted;
+    /// exit 2 if no store named `default` exists.
     Add {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
-        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        /// Refresh interval for URL and feed sources (e.g. "1h", "30m", "3600").
         #[arg(long)]
         refresh: Option<String>,
+        /// Override source-kind classification instead of inferring it from
+        /// the argument (path vs. `http(s)://` URL). `feed` treats the
+        /// argument as an Atom/RSS feed URL, which fetches every entry page
+        /// at index time — pass `--max-entries` to bound that.
+        #[arg(long, value_enum)]
+        kind: Option<SourceKindArg>,
+        /// Cap on feed entries considered per indexing run (feed sources only).
+        #[arg(long, value_name = "N")]
+        max_entries: Option<u32>,
+        /// For feed sources, index only the feed-supplied summary instead of
+        /// fetching each entry's full page content (feed sources only).
+        #[arg(long)]
+        no_fetch_full_content: bool,
     },
 
     /// Manage user accounts. Every subcommand routes to a running daemon
@@ -173,6 +315,22 @@ pub enum Command {
     /// Manage invites and pending access requests (admin only, T6).
     #[command(subcommand)]
     Invite(InviteCommand),
+    /// Generate a shell completion script on stdout.
+    ///
+    /// Pure codegen: no config load, no daemon probe, works before `init`.
+    /// Install e.g. with `localdb completions zsh >
+    /// "${fpath[1]}/_localdb"` or `localdb completions bash >>
+    /// ~/.bash_completion`.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: cli::Shell,
+    },
+
+    /// Internal maintenance subcommands. Not part of the public surface —
+    /// build/release tooling only.
+    #[command(subcommand, hide = true)]
+    Internal(InternalCommand),
 }
 
 /// Invite management subcommands (specs/05-surfaces.md §2, T6).
@@ -280,17 +438,138 @@ pub enum KeyCommand {
     },
 }
 
+/// `search`'s ten metadata-filter flags, flattened into
+/// `Command::Search` via `#[command(flatten)] filters: Box<SearchFilterArgs>`
+/// — boxed so this large, all-`Option<String>` group doesn't make `Search`
+/// dominate `Command`'s overall enum size. Field names are hand-written
+/// literals (not derived from `DateAxis` at runtime — `#[arg(long = ...)]`
+/// only accepts a `syn::LitStr`), so they, `core::SearchFilters`'s own field
+/// docs, and the MCP tool schema description text must be kept in sync by
+/// hand; `localdb/tests/cli_search_filters.rs`'s
+/// `date_axis_describe_text_matches_cli_help_and_mcp_schema` is the
+/// consistency guard.
+#[derive(Debug, Args)]
+pub struct SearchFilterArgs {
+    /// Restrict to resources whose URI starts with this prefix (e.g. "file:///docs/").
+    /// No date or duration parsing is applied. Matched with SQL LIKE, so a literal
+    /// `%` or `_` in the prefix acts as a wildcard.
+    #[arg(long)]
+    path: Option<String>,
+
+    /// Restrict to resources with this exact MIME type (e.g. "text/markdown"). Matched
+    /// literally — no date or duration parsing.
+    #[arg(long)]
+    mime: Option<String>,
+
+    /// Lower bound (inclusive) on the added date — when this resource was first indexed.
+    /// Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a
+    /// relative duration such as "7d" or "30m", which always resolves to now minus the
+    /// duration regardless of which bound it fills. Note: "M" means months and "m" means
+    /// minutes in the duration grammar — both parse successfully, so a mistaken capital
+    /// silently produces a bound roughly 44,000 times further out. NULL rule: a resource with
+    /// no value on this axis is excluded, regardless of the bound.
+    #[arg(long)]
+    added_after: Option<String>,
+
+    /// Upper bound (inclusive) on the added date — when this resource was first indexed.
+    /// Same value grammar as --added-after. NULL rule: a resource with no value on this
+    /// axis is excluded, regardless of the bound.
+    #[arg(long)]
+    added_before: Option<String>,
+
+    /// Lower bound (inclusive) on the updated date — when the store last wrote this
+    /// resource's stored state. Same value grammar as --added-after. NULL rule: a
+    /// resource with no value on this axis is excluded, regardless of the bound.
+    #[arg(long)]
+    updated_after: Option<String>,
+
+    /// Upper bound (inclusive) on the updated date — when the store last wrote this
+    /// resource's stored state. Same value grammar as --added-after. NULL rule: a
+    /// resource with no value on this axis is excluded, regardless of the bound.
+    #[arg(long)]
+    updated_before: Option<String>,
+
+    /// Lower bound (inclusive) on the modified date — the source's own claim of when
+    /// this resource was last changed. Same value grammar as --added-after. NULL rule: a
+    /// resource with no claimed modification time is excluded, regardless of the bound.
+    #[arg(long)]
+    modified_after: Option<String>,
+
+    /// Upper bound (inclusive) on the modified date — the source's own claim of when
+    /// this resource was last changed. Same value grammar as --added-after. NULL rule: a
+    /// resource with no claimed modification time is excluded, regardless of the bound.
+    #[arg(long)]
+    modified_before: Option<String>,
+
+    /// Lower bound (inclusive) on the document date — the document's own claimed date
+    /// (Dublin Core dc:date). Same value grammar as --added-after. NULL rule: a resource
+    /// with no claimed document date is excluded, regardless of the bound. Coverage: a
+    /// resource has one only when its source carried one — HTML (JSON-LD or a
+    /// dcterms.date/date meta), Markdown front matter, Office (dcterms:created), PDF
+    /// (/CreationDate or XMP xmp:CreateDate), and feed entries (published/updated).
+    /// Plain text carries none, and any format's metadata may simply omit it.
+    #[arg(long)]
+    document_after: Option<String>,
+
+    /// Upper bound (inclusive) on the document date — the document's own claimed date
+    /// (Dublin Core dc:date). Same value grammar as --added-after. NULL rule: a resource
+    /// with no claimed document date is excluded, regardless of the bound. Coverage: a
+    /// resource has one only when its source carried one — HTML (JSON-LD or a
+    /// dcterms.date/date meta), Markdown front matter, Office (dcterms:created), PDF
+    /// (/CreationDate or XMP xmp:CreateDate), and feed entries (published/updated).
+    /// Plain text carries none, and any format's metadata may simply omit it.
+    #[arg(long)]
+    document_before: Option<String>,
+}
+
+/// Hidden `internal` subcommands (build/release tooling, not user-facing).
+#[derive(Debug, Subcommand)]
+pub enum InternalCommand {
+    /// Print the generated router JSON Schema for `config.yaml` to stdout.
+    ///
+    /// Pure codegen: no config load, no daemon probe. Used to (re)generate
+    /// the committed `schema/config.schema.json` artifact.
+    PrintSchema,
+}
+
+/// `--kind` override for `source add` / `add` (see [`Command::Add`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SourceKindArg {
+    Path,
+    Url,
+    Feed,
+}
+
+impl SourceKindArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SourceKindArg::Path => "path",
+            SourceKindArg::Url => "url",
+            SourceKindArg::Feed => "feed",
+        }
+    }
+}
+
 /// Store management subcommands.
 #[derive(Debug, Subcommand)]
 pub enum StoreCommand {
     /// Add a new store.
+    ///
+    /// The store is named by the positional argument below. Not store-scoped:
+    /// passing `--store` exits 2.
     Add {
         /// Store name.
         name: String,
     },
     /// List all stores.
+    ///
+    /// Lists every store when `--store` is omitted; pass `--store`
+    /// (repeatable) to narrow.
     List,
     /// Remove a store.
+    ///
+    /// The store is named by the positional argument below. Not store-scoped:
+    /// passing `--store` exits 2.
     Remove {
         /// Store name or ID.
         name: String,
@@ -317,48 +596,116 @@ pub enum StoreCommand {
 /// they only ever surface the refusal-with-hint that `LibsqlDb::open`
 /// produces on a version mismatch. All three subcommands refuse with
 /// `daemon_running` (exit 4) while the daemon is up, the same way every
-/// other daemon-aware write command does.
+/// other daemon-aware write command does. None of them are store-scoped:
+/// they operate on the whole database file, and `--store` is rejected
+/// outright (exit 2) rather than silently ignored.
 #[derive(Debug, Subcommand)]
 pub enum DbCommand {
     /// Show schema version, pending migrations, and migration history.
     ///
     /// Never refuses, even on a store newer than this binary or one that
-    /// predates the migration framework entirely.
+    /// predates the migration framework entirely. Not store-scoped: passing
+    /// `--store` exits 2.
     Status,
 
-    /// Apply pending migrations to bring the store up to this binary's head version.
+    /// Apply pending migrations to bring the database up to this binary's head version.
     ///
     /// A legacy (pre-migration-framework, v1-v3) store requires confirmation
     /// before its destructive rebuild (all indexed data is lost); an
-    /// ordinary forward migration needs no confirmation.
+    /// ordinary forward migration needs no confirmation. Not store-scoped:
+    /// passing `--store` exits 2.
     Migrate,
 
     /// Reverse migrations using stored down-SQL (default: one step back).
     ///
     /// Always requires confirmation. Refuses cleanly, without changing
-    /// anything, if a migration on the way to `--to` has no down path.
+    /// anything, if a migration on the way to `--to` has no down path. Not
+    /// store-scoped: passing `--store` exits 2.
     Downgrade {
         /// Target schema version to downgrade to (default: one step below the current version).
         #[arg(long, value_name = "VERSION")]
         to: Option<i64>,
     },
+
+    /// Reclaim disk space freed by prior migrations/deletes by rewriting the
+    /// whole database file (SQLite `VACUUM`).
+    ///
+    /// A schema migration (e.g. v6 `shrink_vector_index`) or an ordinary
+    /// bulk delete frees pages onto SQLite's own free list, but the file
+    /// itself does not shrink until something rewrites it — this does that.
+    /// Data-preserving (an interrupted VACUUM leaves the original file
+    /// untouched), but needs roughly the current file size again in free
+    /// disk space and can take minutes on a large store. Not store-scoped:
+    /// passing `--store` exits 2.
+    Vacuum,
+}
+
+/// Job management subcommands (issue #218).
+#[derive(Debug, Subcommand)]
+pub enum JobCommand {
+    /// Request cancellation of a queued or running job.
+    ///
+    /// Requires a running daemon (exit 5 without one). Exit codes: 0
+    /// cancellation requested (202), 3 unknown job id, 4 job already
+    /// reached a terminal state.
+    Cancel {
+        /// Job ID.
+        id: String,
+    },
+
+    /// List every job on the daemon's queue, regardless of state or store.
+    ///
+    /// Requires a running daemon (exit 5 without one); `--store` is
+    /// rejected outright (exit 2, §2.2) — a job list is not store-scoped.
+    List,
 }
 
 /// Source management subcommands.
+///
+/// `--store` is a filter: omitted, `list` and `remove <ULID>` span every
+/// store. `add` is the exception — a write has to pick one target, so it
+/// defaults to the store named `default` (exit 2 if absent).
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
     /// Add a new source to a store.
+    ///
+    /// Defaults to the store named `default` when `--store` is omitted;
+    /// exit 2 if no store named `default` exists. This is the one `source`
+    /// subcommand that narrows to a single store by default, because a write
+    /// must land in one named place rather than fan out across every store.
     Add {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
-        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        /// Refresh interval for URL and feed sources (e.g. "1h", "30m", "3600").
         #[arg(long)]
         refresh: Option<String>,
+        /// Override source-kind classification instead of inferring it from
+        /// the argument (path vs. `http(s)://` URL). `feed` treats the
+        /// argument as an Atom/RSS feed URL, which fetches every entry page
+        /// at index time — pass `--max-entries` to bound that.
+        #[arg(long, value_enum)]
+        kind: Option<SourceKindArg>,
+        /// Cap on feed entries considered per indexing run (feed sources only).
+        #[arg(long, value_name = "N")]
+        max_entries: Option<u32>,
+        /// For feed sources, index only the feed-supplied summary instead of
+        /// fetching each entry's full page content (feed sources only).
+        #[arg(long)]
+        no_fetch_full_content: bool,
     },
-    /// List sources on a store.
+    /// List sources across stores.
+    ///
+    /// Lists every store's sources when `--store` is omitted; pass `--store`
+    /// (repeatable) to narrow. A store-name column appears whenever more than
+    /// one store is in scope.
     List,
     /// Remove a source from a store.
+    ///
+    /// A source ULID is globally unique, so removing by ULID searches every
+    /// store when `--store` is omitted. Removing by path or URL is ambiguous
+    /// — the same path can be a source in several stores — so it requires an
+    /// explicit `--store` and exits 2 without one.
     Remove {
         /// Source IDs, paths, or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
@@ -366,23 +713,71 @@ pub enum SourceCommand {
     },
 }
 
+/// Document read subcommands.
+///
+/// `--store` is a filter for `list`; omitted, it spans every store. `get`
+/// resolves its id across the `--store` scope: zero flags looks it up
+/// across every store (exit 2 if the id exists in more than one), one flag
+/// scopes the lookup unambiguously, and more than one flag checks the found
+/// document's store against the given set.
+#[derive(Debug, Subcommand)]
+pub enum DocumentCommand {
+    /// List documents across stores.
+    ///
+    /// Lists every store's documents when `--store` is omitted; pass
+    /// `--store` (repeatable) to narrow. A store-name column appears
+    /// whenever more than one store is in scope.
+    List {
+        /// Limit to documents from a specific source (by ID).
+        #[arg(long, value_name = "SOURCE_ID")]
+        source: Option<String>,
+    },
+    /// Get a single document by id.
+    ///
+    /// Unknown id: exit 3.
+    Get {
+        /// Document ID.
+        id: String,
+        /// Include the document's reconstructed full text in the output.
+        #[arg(long)]
+        text: bool,
+    },
+}
+
 fn main() {
     // Initialize structured logging. In embedded mode (no daemon), emit to stderr.
-    // pdf-extract/lopdf/cff_parser emit high-volume noise (unknown glyph, corrupt deflate,
-    // Unicode mismatch, object load errors) that is not actionable for users — suppress
-    // those targets entirely by default.  Real per-document extraction failures surface via
-    // the job outcome path (one WARN line per failed file), not here.
+    // The PDF parser (pdf_oxide) emits high-volume, per-glyph/per-object noise
+    // (unmappable glyphs, malformed streams, recovery warnings) that is not
+    // actionable for users — suppress that target entirely by default. Real
+    // per-document extraction failures surface via the job outcome path (one
+    // WARN line per failed file), not here.
     // RUST_LOG still overrides this default entirely (e.g. RUST_LOG=debug to see it all).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("warn,lopdf=off,pdf_extract=off,cff_parser=off")
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,pdf_oxide=off")),
         )
         .init();
 
     let cli = Cli::parse();
+
+    // `internal` subcommands are pure stdout tooling (build/release codegen)
+    // and must never load config, probe the daemon, or go through
+    // `command_table::dispatch` — handled first, before `CliContext` (and
+    // the config/daemon env vars it reads) is even constructed.
+    if let Command::Internal(InternalCommand::PrintSchema) = &cli.command {
+        cli::run_internal_print_schema();
+        return;
+    }
+
+    // `completions` is the same kind of pure stdout codegen — handled before
+    // `CliContext` so it works with no config, store, or daemon.
+    if let Command::Completions { shell } = &cli.command {
+        use clap::CommandFactory;
+        cli::run_completions(*shell, &mut Cli::command());
+        return;
+    }
 
     let ctx = CliContext {
         config: cli.config,
@@ -401,7 +796,7 @@ fn main() {
     };
 
     match &cli.command {
-        Command::Init => cli::run_init(&ctx),
+        Command::Init { download_model } => cli::run_init(&ctx, *download_model),
         Command::Serve => cli::run_serve(&ctx),
         Command::Mcp { allow_write } => cli::run_mcp(&ctx, *allow_write),
         Command::Status => cli::run_status(&ctx),
@@ -413,10 +808,23 @@ fn main() {
             StoreCommand::Revoke { store, user } => cli::run_store_revoke(&ctx, store, user),
         },
         Command::Source(cmd) => match cmd {
-            SourceCommand::Add { sources, refresh } => {
+            SourceCommand::Add {
+                sources,
+                refresh,
+                kind,
+                max_entries,
+                no_fetch_full_content,
+            } => {
                 // #5: loop over multiple arguments.
                 for source in sources {
-                    cli::run_source_add(&ctx, source, refresh.as_deref());
+                    cli::run_source_add(
+                        &ctx,
+                        source,
+                        refresh.as_deref(),
+                        (*kind).map(SourceKindArg::as_str),
+                        *max_entries,
+                        *no_fetch_full_content,
+                    );
                 }
             }
             SourceCommand::List => cli::run_source_list(&ctx),
@@ -427,20 +835,62 @@ fn main() {
                 }
             }
         },
+        Command::Document(cmd) => match cmd {
+            DocumentCommand::List { source } => cli::run_document_list(&ctx, source.as_deref()),
+            DocumentCommand::Get { id, text } => cli::run_document_get(&ctx, id, *text),
+        },
         Command::Db(cmd) => match cmd {
             DbCommand::Status => cli::run_db_status(&ctx),
             DbCommand::Migrate => cli::run_db_migrate(&ctx),
             DbCommand::Downgrade { to } => cli::run_db_downgrade(&ctx, *to),
+            DbCommand::Vacuum => cli::run_db_vacuum(&ctx),
         },
-        Command::Index { source, strict } => cli::run_index(&ctx, source.as_deref(), *strict),
+        Command::Job(cmd) => match cmd {
+            JobCommand::Cancel { id } => cli::run_job_cancel(&ctx, id),
+            JobCommand::List => cli::run_job_list(&ctx),
+        },
+        Command::Index {
+            source,
+            strict,
+            delete,
+            refetch,
+        } => cli::run_index(&ctx, source.as_deref(), *strict, *delete, *refetch),
         Command::Search {
             query,
             limit,
             content_length,
-        } => cli::run_search(&ctx, &query.join(" "), *limit, *content_length),
-        Command::Add { sources, refresh } => {
+            filters,
+        } => {
+            let filters = cli::SearchFilters {
+                path: filters.path.clone(),
+                mime: filters.mime.clone(),
+                added_after: filters.added_after.clone(),
+                added_before: filters.added_before.clone(),
+                updated_after: filters.updated_after.clone(),
+                updated_before: filters.updated_before.clone(),
+                modified_after: filters.modified_after.clone(),
+                modified_before: filters.modified_before.clone(),
+                document_after: filters.document_after.clone(),
+                document_before: filters.document_before.clone(),
+            };
+            cli::run_search(&ctx, &query.join(" "), *limit, *content_length, filters)
+        }
+        Command::Add {
+            sources,
+            refresh,
+            kind,
+            max_entries,
+            no_fetch_full_content,
+        } => {
             for source in sources {
-                cli::run_source_add(&ctx, source, refresh.as_deref());
+                cli::run_source_add(
+                    &ctx,
+                    source,
+                    refresh.as_deref(),
+                    (*kind).map(SourceKindArg::as_str),
+                    *max_entries,
+                    *no_fetch_full_content,
+                );
             }
         }
         Command::User(cmd) => match cmd {
@@ -486,6 +936,15 @@ fn main() {
             InviteCommand::Approve { request_id } => cli::run_invite_approve(&ctx, request_id),
             InviteCommand::Deny { request_id } => cli::run_invite_deny(&ctx, request_id),
         },
+        // Unreachable: handled and returned from above, before `ctx` even
+        // exists, so these arms never actually dispatch — required only for
+        // match exhaustiveness over `Command`.
+        Command::Internal(InternalCommand::PrintSchema) => {
+            unreachable!("Command::Internal is handled and returns before this match")
+        }
+        Command::Completions { .. } => {
+            unreachable!("Command::Completions is handled and returns before this match")
+        }
     }
 }
 
@@ -508,7 +967,8 @@ mod tests {
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
         for expected in &[
-            "init", "serve", "mcp", "status", "store", "source", "db", "index", "search", "add",
+            "init", "serve", "mcp", "status", "store", "source", "document", "db", "job", "index",
+            "search", "add",
         ] {
             assert!(
                 subcommand_names.contains(expected),
@@ -565,6 +1025,29 @@ mod tests {
         }
     }
 
+    /// Verify the document subcommands are present.
+    #[test]
+    fn document_subcommands_present() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let document_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "document")
+            .expect("document subcommand missing");
+
+        let sub_names: Vec<&str> = document_cmd
+            .get_subcommands()
+            .map(|sc| sc.get_name())
+            .collect();
+
+        for expected in &["list", "get"] {
+            assert!(
+                sub_names.contains(expected),
+                "document {expected} subcommand missing; found: {sub_names:?}",
+            );
+        }
+    }
+
     /// Verify the db subcommands are present.
     #[test]
     fn db_subcommands_present() {
@@ -577,12 +1060,82 @@ mod tests {
 
         let sub_names: Vec<&str> = db_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
-        for expected in &["status", "migrate", "downgrade"] {
+        for expected in &["status", "migrate", "downgrade", "vacuum"] {
             assert!(
                 sub_names.contains(expected),
                 "db {expected} subcommand missing; found: {sub_names:?}",
             );
         }
+    }
+
+    /// Verify the job subcommands are present.
+    #[test]
+    fn job_subcommands_present() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let job_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "job")
+            .expect("job subcommand missing");
+
+        let sub_names: Vec<&str> = job_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
+
+        for expected in &["cancel", "list"] {
+            assert!(
+                sub_names.contains(expected),
+                "job {expected} subcommand missing; found: {sub_names:?}",
+            );
+        }
+    }
+
+    /// `localdb job list` parses with no arguments.
+    #[test]
+    fn job_list_parses() {
+        let cli = Cli::try_parse_from(["localdb", "job", "list"]).unwrap();
+        assert!(matches!(cli.command, Command::Job(JobCommand::List)));
+    }
+
+    /// `localdb job cancel <id>` parses the job id as a positional arg.
+    #[test]
+    fn job_cancel_parses() {
+        let cli = Cli::try_parse_from(["localdb", "job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+            .unwrap();
+        if let Command::Job(JobCommand::Cancel { id }) = cli.command {
+            assert_eq!(id, "01HRQHB7FN3WMX4AZDV3S9VCTZ");
+        } else {
+            panic!("expected Job(Cancel) command");
+        }
+    }
+
+    /// `localdb db vacuum` parses with no arguments.
+    #[test]
+    fn db_vacuum_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "db", "vacuum"])
+                .unwrap()
+                .command,
+            Command::Db(DbCommand::Vacuum)
+        ));
+    }
+
+    /// `localdb init`/`localdb init --download-model` parse the new flag.
+    #[test]
+    fn init_download_model_flag_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "init"]).unwrap().command,
+            Command::Init {
+                download_model: false
+            }
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "init", "--download-model"])
+                .unwrap()
+                .command,
+            Command::Init {
+                download_model: true
+            }
+        ));
     }
 
     /// `localdb db downgrade --to N` parses `N` as an `i64`.
@@ -627,17 +1180,61 @@ mod tests {
 
     /// Unquoted multi-word query is joined into a single string.
     #[test]
-    fn search_query_trailing_var_arg() {
+    fn search_query_accepts_unquoted_multiple_words() {
         let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
         if let Command::Search {
             query,
             limit,
             content_length,
+            ..
         } = cli.command
         {
             assert_eq!(query.join(" "), "machine learning");
             assert_eq!(limit, 3);
             assert_eq!(content_length, 1000);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// A flag typed *after* the query words must still be parsed as a flag,
+    /// not silently absorbed into the query (issue #224). Before the fix,
+    /// `trailing_var_arg = true` made `--limit 5` here part of the query
+    /// text instead of setting `limit`.
+    #[test]
+    fn search_flags_after_query_words_still_parse() {
+        let cli =
+            Cli::try_parse_from(["localdb", "search", "rank", "fusion", "--limit", "5"]).unwrap();
+        if let Command::Search { query, limit, .. } = cli.command {
+            assert_eq!(query.join(" "), "rank fusion");
+            assert_eq!(limit, 5);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// `--limit` before the query words still works (regression guard).
+    #[test]
+    fn search_flags_before_query_words_still_parse() {
+        let cli =
+            Cli::try_parse_from(["localdb", "search", "--limit", "5", "rank", "fusion"]).unwrap();
+        if let Command::Search { query, limit, .. } = cli.command {
+            assert_eq!(query.join(" "), "rank fusion");
+            assert_eq!(limit, 5);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// `--` forces everything after it to be literal query text, including
+    /// tokens that look like flags — the escape hatch for a query word that
+    /// legitimately starts with `-`.
+    #[test]
+    fn search_double_dash_escapes_flag_like_query_words() {
+        let cli = Cli::try_parse_from(["localdb", "search", "--", "--limit", "5"]).unwrap();
+        if let Command::Search { query, limit, .. } = cli.command {
+            assert_eq!(query, vec!["--limit".to_string(), "5".to_string()]);
+            assert_eq!(limit, 3);
         } else {
             panic!("expected Search command");
         }
@@ -651,6 +1248,143 @@ mod tests {
             assert_eq!(sources, vec!["/some/path"]);
         } else {
             panic!("expected Add command");
+        }
+    }
+
+    /// `--kind`, `--max-entries`, `--no-fetch-full-content` parse on `add`.
+    #[test]
+    fn add_feed_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "localdb",
+            "add",
+            "https://example.com/feed.xml",
+            "--kind",
+            "feed",
+            "--max-entries",
+            "10",
+            "--no-fetch-full-content",
+        ])
+        .unwrap();
+        if let Command::Add {
+            kind,
+            max_entries,
+            no_fetch_full_content,
+            ..
+        } = cli.command
+        {
+            assert_eq!(kind, Some(SourceKindArg::Feed));
+            assert_eq!(max_entries, Some(10));
+            assert!(no_fetch_full_content);
+        } else {
+            panic!("expected Add command");
+        }
+    }
+
+    /// Same flags parse identically on `source add`.
+    #[test]
+    fn source_add_feed_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "localdb",
+            "source",
+            "add",
+            "https://example.com/feed.xml",
+            "--kind",
+            "feed",
+            "--max-entries",
+            "10",
+            "--no-fetch-full-content",
+        ])
+        .unwrap();
+        if let Command::Source(SourceCommand::Add {
+            kind,
+            max_entries,
+            no_fetch_full_content,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(kind, Some(SourceKindArg::Feed));
+            assert_eq!(max_entries, Some(10));
+            assert!(no_fetch_full_content);
+        } else {
+            panic!("expected Source(Add) command");
+        }
+    }
+
+    /// `--kind path|url` also parses (bypasses classification without a
+    /// feed-only implication).
+    #[test]
+    fn kind_path_and_url_parse() {
+        let cli = Cli::try_parse_from(["localdb", "add", "some-arg", "--kind", "path"]).unwrap();
+        if let Command::Add { kind, .. } = cli.command {
+            assert_eq!(kind, Some(SourceKindArg::Path));
+        } else {
+            panic!("expected Add command");
+        }
+
+        let cli = Cli::try_parse_from(["localdb", "add", "some-arg", "--kind", "url"]).unwrap();
+        if let Command::Add { kind, .. } = cli.command {
+            assert_eq!(kind, Some(SourceKindArg::Url));
+        } else {
+            panic!("expected Add command");
+        }
+    }
+
+    /// `Command::Add` and `SourceCommand::Add` must expose identical arg
+    /// names/requirements for the shared flags — they are hand-synced clap
+    /// structs, and drift between them would silently desync `localdb add`
+    /// from `localdb source add` (issue #116).
+    #[test]
+    fn add_and_source_add_flags_are_in_parity() {
+        use clap::CommandFactory;
+        use std::collections::BTreeMap;
+
+        let cmd = Cli::command();
+        let add_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "add")
+            .expect("add subcommand missing");
+        let source_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "source")
+            .expect("source subcommand missing");
+        let source_add_cmd = source_cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "add")
+            .expect("source add subcommand missing");
+
+        fn arg_shapes(
+            cmd: &clap::Command,
+        ) -> BTreeMap<String, (bool, Option<clap::builder::ValueRange>)> {
+            cmd.get_arguments()
+                .map(|a| {
+                    (
+                        a.get_id().as_str().to_string(),
+                        (a.is_required_set(), a.get_num_args()),
+                    )
+                })
+                .collect()
+        }
+
+        let add_args = arg_shapes(add_cmd);
+        let source_add_args = arg_shapes(source_add_cmd);
+
+        for flag in &[
+            "sources",
+            "refresh",
+            "kind",
+            "max_entries",
+            "no_fetch_full_content",
+        ] {
+            let add_shape = add_args
+                .get(*flag)
+                .unwrap_or_else(|| panic!("`add` is missing --{flag}"));
+            let source_add_shape = source_add_args
+                .get(*flag)
+                .unwrap_or_else(|| panic!("`source add` is missing --{flag}"));
+            assert_eq!(
+                add_shape, source_add_shape,
+                "`--{flag}` differs between `add` and `source add`: {add_shape:?} vs {source_add_shape:?}"
+            );
         }
     }
 
@@ -669,6 +1403,44 @@ mod tests {
             result.is_err(),
             "expected --dir to be rejected, but clap accepted it"
         );
+    }
+
+    /// `localdb index --refetch` parses and sets the flag.
+    #[test]
+    fn index_refetch_flag_parses() {
+        let cli = Cli::try_parse_from(["localdb", "index", "--refetch"]).unwrap();
+        match cli.command {
+            Command::Index { refetch, .. } => assert!(refetch),
+            other => panic!("expected Index command, got: {other:?}"),
+        }
+    }
+
+    /// `--refetch` is absent by default.
+    #[test]
+    fn index_without_refetch_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["localdb", "index"]).unwrap();
+        match cli.command {
+            Command::Index { refetch, .. } => assert!(!refetch),
+            other => panic!("expected Index command, got: {other:?}"),
+        }
+    }
+
+    /// `--refetch` combines with `--delete` and the global `-s` store filter
+    /// without conflict.
+    #[test]
+    fn index_refetch_combined_with_delete_and_store_flag_parses() {
+        let cli = Cli::try_parse_from(["localdb", "-s", "notes", "index", "--refetch", "--delete"])
+            .unwrap();
+        assert_eq!(cli.stores, vec!["notes"]);
+        match cli.command {
+            Command::Index {
+                refetch, delete, ..
+            } => {
+                assert!(refetch);
+                assert!(delete);
+            }
+            other => panic!("expected Index command, got: {other:?}"),
+        }
     }
 
     /// `-s` short flag works as a subcommand-level option too.

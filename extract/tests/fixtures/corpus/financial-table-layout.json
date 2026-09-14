@@ -1,0 +1,11 @@
+{
+  "file": "financial-table-layout.pdf",
+  "expect": "ok",
+  "pages": 1,
+  "page_phrases": {
+    "1": ["Apple Inc. summary (synthetic, $ millions)", "365,817", "212,981", "94,680", "2024"]
+  },
+  "forbid_substrings": ["�"],
+  "title_contains": null,
+  "notes": "Page has a bold heading 'Apple Inc. summary (synthetic, $ millions)', a justified explanatory paragraph, and a 4-column x 5-row (incl. header) bordered table: columns 'Year' (left-aligned text: 2021, 2022, 2023, 2024), 'Revenue', 'Cost', 'Net Income' (all three right-aligned numeric, comma-thousands, no currency symbol -- values in $ millions). Row values: 2021=365,817/212,981/94,680; 2022=394,328/223,546/99,803; 2023=383,285/214,137/96,995; 2024=391,035/210,352/93,736. An italic footnote below the table reads 'Note: this fixture is generated, not from any real filing.' Each cell is drawn with a separate text-show operator and right-aligned, which is the layout pattern known to trigger word-concatenation and column-alignment bugs in naive PDF text extractors -- a future table-extraction test should assert the four columns stay separated per row rather than collapsing into one run of digits."
+}

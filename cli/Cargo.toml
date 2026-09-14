@@ -1,35 +1,59 @@
 [package]
-name = "cli"
+name = "localdb-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "CLI command implementations, thin layer on core / daemon client"
 
+[lib]
+# Keep the short crate name in code (`use cli::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "cli"
+
 [dependencies]
-localdb-core = { path = "../core" }
-store-libsql = { path = "../store-libsql" }
-extract = { path = "../extract" }
-ingest = { path = "../ingest" }
-embed = { path = "../embed", features = ["local-onnx"] }
-fetch = { path = "../fetch" }
-mcp = { path = "../mcp" }
-server = { path = "../server" }
+localdb-core = { path = "../core", version = "0.2.0" }
+localdb-store-libsql = { path = "../store-libsql", version = "0.2.0" }
+localdb-extract = { path = "../extract", version = "0.2.0" }
+localdb-ingest = { path = "../ingest", version = "0.2.0" }
+localdb-embed = { path = "../embed", version = "0.2.0", features = ["local-onnx"] }
+localdb-fetch = { path = "../fetch", version = "0.2.0" }
+localdb-mcp = { path = "../mcp", version = "0.2.0" }
+localdb-server = { path = "../server", version = "0.2.0" }
 tokio = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { workspace = true }
+clap_complete = "4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 indicatif = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
 webbrowser = "1"
+percent-encoding = { workspace = true }
+# `bytes_stream()` on a `reqwest::Response` yields a `futures_util::Stream`
+# (re-exported by `futures`, already a pinned workspace dependency used by
+# `server` for its own SSE stream) — hand-rolling the `GET
+# /v1/jobs/{id}/events` SSE line parser in `job_attach.rs` needs `StreamExt`
+# to poll it.
+futures = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)
 # picks up ANE/GPU acceleration without needing --features. Cargo unions this with the
 # local-onnx feature above; Linux never pulls objc2/block2/etc.
-embed = { path = "../embed", features = ["local-coreml"] }
+localdb-embed = { path = "../embed", version = "0.2.0", features = ["local-coreml"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Real-server test harnesses for `job_attach.rs`'s daemon-routed paths
+# (submit/attach/SSE/poll-fallback error branches): both a real
+# `server::daemon::build_router` instance and a small hand-rolled mock router
+# for wire-shape edge cases the real daemon can't be coaxed into producing
+# (a malformed `/v1/jobs` response, a dropped SSE stream). `axum` is already
+# resolved in the dependency graph via `server`'s own (non-dev) dependency on
+# it — this only newly depends on it directly for test code.
 axum = { workspace = true }

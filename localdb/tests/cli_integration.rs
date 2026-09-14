@@ -42,6 +42,37 @@ fn write_default_config(dir: &TempDir) {
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
 }
 
+/// Build a Command pointed at a config path inside `dir` that does **not**
+/// exist yet — for exercising implicit first-run scaffolding
+/// (`cli::scaffold::ensure_config_scaffolded`, issue #119/#120). Unlike
+/// `cmd_with_dir`/`write_default_config`, nothing is pre-seeded: the whole
+/// point is to observe what a genuinely fresh install does.
+///
+/// `ensure_config_scaffolded` falls back to `PlatformPaths::resolve()` for
+/// `paths.data`/`models`/`logs` whenever the config file itself is absent —
+/// even when `LOCALDB_CONFIG` explicitly names where the *file* should live
+/// (see `cli::scaffold::ensure_config_scaffolded_inner`'s doc comment) — so
+/// this also redirects every env var `directories::ProjectDirs` consults
+/// when resolving those platform defaults, or a "fresh install" test would
+/// actually create directories under the real machine's home directory.
+/// `directories`' macOS backend (`directories::mac::project_dirs_from`)
+/// resolves everything from `dirs_sys::home_dir()`, which reads `$HOME`
+/// directly; its Linux/XDG backend reads `$XDG_CONFIG_HOME`/
+/// `$XDG_DATA_HOME`/`$XDG_CACHE_HOME`/`$XDG_STATE_HOME`, falling back to
+/// `$HOME`-derived defaults when any of those are unset. Setting all five
+/// env vars covers both platforms CI runs on (`.github/workflows/ci.yml`:
+/// `ubuntu-latest`/`ubuntu-22.04` and `macos-14`/`macos-latest`).
+fn cmd_with_fresh_dir(dir: &TempDir) -> Command {
+    let mut c = cmd();
+    c.env("LOCALDB_CONFIG", dir.path().join("config.yaml"));
+    c.env("HOME", dir.path());
+    c.env("XDG_CONFIG_HOME", dir.path().join("xdg-config"));
+    c.env("XDG_DATA_HOME", dir.path().join("xdg-data"));
+    c.env("XDG_CACHE_HOME", dir.path().join("xdg-cache"));
+    c.env("XDG_STATE_HOME", dir.path().join("xdg-state"));
+    c
+}
+
 /// Write a YAML config with a specific data dir and extra content.
 fn write_config_with_data_dir(dir: &TempDir, extra: &str) {
     let data_dir = dir.path().join("data");
@@ -52,6 +83,22 @@ fn write_config_with_data_dir(dir: &TempDir, extra: &str) {
         extra
     );
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+}
+
+/// True if this test process is running as euid 0 (root). Mode bits
+/// (`chmod`) are ignored for root, so permission-denied regression tests
+/// must skip rather than silently pass without proving anything. Shells out
+/// to `id -u` instead of adding a `libc`/`nix` dependency for a single
+/// integration-test check.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +177,99 @@ fn search_requires_query() {
     cmd().arg("search").assert().failure();
 }
 
+/// A typo'd flag typed after the query words must be a hard parse error
+/// (exit 2), not silently absorbed into the query text (issue #224). clap
+/// suggests the flag it thinks was meant.
+#[test]
+fn search_typo_flag_after_query_exits_2_with_suggestion() {
+    cmd()
+        .args(["search", "rank", "fusion", "--limt", "5"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--limit"));
+}
+
+/// An unrecognized flag-shaped token anywhere in `search`'s arguments is a
+/// parse error (exit 2). Before this fix, `trailing_var_arg` made anything
+/// after the first query word part of the query, so `--foo-bar` here would
+/// have been silently swallowed as literal query text instead of rejected.
+#[test]
+fn search_unknown_flag_exits_2() {
+    cmd().args(["search", "find", "--foo-bar"]).assert().code(2);
+}
+
+/// Pre-existing, unrelated-to-#224 gap: clap parse errors happen inside
+/// `Cli::parse()`, before the `CliContext` that carries `--json` exists, so
+/// even with `--json` passed, a parse error is reported as plain text, not
+/// a JSON error envelope — identical to every other clap parse error in
+/// this CLI (e.g. `unknown_subcommand_fails`, `search_requires_query`).
+#[test]
+fn search_typo_flag_with_json_flag_still_reports_plain_text() {
+    let assert = cmd()
+        .args(["--json", "search", "rank", "fusion", "--limt", "5"])
+        .assert()
+        .code(2);
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stderr).is_err(),
+        "clap parse-error stderr must not parse as JSON; got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// internal print-schema (hidden)
+// ---------------------------------------------------------------------------
+
+/// `localdb internal print-schema` is hidden from `--help` (build/release
+/// tooling only, not part of the public surface).
+#[test]
+fn internal_print_schema_is_hidden_from_help() {
+    let output = cmd()
+        .arg("--help")
+        .output()
+        .expect("localdb --help should succeed");
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !help_text.contains("internal"),
+        "`internal` must not appear in --help output;\nfull output:\n{help_text}",
+    );
+}
+
+/// `localdb internal print-schema` prints the generated router JSON Schema
+/// and must work without any config file present — it must not load config,
+/// probe the daemon, or otherwise touch `LOCALDB_CONFIG`'s target.
+#[test]
+fn internal_print_schema_prints_router_schema() {
+    // Point LOCALDB_CONFIG at a path inside an empty temp dir; no config.yaml
+    // is ever written here.
+    let dir = TempDir::new().unwrap();
+    let output = cmd_with_dir(&dir)
+        .arg("internal")
+        .arg("print-schema")
+        .output()
+        .expect("localdb internal print-schema should run");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, got {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON");
+    assert_eq!(
+        value["$id"],
+        serde_json::Value::String(localdb_core::config::SCHEMA_URL.to_string())
+    );
+}
+
 // ---------------------------------------------------------------------------
 // serve / mcp wiring
 // ---------------------------------------------------------------------------
@@ -145,6 +285,40 @@ fn mcp_exits_cleanly_on_stdin_eof() {
         .write_stdin("")
         .assert()
         .success();
+}
+
+/// `serve` goes through the same `load_config_scaffolded` helper `store
+/// add`/`index`/`source *` do (issue #119/#120), so a fresh install
+/// scaffolds `config.yaml` before `serve` ever binds a port or takes the
+/// daemon's socket lock. Unlike `serve_rejects_store_flag_exits_2` (which
+/// can assert `success()`/exit-2 outright because that rejection happens
+/// *before* any bind attempt), a fresh, unrejected `serve` goes on to bind
+/// and then block forever serving requests — so, like
+/// `search_on_fresh_install_scaffolds_config_and_default_store`, this uses a
+/// short `.timeout()` to let the process run just far enough to scaffold
+/// (which happens before the bind attempt either way) without waiting for —
+/// or depending on the outcome of — an actual daemon start.
+#[test]
+fn serve_on_fresh_install_scaffolds_config() {
+    let dir = TempDir::new().unwrap();
+
+    let _ = cmd_with_fresh_dir(&dir)
+        .arg("serve")
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    let config_path = dir.path().join("config.yaml");
+    let content = std::fs::read_to_string(&config_path)
+        .expect("`serve` on a fresh install must scaffold config.yaml");
+    let first_line = content
+        .lines()
+        .next()
+        .expect("scaffolded config must be non-empty");
+    assert!(
+        first_line.starts_with("# yaml-language-server: $schema="),
+        "first line must be the yaml-language-server modeline; got: {first_line}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +337,36 @@ fn init_creates_config_and_data_dir() {
     assert!(dir.path().join("config.yaml").exists());
     // Data dir must exist.
     assert!(dir.path().join("data").exists());
+}
+
+/// `init` has repair semantics against an *existing* config (specs/05
+/// §2.5): directories the config references are recreated even though
+/// implicit scaffolding (a no-op when the file exists) would not touch them.
+#[test]
+fn init_recreates_missing_dirs_from_existing_config() {
+    let dir = TempDir::new().unwrap();
+    let models_dir = dir.path().join("models");
+    let logs_dir = dir.path().join("logs");
+    write_config_with_data_dir(
+        &dir,
+        &format!(
+            "  models: {}\n  logs: {}",
+            models_dir.to_string_lossy(),
+            logs_dir.to_string_lossy()
+        ),
+    );
+    // Neither dir exists yet (write_config_with_data_dir only creates data/).
+    assert!(!models_dir.exists() && !logs_dir.exists());
+
+    cmd_with_dir(&dir).arg("init").assert().success();
+    assert!(models_dir.exists(), "init must recreate paths.models");
+    assert!(logs_dir.exists(), "init must recreate paths.logs");
+
+    // And again after deleting them — repair on every run, not just the first.
+    std::fs::remove_dir_all(&models_dir).unwrap();
+    std::fs::remove_dir_all(&logs_dir).unwrap();
+    cmd_with_dir(&dir).arg("init").assert().success();
+    assert!(models_dir.exists() && logs_dir.exists());
 }
 
 #[test]
@@ -193,14 +397,780 @@ fn init_is_idempotent() {
     cmd_with_dir(&dir).arg("init").assert().success();
 }
 
+/// `init --json` prints every resolved path — `models_dir`/`logs_dir` are new
+/// fields alongside the pre-existing `config_path`/`data_dir` (issue #225).
+#[test]
+fn init_json_output_includes_models_and_logs_dir() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --json should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert!(v.get("models_dir").and_then(|x| x.as_str()).is_some());
+    assert!(v.get("logs_dir").and_then(|x| x.as_str()).is_some());
+}
+
+/// On a healthy fresh install, `init --json` reports an empty `warnings`
+/// list, a successfully-created `default` store, and (with no
+/// `--download-model` flag) a skipped model download (issue #225).
+#[test]
+fn init_json_output_includes_warnings_and_default_store_on_healthy_run() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --json should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(
+        v["warnings"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new()
+    );
+    assert_eq!(v["default_store"].as_str().unwrap(), "ok");
+    assert_eq!(v["model_download"].as_str().unwrap(), "skipped");
+}
+
+/// Only the *database* is best-effort for `init`, not the config: an
+/// existing config that does not parse is a hard exit 2, exactly as it is
+/// for every other command. Scaffolding leaves a malformed file's bytes
+/// untouched, so `init` is the command that reports it rather than one that
+/// warns past it and claims `"status": "ok"`.
+#[test]
+fn init_on_malformed_config_exits_2_without_warning() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config.yaml"), "%bad: [unclosed\n").unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a malformed config must exit 2, not be folded into `warnings`; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!("--json error envelope must be pure JSON on stdout; got: {stdout}")
+    });
+    assert_eq!(
+        v["error"].as_str().unwrap_or_default(),
+        "invalid_config",
+        "error envelope should classify this as invalid_config; got: {v}"
+    );
+}
+
+/// `init --download-model` against `provider: fake` (no network, no real
+/// download) must report `model_download: "ok"` in `--json` output, and — in
+/// the human-readable summary, which is the only surface that ever prints
+/// it — the "downloads on first index" note must be suppressed once the
+/// model has actually been prepared (issue #225).
+#[test]
+fn init_download_model_json_reports_ok() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init", "--download-model"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --download-model against a fake provider should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["model_download"].as_str().unwrap(), "ok");
+
+    // The cosmetic "Preparing the configured embedder..." progress line is
+    // gated on `!ctx.json`, not on `download_model` alone — a `--json`
+    // caller's stderr stays free of it purely for output hygiene. Nothing
+    // downstream depends on stderr being clean (the JSON error envelope
+    // lives on stdout — see `init_download_model_json_failure_stdout_is_pure_json`
+    // below), so this is a UX choice, not a correctness one.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Preparing the configured embedder"),
+        "the progress line must be suppressed under --json; got stderr: {stderr}"
+    );
+
+    // Same config, human output this time: the note only ever prints when
+    // `model_download != "ok"`, so its absence here is the real assertion —
+    // the JSON call above cannot exercise `print_human_summary` at all.
+    let human_output = cmd_with_dir(&dir)
+        .args(["init", "--download-model"])
+        .output()
+        .unwrap();
+    assert!(human_output.status.success());
+    let human_stdout = String::from_utf8_lossy(&human_output.stdout);
+    assert!(
+        !human_stdout.contains("downloads its embedding model"),
+        "the 'downloads on first index' note must be suppressed once the model \
+         download itself reports ok; got: {human_stdout}"
+    );
+
+    // Human mode still gets the progress line: it is suppressed under
+    // `--json`, not dropped outright.
+    let human_stderr = String::from_utf8_lossy(&human_output.stderr);
+    assert!(
+        human_stderr.contains("Preparing the configured embedder"),
+        "human-mode run should still print the progress line; got stderr: {human_stderr}"
+    );
+}
+
+/// `init --download-model` against a hosted provider with no matching
+/// `providers:` block must fail fast (exit 2, `InvalidConfig`) rather than
+/// silently skip — `create_embedder` is called unconditionally, no
+/// provider-name special-casing (issue #225). No network involved: the
+/// failure is a config-shape error before any HTTP call would be made.
+#[test]
+fn init_download_model_failure_exits_2_and_names_providers_block() {
+    let dir = TempDir::new().unwrap();
+    write_config_with_data_dir(
+        &dir,
+        "defaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+    );
+
+    let output = cmd_with_dir(&dir)
+        .args(["init", "--download-model"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "init --download-model with an unconfigured provider should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("providers:"),
+        "error should name the missing 'providers:' config block; got: {stderr}"
+    );
+}
+
+/// Same failure as `init_download_model_failure_exits_2_and_names_providers_block`,
+/// but under `--json`: the JSON error envelope goes to **stdout**, not
+/// stderr (`normalize::exit_err`, issue #260) — stdout is the only channel a
+/// `--json` caller is ever guaranteed to be pure JSON, so nothing that might
+/// land on stderr (a progress line, a warning) can corrupt it.
+///
+/// A `.contains("providers:")` check on stdout cannot tell "clean JSON" from
+/// "JSON plus a stray prefix"; parsing the *whole* stdout string as a single
+/// JSON value is what pins it.
+#[test]
+fn init_download_model_json_failure_stdout_is_pure_json() {
+    let dir = TempDir::new().unwrap();
+    write_config_with_data_dir(
+        &dir,
+        "defaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+    );
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init", "--download-model"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "init --download-model with an unconfigured provider should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!("--json error envelope must be pure JSON on stdout; got: {stdout}")
+    });
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("providers:"),
+        "error message should name the missing 'providers:' config block; got: {v}"
+    );
+}
+
+/// `init` on a DB that needs a schema migration (pre-baseline "legacy"
+/// version) must warn and exit 0 rather than hard-fail — `init`'s real job
+/// is the config + directories, not opening the store (issue #225). It must
+/// also not mutate a store it could not open.
+#[test]
+fn init_on_legacy_schema_db_warns_and_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 2));
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "init against a legacy-schema store must still exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["default_store"].as_str().unwrap(), "skipped");
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].as_str().unwrap().contains("db migrate"),
+        "warning should point at `localdb db migrate`; got: {warnings:?}"
+    );
+
+    // Config + all four directories must still have been created.
+    assert!(dir.path().join("config.yaml").exists());
+    assert!(data_dir.exists());
+    let config_content = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(config_content.contains("provider: fake"));
+
+    // `init` must not have mutated the store it could not open.
+    let version = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let v: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        v
+    });
+    assert_eq!(
+        version, 2,
+        "init warning on an unopenable store must not touch it"
+    );
+}
+
+/// Mirrors `init_on_legacy_schema_db_warns_and_exits_0` for the opposite
+/// side of the same code path: a schema *newer* than this binary understands
+/// (`VersionDisposition::TooNew`) must also warn and exit 0, not hard-fail
+/// (issue #225).
+#[test]
+fn init_on_too_new_schema_db_warns_and_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally (mirrors
+    // `source_list_routes_to_daemon_when_local_db_schema_is_incompatible`).
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "init against a too-new-schema store must still exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["default_store"].as_str().unwrap(), "skipped");
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].as_str().unwrap().contains("db downgrade"),
+        "warning should point at `localdb db downgrade` (too-new schema); got: {warnings:?}"
+    );
+
+    assert!(dir.path().join("config.yaml").exists());
+    assert!(data_dir.exists());
+
+    let version = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let v: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        v
+    });
+    assert_eq!(
+        version, 999_999,
+        "init warning on an unopenable store must not touch it"
+    );
+}
+
+/// Same legacy-schema seed as `init_on_legacy_schema_db_warns_and_exits_0`,
+/// but without `--json`: the human-output `Warning:` loop
+/// (`print_human_summary`) must surface the actionable `db migrate` text on
+/// stderr, and — since `default_store` is `"skipped"` here, not a freshly
+/// created store — the `store add` hint must be absent.
+#[test]
+fn init_on_legacy_schema_db_prints_warning_without_store_add_hint() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 2));
+
+    let output = cmd_with_dir(&dir).arg("init").output().unwrap();
+    assert!(
+        output.status.success(),
+        "init against a legacy-schema store must still exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Warning:"),
+        "human output should carry a `Warning:` line; got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("db migrate"),
+        "warning should point at `localdb db migrate`; got stderr: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("store add"),
+        "the `store add` hint must not print when default_store was skipped; got stdout: {stdout}"
+    );
+}
+
+/// A genuine first run whose database cannot be created — unwritable data
+/// dir, full disk — must warn and exit 0, not hard-fail (issue #225).
+///
+/// This is the first-run variant of the guarantee
+/// `init_on_legacy_schema_db_warns_and_exits_0` covers: `init`'s job is the
+/// config and the directories, so *every* DB-open failure folds into
+/// `warnings` / `default_store: "skipped"`. It is worth pinning separately
+/// because a first run is the one state where the config is still the
+/// pristine scaffolded template with no `localdb.db` beside it — the
+/// condition that makes the lenient config loader open the database itself,
+/// where a failure would escape as a hard exit before `run_init_async` ever
+/// gets to decide. `run_init_async` loads config through
+/// `load_config_for_maintenance`, which parses and resolves only, and
+/// confines the open to `seed_default_store`.
+#[test]
+#[cfg(unix)]
+fn init_on_unwritable_data_dir_after_fresh_scaffold_warns_and_exits_0() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Mode bits are ignored for root, so this scenario can't be reproduced
+    // and the test would pass without proving anything — skip rather than
+    // give a false green.
+    if running_as_root() {
+        eprintln!("skipping init_on_unwritable_data_dir_after_fresh_scaffold_warns_and_exits_0: running as euid 0, permission bits are ignored");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+
+    // Genuine first run — must be `cmd_with_fresh_dir`, not
+    // `write_default_config`: the seed condition this test targets
+    // (`config_is_pristine_template`) requires the config to be
+    // byte-identical to `render_default_config_template()`, which only a
+    // real first-run scaffold produces. This call writes the pristine
+    // template, all four directories, and `localdb.db`.
+    cmd_with_fresh_dir(&dir).arg("init").assert().success();
+
+    // Recursive find idiom from
+    // `fresh_install_with_daemon_url_scaffolds_config_but_not_local_db`
+    // above, adapted to return the path instead of a bool: `localdb.db`
+    // lives under a platform-resolved data dir this test process must not
+    // compute itself (`PlatformPaths::resolve()` reads *this* process's
+    // env, not the child's).
+    fn find_db(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                find_db(&p)
+            } else if p.file_name().is_some_and(|n| n == "localdb.db") {
+                Some(p)
+            } else {
+                None
+            }
+        })
+    }
+    let db_path =
+        find_db(dir.path()).expect("fresh `init` must have scaffolded a local localdb.db");
+    let data_dir = db_path
+        .parent()
+        .expect("localdb.db must have a parent dir")
+        .to_path_buf();
+
+    // Seed condition: config is pristine (untouched since the first run
+    // above) AND the DB does not exist.
+    std::fs::remove_file(&db_path).unwrap();
+
+    // Make the DB's directory unwritable so recreating `localdb.db` fails —
+    // the DB-open failure this whole test exists to turn into a warning
+    // instead of a hard exit.
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = cmd_with_fresh_dir(&dir)
+        .args(["init", "--json"])
+        .output()
+        .unwrap();
+
+    // Restore permissions immediately, before any assert, so `TempDir`'s
+    // `Drop` can clean up even if an assertion below panics (house idiom —
+    // see `source_add_auto_index_permission_denied_warns_but_succeeds`).
+    let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755));
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "init on a first run whose DB cannot be created must warn, not hard-fail; \
+         stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["default_store"].as_str().unwrap(), "skipped");
+    assert!(
+        !v["warnings"].as_array().unwrap().is_empty(),
+        "expected at least one warning describing the DB-open failure; got: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// implicit config scaffolding (issue #119/#120)
+// ---------------------------------------------------------------------------
+// Every strict (`cli::app_db::load_config_scaffolded`) and lenient
+// (`cli::app_db::load_config_lenient`) CLI load path now scaffolds the
+// default commented config template — and, on that same first run, a
+// `default` store — instead of requiring an explicit `localdb init` first.
+// `db status`/`migrate`/`downgrade` are the deliberate exception: they must
+// keep hard-failing on a fresh install rather than silently scaffolding
+// underneath a schema-repair command (see
+// `db_status_on_fresh_install_does_not_scaffold_and_exits_2` below).
+
+/// `search` goes through the *lenient* load path. Scaffolding (writing
+/// `config.yaml` and inserting the `default` store) happens synchronously,
+/// before `search` ever touches the configured `provider: local` embedder —
+/// which, on a genuine first run with no cached model, would otherwise
+/// attempt the one-time ~706 MB download documented in CLAUDE.md. A short
+/// `.timeout()` lets this test observe scaffolding's on-disk side effects
+/// without waiting on — or requiring network access for — that download; a
+/// second, separate `store list` invocation (no embedder involved) confirms
+/// the `default` store landed in the database, not just returned in memory.
+#[test]
+fn search_on_fresh_install_scaffolds_config_and_default_store() {
+    let dir = TempDir::new().unwrap();
+
+    let _ = cmd_with_fresh_dir(&dir)
+        .args(["search", "hello"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    let config_path = dir.path().join("config.yaml");
+    let content = std::fs::read_to_string(&config_path)
+        .expect("`search` on a fresh install must scaffold config.yaml");
+    let first_line = content
+        .lines()
+        .next()
+        .expect("scaffolded config must be non-empty");
+    assert!(
+        first_line.starts_with("# yaml-language-server: $schema="),
+        "first line must be the yaml-language-server modeline; got: {first_line}"
+    );
+    assert!(
+        content.lines().any(|l| l.starts_with("$schema: ")),
+        "scaffolded config must contain a `$schema:` key line; got:\n{content}"
+    );
+
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// When `LOCALDB_DAEMON_URL` forces daemon routing, first-run scaffolding
+/// still writes the config file but must NOT touch the local embedded DB —
+/// the command acts on that daemon's store registry, and a local `default`
+/// store would either be invisible to the daemon or fail the command on an
+/// unrelated local problem (codex review on PR #215).
+#[test]
+fn fresh_install_with_daemon_url_scaffolds_config_but_not_local_db() {
+    let dir = TempDir::new().unwrap();
+
+    // Unreachable daemon: explicit URL routing fails, exit 5 (specs/05 §5).
+    cmd_with_fresh_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:9")
+        .args(["store", "add", "mystore"])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "config must still be scaffolded"
+    );
+    // No localdb.db anywhere under the redirected home: the local embedded
+    // DB was never opened, so no `default` store was created behind the
+    // daemon's back.
+    fn find_db(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    find_db(&p)
+                } else {
+                    p.file_name().is_some_and(|n| n == "localdb.db")
+                }
+            })
+    }
+    assert!(
+        !find_db(dir.path()),
+        "daemon-routed first run must not create the local DB"
+    );
+}
+
+/// `serve` never routes to `LOCALDB_DAEMON_URL` — it always starts a *local*
+/// daemon — so the daemon-url gate that suppresses local `default`-store
+/// creation for routable commands (the test above) must not apply to it
+/// (codex review round 2 on PR #215). Same timeout-kill pattern as
+/// `serve_on_fresh_install_scaffolds_config`: seeding happens during config
+/// load, before the bind attempt, so the outcome of the actual daemon start
+/// doesn't matter.
+#[test]
+fn serve_on_fresh_install_with_daemon_url_still_creates_default_store() {
+    let dir = TempDir::new().unwrap();
+
+    let _ = cmd_with_fresh_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:9")
+        .arg("serve")
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    // `store list` *without* the env var: the local DB must have `default`.
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// The recovery half of the daemon-url gate (codex review round 2 on PR
+/// #215): a daemon-routed first run scaffolds the config but — correctly —
+/// skips the local `default` store (the test above). That must not strand
+/// the install: the next *locally*-routed command finds no `localdb.db` and
+/// seeds `default` itself, without requiring an explicit `localdb init`.
+#[test]
+fn local_run_after_daemon_routed_first_run_creates_default_store() {
+    let dir = TempDir::new().unwrap();
+
+    // Daemon-routed first run: config scaffolded, no local DB (locked in by
+    // `fresh_install_with_daemon_url_scaffolds_config_but_not_local_db`).
+    cmd_with_fresh_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:9")
+        .args(["store", "list"])
+        .assert()
+        .failure()
+        .code(5);
+    assert!(dir.path().join("config.yaml").exists());
+
+    // Local run: config already exists (no scaffolding), but the absent DB
+    // file must still trigger `default`-store seeding.
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// `store add` goes through the *strict* load path
+/// (`load_config_scaffolded`) — covers the strict-path half of implicit
+/// scaffolding, distinct from `search`'s lenient path above.
+#[test]
+fn store_add_on_fresh_install_scaffolds() {
+    let dir = TempDir::new().unwrap();
+
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
+
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "`store add` on a fresh install must scaffold config.yaml"
+    );
+
+    // Both the store this command created and the implicit `default` store
+    // scaffolding creates on the same first run must be present.
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mystore"))
+        .stdout(predicate::str::contains("default"));
+}
+
+/// `status` goes through the lenient load path, like `search`, but never
+/// touches an embedder — so unlike the `search` test above, this can assert
+/// a normal `success()` outcome without a timeout escape hatch.
+#[test]
+fn status_on_fresh_install_scaffolds() {
+    let dir = TempDir::new().unwrap();
+
+    cmd_with_fresh_dir(&dir).arg("status").assert().success();
+
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "`status` on a fresh install must scaffold config.yaml"
+    );
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// `db status`/`migrate`/`downgrade` intentionally never scaffold (see
+/// `app_db::load_config_for_maintenance`'s doc comment and CLAUDE.md's
+/// "Schema changes" note): they exist to repair a store's schema, so they
+/// must keep hard-failing on a fresh install rather than quietly creating
+/// one underneath themselves.
+#[test]
+fn db_status_on_fresh_install_does_not_scaffold_and_exits_2() {
+    let dir = TempDir::new().unwrap();
+
+    let output = cmd_with_fresh_dir(&dir)
+        .args(["db", "status"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "`db status` on a fresh install must hard-fail, not scaffold; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.path().join("config.yaml").exists(),
+        "`db status` must never scaffold config.yaml"
+    );
+}
+
+/// Locks the latent-bug fix described in `load_config_lenient`'s doc
+/// comment: an explicit `--config` whose parent directory is missing used
+/// to silently fall through to an unrelated platform-default config on the
+/// lenient path; the F11 guard in `ensure_config_scaffolded` now makes this
+/// exit 2 uniformly, before anything is ever created on disk.
+#[test]
+fn search_with_explicit_config_missing_parent_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let missing_parent_config = dir.path().join("nonexistent-dir").join("config.yaml");
+
+    let output = cmd()
+        .args([
+            "--config",
+            missing_parent_config.to_str().unwrap(),
+            "search",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "explicit --config with a missing parent directory must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !missing_parent_config.parent().unwrap().exists(),
+        "nothing should be created when --config's parent directory is missing"
+    );
+}
+
+/// `localdb init` after a command has already implicitly scaffolded config
+/// must remain a byte-for-byte no-op (specs/05-surfaces.md's idempotency
+/// contract for `init`), not just "still exits 0".
+#[test]
+fn init_after_implicit_scaffold_is_still_idempotent() {
+    let dir = TempDir::new().unwrap();
+
+    // `status` needs no store or embedder, so it exercises the lenient
+    // scaffold path cheaply.
+    cmd_with_fresh_dir(&dir).arg("status").assert().success();
+
+    let config_path = dir.path().join("config.yaml");
+    let before = std::fs::read(&config_path).expect("status must have scaffolded config.yaml");
+
+    cmd_with_fresh_dir(&dir).arg("init").assert().success();
+
+    let after = std::fs::read(&config_path).unwrap();
+    assert_eq!(
+        before, after,
+        "`init` after an implicit scaffold must not rewrite config.yaml"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
+
+// `status` resolves its store scope like every other all-stores command
+// (specs/05-surfaces.md §2.2): a database with zero stores is exit 2, not a
+// silent empty success (see the zero-store tests further down). These two
+// tests exercise the success path, so they need at least one store to exist
+// first.
 
 #[test]
 fn status_shows_daemon_not_running() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
+    cmd_with_dir(&dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
 
     cmd_with_dir(&dir)
         .arg("status")
@@ -213,6 +1183,10 @@ fn status_shows_daemon_not_running() {
 fn status_json_has_daemon_field() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
+    cmd_with_dir(&dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
 
     let output = cmd_with_dir(&dir)
         .arg("--json")
@@ -226,6 +1200,123 @@ fn status_json_has_daemon_field() {
         .unwrap_or_else(|_| panic!("status --json must emit valid JSON; got: {stdout}"));
     assert!(v.get("daemon").is_some());
     assert!(v.get("stores").is_some());
+}
+
+/// `status --store <name>...` must scope the daemon request itself, not just
+/// filter the response client-side (issue #187 review, finding F7): each
+/// requested name is sent as a repeated, percent-encoded `?store=` query
+/// param, mirroring `encode_path_segment`'s use on URL path segments
+/// elsewhere in `daemon_client`. Uses a store name containing a space to
+/// prove the value is actually percent-encoded (`store=sp%20ace`), not just
+/// concatenated raw — an unescaped space would still parse as one query
+/// param in this case, but an unescaped '&' or '#' would corrupt the query
+/// string entirely, which is what percent-encoding here guards against.
+#[test]
+fn status_daemon_scopes_request_with_percent_encoded_store_params() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (listener, port) = start_mock_daemon();
+    let received_request_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received_request_lines.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_ok() {
+                received_clone
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_string());
+            }
+
+            // Drain headers.
+            loop {
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            // Respond with a `GET /v1/status` body naming the two scoped
+            // stores, so the CLI's client-side `apply_daemon_store_scope`
+            // (kept as defense-in-depth) also succeeds and the process exits
+            // 0 rather than `store_not_found`.
+            let body = r#"{
+                "daemon": true,
+                "store_count": 2,
+                "source_count": 0,
+                "job_count": 0,
+                "stores": [
+                    {"name": "sp ace", "visibility": "private", "backend": "libsql", "document_count": 0, "chunk_count": 0},
+                    {"name": "c", "visibility": "private", "backend": "libsql", "document_count": 0, "chunk_count": 0}
+                ],
+                "database": {
+                    "path": "/tmp/localdb.db",
+                    "exists": false,
+                    "size_bytes": null,
+                    "wal_size_bytes": null,
+                    "total_size_bytes": 0,
+                    "bytes_per_chunk": null,
+                    "largest_tables": []
+                }
+            }"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "status", "--store", "sp ace", "--store", "c"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "status --store should succeed against the mock daemon; \
+         exit={:?} stdout={} stderr={}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    let lines = received_request_lines.lock().unwrap();
+    let status_request = lines
+        .iter()
+        .find(|l| l.contains("/v1/status"))
+        .unwrap_or_else(|| panic!("mock daemon never received a /v1/status request: {lines:?}"));
+    assert!(
+        status_request.contains("store=sp%20ace"),
+        "expected a percent-encoded 'sp ace' store param; got: {status_request}"
+    );
+    assert!(
+        status_request.contains("store=c"),
+        "expected a repeated 'store=c' query param; got: {status_request}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -310,15 +1401,17 @@ fn store_remove_success() {
         .success()
         .stdout(predicate::str::contains("removeme"));
 
-    // Store should no longer appear in list.
-    cmd_with_dir(&dir)
-        .args(["store", "list"])
-        .assert()
-        .success()
-        .stdout(predicate::str::is_match("(?i)no stores|^$").unwrap().or(
-            // If store list returns empty JSON array, that's also fine.
-            predicate::str::contains("removeme").not(),
-        ));
+    // Store should no longer appear in list. With the store removed, the
+    // database now has zero stores — under the all-stores scope policy
+    // (specs/05-surfaces.md §2.2) that's a loud exit 2, not a silent empty
+    // success (see the zero-store tests further down for the rationale).
+    let output = cmd_with_dir(&dir).args(["store", "list"]).output().unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no stores"),
+        "expected a 'no stores' message; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -333,6 +1426,29 @@ fn store_remove_not_found_exits_3() {
 
     // Exit code 3 = not found.
     assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `store remove ../bad --yes` (embedded mode) must exit 2 (InvalidRequest)
+/// like every other command's traversal-name rejection, not exit 3 — H2
+/// (Codex review, PR #212): `store remove` used to skip syntactic
+/// validation in both modes and fall through to a plain "not found" lookup.
+/// This is a deliberate behavior change (3 -> 2) for names of this shape.
+#[test]
+fn store_remove_embedded_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["store", "remove", "--yes", "../bad"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a traversal store name must exit 2 in embedded mode; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +1689,93 @@ fn end_to_end_init_store_source_index_search() {
         uri.contains("hello.md"),
         "citation URI should point to hello.md; got: {}",
         uri
+    );
+}
+
+/// Embedded parity (issue #187 review, finding 1): `localdb search --limit
+/// <huge>` must return no more than `SEARCH_MAX_LIMIT` (100) citations in
+/// embedded mode, exactly like `POST /v1/search` already clamps (see
+/// `search_limit_is_silently_clamped_to_the_max_instead_of_erroring` in
+/// `server/src/handlers/tests/search.rs`). Before this fix,
+/// `SearchCmd::run_embedded` passed `self.limit` straight through as
+/// `top_n` with no cap, so the embedded and daemon paths could return a
+/// different number of results for the identical request.
+///
+/// To make the clamp observable, this fans the query out across three
+/// stores, each seeded with more documents than a single search leg's
+/// `DEFAULT_LEG_K` (50) would return alone — with only one store, the
+/// per-store leg cap already limits the *unclamped* embedded result count
+/// to <= 100 by coincidence, which would make this test pass even without
+/// the fix.
+#[test]
+fn search_embedded_limit_is_clamped_across_multiple_stores() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir).arg("init").assert().success();
+
+    let store_names = ["clamp-store-a", "clamp-store-b", "clamp-store-c"];
+    for store_name in store_names {
+        cmd_with_dir(&dir)
+            .args(["store", "add", store_name])
+            .assert()
+            .success();
+
+        let docs_dir = dir.path().join(format!("{store_name}-docs"));
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                docs_dir.join(format!("doc-{i}.md")),
+                format!("# Doc {i}\n\nzzzclamptestterm content for document {i}.\n"),
+            )
+            .unwrap();
+        }
+
+        cmd_with_dir(&dir)
+            .args(["--store", store_name, "source", "add"])
+            .arg(docs_dir.to_str().unwrap())
+            .assert()
+            .success();
+
+        cmd_with_dir(&dir)
+            .args(["--store", store_name, "index"])
+            .assert()
+            .success();
+    }
+
+    // No daemon running -> embedded path. Ask for far more than
+    // SEARCH_MAX_LIMIT; the corpus has 3 * 40 = 120 matching chunks spread
+    // across three stores, comfortably above the 100-item clamp.
+    let output = cmd_with_dir(&dir)
+        .arg("--json")
+        .args(["search", "--limit", "5000", "zzzclamptestterm"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "search should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("search --json must emit valid JSON; got: {stdout}"));
+    let citations = v["citations"].as_array().expect("citations must be array");
+
+    assert!(
+        citations.len() <= 100,
+        "embedded search must clamp to SEARCH_MAX_LIMIT (100) citations \
+         regardless of the requested --limit, got {}: {stdout}",
+        citations.len()
+    );
+    assert!(
+        citations.len() >= 90,
+        "corpus has 120 matching chunks across 3 stores; expected the clamp \
+         to be genuinely exercised (near 100 results) so this test can \
+         actually distinguish clamped from unclamped behavior, got only {}: \
+         {stdout}",
+        citations.len()
     );
 }
 
@@ -918,6 +2121,103 @@ fn search_routes_to_daemon_when_running() {
     );
 }
 
+/// A daemon that does not advertise search-filter support must make a
+/// filtered search fail loudly, not answer it unfiltered.
+///
+/// `SearchRequest` ignores unknown fields, so a daemon predating search
+/// filters drops them and returns a full result set that is indistinguishable
+/// from a correctly narrowed one — the worst outcome for a scoping request.
+/// The mock here answers `/v1/status` without a `features` list, exactly as an
+/// older daemon would.
+#[test]
+fn filtered_search_refuses_a_daemon_that_does_not_advertise_filter_support() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (listener, port) = start_mock_daemon();
+    let received_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let paths_clone = received_paths.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_ok() {
+                paths_clone
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_string());
+            }
+            loop {
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            // An old daemon's status carries no `features` key at all. If the
+            // CLI were to POST anyway, this would answer with results.
+            let body_resp = if request_line.contains("/v1/status") {
+                r#"{"daemon":true,"store_count":1,"source_count":0,"job_count":0,"stores":[],"database":{}}"#
+            } else {
+                r#"{"citations":[{"chunk_id":"c1","uri":"file:///unfiltered.md"}]}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body_resp.len(),
+                body_resp
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["search", "--mime", "text/markdown", "hello world"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        5,
+        "a filtered search against a filter-unaware daemon must exit 5, not return \
+         unfiltered results; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("restart"),
+        "the error must name the fix; got: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unfiltered.md"),
+        "the unfiltered result set must never reach the user"
+    );
+
+    let paths = received_paths.lock().unwrap();
+    assert!(
+        paths.iter().any(|p| p.contains("/v1/status")),
+        "the CLI must probe capabilities before sending filters; received: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/v1/search")),
+        "the CLI must not POST filters to a daemon that would ignore them; received: {paths:?}"
+    );
+}
+
 /// Daemon-routing: `source add` routes to daemon without panicking.
 ///
 /// Regression test for issue #53: `source add` used the sync `daemon_request`
@@ -1076,6 +2376,214 @@ fn source_remove_with_daemon_running_exits_cleanly_without_panic() {
 }
 
 // ---------------------------------------------------------------------------
+// job cancel (issue #218)
+// ---------------------------------------------------------------------------
+
+/// `job cancel` requires a running daemon — no daemon detected must exit 5
+/// (`daemon_unreachable`), the same outcome every other daemon-only path in
+/// this crate gives.
+#[test]
+fn job_cancel_with_no_daemon_running_exits_5() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--store` is rejected outright (exit 2) — checked before any daemon
+/// probe, so this needs no daemon at all.
+#[test]
+fn job_cancel_with_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "notes",
+            "job",
+            "cancel",
+            "01HRQHB7FN3WMX4AZDV3S9VCTZ",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Reads a full raw HTTP/1.1 request off `stream` (request line + headers,
+/// draining any body per `Content-Length`) and replies with `status`/`body`.
+/// Returns `false` without writing anything if the peer closed the
+/// connection before sending a request line at all — `probe_daemon`'s
+/// health check (`probe_daemon_health_inner`) is a bare
+/// `TcpStream::connect_timeout` with no HTTP request sent, so every mock
+/// daemon in this file sees one such empty connection before the real
+/// request; callers loop past a `false` return to reach it.
+fn respond_to_one_http_request(stream: &mut std::net::TcpStream, status: &str, body: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut content_length: usize = 0;
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).is_err() || first_line.is_empty() {
+        return false;
+    }
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some(v) = line
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            content_length = v;
+        }
+    }
+    if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        let _ = std::io::Read::read_exact(&mut reader, &mut buf);
+    }
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    true
+}
+
+/// Spawn a mock daemon that answers the first *genuine* HTTP request (i.e.
+/// skipping past `probe_daemon`'s bare-connect health check, see
+/// `respond_to_one_http_request`) with `status`/`body`, then returns its
+/// port. Mirrors `store_add_routes_to_daemon_when_running`'s
+/// `listener.incoming()` loop for the same reason: a single `accept()`
+/// would consume the health-check connection and leave the real request
+/// with nothing listening.
+fn spawn_one_shot_mock_daemon(status: &'static str, body: &'static str) -> u16 {
+    let (listener, port) = start_mock_daemon();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            if respond_to_one_http_request(&mut stream, status, body) {
+                break;
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn job_cancel_routes_to_daemon_and_reports_success_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let job_body = r#"{"id":"01HRQHB7FN3WMX4AZDV3S9VCTZ","store_id":"s1","scope":{"type":"store"},"state":"running","stats":{"docs_indexed":0,"chunks_written":0,"docs_skipped":0,"error_count":0,"sources_count":0,"docs_deleted":0,"docs_prunable":0},"created_at":"2026-01-01T00:00:00Z"}"#;
+    let port = spawn_one_shot_mock_daemon("202 Accepted", job_body);
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "exit={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn job_cancel_unknown_id_daemon_reports_exit_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let err_body = r#"{"code":"job_not_found","message":"no-such-job"}"#;
+    let port = spawn_one_shot_mock_daemon("404 Not Found", err_body);
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["job", "cancel", "no-such-job"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn job_cancel_already_terminal_daemon_reports_exit_4() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let err_body = r#"{"code":"job_already_terminal","message":"job already reached a terminal state; cannot cancel"}"#;
+    let port = spawn_one_shot_mock_daemon("409 Conflict", err_body);
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Regression guard for #67 — concurrent DB access no longer fails
 //
 // Previously, holding the redb handle open in-process (e.g. by a daemon or
@@ -1090,6 +2598,13 @@ fn source_remove_with_daemon_running_exits_cleanly_without_panic() {
 async fn store_list_succeeds_while_db_held_open_by_another_connection() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
+    // A zero-store DB now exits 2 (specs/05-surfaces.md §2.2), so a store
+    // must exist for this to exercise the "succeeds despite the held-open
+    // connection" behavior rather than the unrelated no-stores exit.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
 
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -1124,40 +2639,67 @@ async fn store_list_succeeds_while_db_held_open_by_another_connection() {
 fn two_concurrent_store_list_calls_both_succeed() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
+    // A zero-store DB now exits 2 (specs/05-surfaces.md §2.2); a store must
+    // exist so this test still exercises the concurrent-access behavior.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
 
     // Run two store-list commands at the same time (non-blocking spawn).
     // Both must point at the same temp config so they share the same localdb.db.
     let config_path = dir.path().join("config.yaml");
     let binary = env!("CARGO_BIN_EXE_localdb");
 
-    let mut child1 = std::process::Command::new(binary)
+    let child1 = std::process::Command::new(binary)
         .env("LOCALDB_CONFIG", &config_path)
         .args(["store", "list"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn child1");
-    let mut child2 = std::process::Command::new(binary)
+    let child2 = std::process::Command::new(binary)
         .env("LOCALDB_CONFIG", &config_path)
         .args(["store", "list"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn child2");
 
-    let s1 = child1.wait().expect("wait child1");
-    let s2 = child2.wait().expect("wait child2");
+    // Both children are spawned above before either is waited on, so they
+    // still run concurrently; `wait_with_output` consumes each child but
+    // that's fine now that both are already running.
+    let o1 = child1.wait_with_output().expect("wait child1");
+    let o2 = child2.wait_with_output().expect("wait child2");
 
-    assert!(s1.success(), "first store list failed: {:?}", s1.code());
-    assert!(s2.success(), "second store list failed: {:?}", s2.code());
+    assert!(
+        o1.status.success(),
+        "first store list failed: exit={:?} stdout={} stderr={}",
+        o1.status.code(),
+        String::from_utf8_lossy(&o1.stdout),
+        String::from_utf8_lossy(&o1.stderr),
+    );
+    assert!(
+        o2.status.success(),
+        "second store list failed: exit={:?} stdout={} stderr={}",
+        o2.status.code(),
+        String::from_utf8_lossy(&o2.stdout),
+        String::from_utf8_lossy(&o2.stderr),
+    );
 }
 
 /// With a minimal valid config (version: 1 + temp data dir, no `stores:` key, no embedder
-/// policy), read-only commands like `store list` must still succeed (exit 0), returning an
-/// empty list.  This exercises the lenient loader path and is hermetic across machines
-/// (a fresh temp data dir avoids legacy-layout interference from developer installations).
+/// policy), `store list` must load config via the lenient path without an *invalid config*
+/// failure — that's what this test guards (F1-cli). It used to also assert exit 0 with an
+/// empty store list, but the project is moving toward implicit init (a `default` store
+/// auto-created idempotently), so a database with zero stores is now a deliberate loud
+/// failure under the all-stores scope policy (specs/05-surfaces.md §2.2), not a silent
+/// empty-list success. Since a config-load failure is *also* exit 2, the exit code alone
+/// can no longer distinguish "config was fine, there just aren't any stores" from "config
+/// itself was rejected" — so this asserts on the stderr message instead, proving the
+/// lenient-config path succeeded and the "no stores" branch is what actually fired.
 #[test]
-fn store_list_with_absent_config_exits_0() {
+fn store_list_with_minimal_config_and_no_stores_exits_2_with_no_stores_message() {
     let dir = TempDir::new().unwrap();
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -1168,11 +2710,20 @@ fn store_list_with_absent_config_exits_0() {
     );
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
     let output = cmd_with_dir(&dir).args(["store", "list"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code().unwrap(),
-        0,
-        "store list with minimal config should exit 0; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        2,
+        "store list with zero stores should exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no stores"),
+        "expected the no-stores message (proving the minimal config loaded fine via the \
+         lenient path, rather than failing as invalid config); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid config"),
+        "the minimal config must not be rejected as invalid; stderr: {stderr}"
     );
 }
 
@@ -1347,9 +2898,8 @@ fn db_status_on_fresh_healthy_store_reports_current_equals_head() {
     let head = v["head_version"].as_i64().unwrap();
     assert_eq!(current, head, "fresh store should be exactly at head");
     assert_eq!(
-        current, 7,
-        "current baseline/head is v7 (baseline v4 + the block_id-drop migration, \
-         + the auth-tables migration, + access_requests.collected_at)"
+        current, 10,
+        "current head includes the auth tables and token collection marker"
     );
     assert_eq!(v["pending"].as_i64().unwrap(), 0);
     assert!(!v["legacy"].as_bool().unwrap());
@@ -1738,9 +3288,10 @@ fn db_downgrade_explicit_target_below_baseline_without_confirmation_reports_real
     );
 }
 
-/// All three `db` subcommands refuse with exit 4 (`daemon_running`) while a
-/// daemon is running — per specs/05-surfaces.md §2.1 they are CLI-only and
-/// never route to the daemon's HTTP API, unlike `store`/`source`/`search`.
+/// All four `db` subcommands (`status`, `migrate`, `downgrade`, `vacuum`)
+/// refuse with exit 4 (`daemon_running`) while a daemon is running — per
+/// specs/05-surfaces.md §2.1 they are CLI-only and never route to the
+/// daemon's HTTP API, unlike `store`/`source`/`search`.
 #[test]
 fn db_commands_refuse_while_daemon_running() {
     let dir = TempDir::new().unwrap();
@@ -1756,6 +3307,10 @@ fn db_commands_refuse_while_daemon_running() {
         vec!["db", "migrate"],
         vec!["--yes", "db", "migrate"],
         vec!["--yes", "db", "downgrade"],
+        // issue #187 review, finding 4b: `db vacuum` is the fourth `db`
+        // subcommand (specs/05-surfaces.md §2, §2.1) and must refuse the
+        // same way as its siblings — it was missing from this trio.
+        vec!["db", "vacuum"],
     ] {
         let output = cmd_with_dir(&dir)
             .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:19999")
@@ -1770,4 +3325,5481 @@ fn db_commands_refuse_while_daemon_running() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-store `--store` scope — specs/05-surfaces.md §2.2, issue #178
+//
+// Before the fix, every command except `search`/`mcp` called a helper that
+// used `ctx.stores.first()` and otherwise picked an ARBITRARY store
+// (`list_stores()[0]`) when `--store` was omitted. These tests create three
+// stores (`books`, `default`, `research`) and exercise the resolution rules
+// in the §2.2 table: `-s` is repeatable, every name is validated and
+// resolved (not just the first), unknown names are exit 3, and each
+// command's no-`-s` default is deterministic rather than "whichever store
+// sorts first".
+// ---------------------------------------------------------------------------
+
+/// Create three stores — `books`, `default`, `research` — each seeded with
+/// one path source pointing at its own fixture directory (auto-indexed via
+/// `source add`, so `index` has real, if trivial, work to do per store).
+/// Returns each store's fixture directory so callers can assert on exact
+/// paths rather than just counts.
+fn setup_multi_store(dir: &TempDir) -> std::collections::HashMap<&'static str, std::path::PathBuf> {
+    write_default_config(dir);
+    let mut fixtures = std::collections::HashMap::new();
+    for name in ["books", "default", "research"] {
+        cmd_with_dir(dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+
+        let fixture = dir.path().join(format!("{name}-docs"));
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(
+            fixture.join("doc.md"),
+            format!("# {name}\n\nDocument for store {name}.\n"),
+        )
+        .unwrap();
+
+        cmd_with_dir(dir)
+            .args(["--store", name, "source", "add", fixture.to_str().unwrap()])
+            .assert()
+            .success();
+
+        fixtures.insert(name, fixture);
+    }
+    fixtures
+}
+
+/// Headline regression test for issues #178 and #201: `source list` with no
+/// `--store` must not silently narrow to *any* single store.
+///
+/// #178's original fix replaced "an arbitrary store (`list_stores()[0]`)"
+/// with "the store named `default`" — which cured the arbitrariness but kept
+/// the narrowing, and that is #201: `source list` reporting
+/// `No sources on store 'default'.` on a database that plainly had sources in
+/// `books` and `hydra`. `-s` is a *filter*, so omitting it spans everything
+/// (specs/05-surfaces.md §2.2). This asserts the sharper form of #178's
+/// intent: the bare listing covers every store, not one privileged one.
+#[test]
+fn source_list_no_store_flag_spans_all_stores_178_201() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research — one source each
+
+    let bare = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(bare.status.success());
+    let bare_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&bare.stdout)).unwrap();
+    let sources = bare_v["sources"].as_array().expect("sources array");
+
+    assert_eq!(
+        sources.len(),
+        3,
+        "a bare `source list` must cover every store's sources: {bare_v}"
+    );
+    let store_names: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        store_names,
+        ["books", "default", "research"].into_iter().collect(),
+        "every store must appear in a bare `source list`: {bare_v}"
+    );
+
+    // The #201 half, stated negatively: the bare listing must not be
+    // equivalent to any single-store view — neither the arbitrary store #178
+    // used to pick, nor the `default` store #178's fix picked instead.
+    for narrowed in ["books", "default"] {
+        let explicit = cmd_with_dir(&dir)
+            .args(["--json", "--store", narrowed, "source", "list"])
+            .output()
+            .unwrap();
+        assert!(explicit.status.success());
+        let explicit_v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&explicit.stdout)).unwrap();
+        assert_ne!(
+            bare_v, explicit_v,
+            "a bare `source list` must not collapse to the single store '{narrowed}'"
+        );
+    }
+}
+
+/// `source add` with no `--store` lands in the store named `default`
+/// (specs/05-surfaces.md §2.2), verified by re-listing that store's sources.
+#[test]
+fn source_add_no_store_flag_lands_in_default_store() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // each of books/default/research already has 1 source
+
+    let fixture = dir.path().join("extra-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "default", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources must be an array");
+    assert_eq!(
+        sources.len(),
+        2,
+        "default store should now hold its original source plus the new one: {v}"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|s| s["root"].as_str() == Some(fixture.to_str().unwrap())),
+        "the newly added source should be on 'default': {v}"
+    );
+
+    // The other two stores must be untouched by the bare `source add`.
+    let books_output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "books", "source", "list"])
+        .output()
+        .unwrap();
+    let books_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&books_output.stdout)).unwrap();
+    assert_eq!(
+        books_v["sources"].as_array().unwrap().len(),
+        1,
+        "books should be untouched by a bare `source add`: {books_v}"
+    );
+}
+
+/// `source add` with no `--store` requires a store literally named `default`
+/// — this fires even when exactly one store exists under a different name,
+/// per specs/05-surfaces.md §2.2 ("predictability wins over guessing the
+/// sole store").
+#[test]
+fn source_add_no_store_flag_exits_2_even_with_exactly_one_other_store() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    cmd_with_dir(&dir)
+        .args(["store", "add", "onlystore"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no store named 'default'; pass --store <name>"),
+        "stderr: {stderr}"
+    );
+}
+
+/// After `store remove default`, a bare `source add` (no `--store`) exits 2
+/// and the message names `--store` — the store set genuinely has no
+/// `default` member anymore, distinct from the "never had one" case above.
+#[test]
+fn source_add_no_store_flag_after_default_removed_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "remove", "--yes", "default"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("orphan-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--store"),
+        "error message should name --store; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no store named 'default'"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `source list` output gains a store-name column only when more than one
+/// store is in scope (specs/05-surfaces.md §2.2); with exactly one store the
+/// output is byte-identical to the pre-multi-store format.
+#[test]
+fn source_list_shows_store_column_only_when_multi_store_in_scope() {
+    let dir = TempDir::new().unwrap();
+    let fixtures = setup_multi_store(&dir);
+    let books_fixture = fixtures.get("books").unwrap().to_str().unwrap();
+
+    // Exactly one store in scope: no column.
+    let single = cmd_with_dir(&dir)
+        .args(["--store", "books", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(single.status.success());
+    let single_stdout = String::from_utf8_lossy(&single.stdout);
+    let single_lines: Vec<&str> = single_stdout.lines().collect();
+    assert_eq!(single_lines.len(), 1, "stdout: {single_stdout}");
+    assert!(
+        single_lines[0].ends_with(&format!("[path] {books_fixture}")),
+        "single-store line must be `{{id}} [path] {{loc}}` with no store column: {}",
+        single_lines[0]
+    );
+    assert!(
+        !single_lines[0].starts_with("books"),
+        "single-store output must not carry a store-name column: {}",
+        single_lines[0]
+    );
+
+    // More than one store in scope: a store-name column appears, padded to
+    // the widest name in scope ("default", 7 chars) + 2 spaces — matching
+    // the worked example in specs/05-surfaces.md §2.2.
+    let multi = cmd_with_dir(&dir)
+        .args(["--store", "books", "--store", "default", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(multi.status.success());
+    let multi_stdout = String::from_utf8_lossy(&multi.stdout);
+    let multi_lines: Vec<&str> = multi_stdout.lines().collect();
+    assert_eq!(multi_lines.len(), 2, "stdout: {multi_stdout}");
+    assert!(
+        multi_lines.iter().any(|l| l.starts_with("books    ")),
+        "expected a 'books' line padded to width 9: {multi_lines:?}"
+    );
+    assert!(
+        multi_lines.iter().any(|l| l.starts_with("default  ")),
+        "expected a 'default' line padded to width 9: {multi_lines:?}"
+    );
+}
+
+/// Issue #187 review, finding 1: a scope of two stores where only *one* has
+/// any sources must still show the store-name column — the column keys off
+/// the size of the *resolved scope* (2 stores), never off how many of those
+/// stores happened to contribute an item to the result set. Regression test
+/// for a bug where the renderer instead rebuilt "how many stores are in
+/// scope" from the *returned items'* own `store_name`s, so a scope of
+/// `--store populated --store empty` silently looked single-store (only
+/// `populated` ever appears in `items`) and dropped the column.
+#[test]
+fn source_list_shows_store_column_even_when_one_scoped_store_is_empty() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    for name in ["populated", "empty"] {
+        cmd_with_dir(&dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+
+    let fixture = dir.path().join("populated-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello\n").unwrap();
+    cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "populated",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "populated", "--store", "empty", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "only 'populated' has a source: {stdout}");
+    // Column width = longest name in scope ("populated", 9) + 2 = 11.
+    assert!(
+        lines[0].starts_with("populated  "),
+        "expected the store-name column even though 'empty' contributed no \
+         items to the result set: {lines:?}"
+    );
+}
+
+/// `index` with no `--store` touches every store, not just the first —
+/// verified via the multi-store `--json` shape (`{"stores": [...], "total":
+/// {...}}`, specs/05-surfaces.md §2.2).
+#[test]
+fn index_no_store_flag_touches_all_stores() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index with no --store should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("index --json must emit valid JSON; got: {stdout}"));
+
+    let stores = v["stores"]
+        .as_array()
+        .expect("multi-store index --json must have a 'stores' array");
+    let names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|s| s["store"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["books", "default", "research"].into_iter().collect(),
+        "index with no --store should touch every store; got: {v}"
+    );
+    assert!(
+        v.get("total").is_some(),
+        "multi-store index --json must include a combined 'total': {v}"
+    );
+}
+
+/// `db migrate` is not store-scoped (specs/05-surfaces.md §2.1/§2.2): passing
+/// `--store` at all, even in a multi-store database, must exit 2 rather than
+/// silently migrating (or being interpreted as migrating) just one store.
+#[test]
+fn db_migrate_with_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["db", "migrate", "--store", "books"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--store is not applicable"),
+        "stderr: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #201: `-s` is a filter, and every command that accepts it either
+// honors it or refuses it — none silently ignore it.
+// ---------------------------------------------------------------------------
+
+/// The reporter's exact human-mode symptom (#201): three stores with sources,
+/// and a bare `source list` showed one store's worth. It must now print one
+/// line per source across all stores, each carrying the store-name column
+/// (which appears because >1 store is in scope, specs/05-surfaces.md §2.2).
+#[test]
+fn source_list_no_store_flag_spans_all_stores_with_column() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research — one source each
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one line per source across all three stores; stdout: {stdout}"
+    );
+
+    // Column width is the longest name in scope ("research", 8) + 2 = 10.
+    for name in ["books", "default", "research"] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(&format!("{name:<10}"))),
+            "expected a '{name}' line with the store-name column: {lines:?}"
+        );
+    }
+}
+
+/// The same, in `--json`: every store's sources appear, each tagged with its
+/// own `store.name`.
+#[test]
+fn source_list_no_store_flag_json_includes_every_store() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources array");
+    assert_eq!(sources.len(), 3, "{v}");
+    let names: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["books", "default", "research"].into_iter().collect()
+    );
+}
+
+/// Issue #187 review, finding 2: `source list --json` must include
+/// `store_id` alongside `store.name` — pre-wave behavior (see
+/// `docs/cli.md`'s worked example) that the shared `SourceListItem`
+/// renderer introduced when both transports were unified onto it silently
+/// dropped. Each source's `store_id` must be a real, non-empty store ULID,
+/// distinct across stores (never the store's *name*, and never blank).
+#[test]
+fn source_list_json_includes_store_id() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research — one source each
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources array");
+    assert_eq!(sources.len(), 3, "{v}");
+
+    let mut store_ids = std::collections::HashSet::new();
+    for s in sources {
+        let store_id = s["store_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a string store_id on {s}"));
+        assert!(!store_id.is_empty(), "store_id must not be blank: {s}");
+        let store_name = s["store"]["name"].as_str().unwrap();
+        assert_ne!(
+            store_id, store_name,
+            "store_id must be the store's ULID, not its name: {s}"
+        );
+        store_ids.insert(store_id.to_string());
+    }
+    assert_eq!(
+        store_ids.len(),
+        3,
+        "each of the three stores must have its own distinct store_id: {v}"
+    );
+}
+
+/// The direct #201 regression: a source living in a *non*-`default` store,
+/// removed by ULID with no `--store`. Under the old `DefaultStore` policy the
+/// ULID resolved fine but its owning store was outside the implicit scope, so
+/// a perfectly valid id exited 3.
+#[test]
+fn source_remove_by_ulid_no_store_flag_succeeds_for_non_default_store() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    for name in ["books", "default"] {
+        cmd_with_dir(&dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+
+    let fixture = dir.path().join("books-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "books",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(add_out.status.success());
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    // No `--store`: the ULID identifies its owning store on its own.
+    let output = cmd_with_dir(&dir)
+        .args(["source", "remove", &id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "a bare `source remove <ulid>` must find the source wherever it lives (#201); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // And it is genuinely gone from `books`.
+    cmd_with_dir(&dir)
+        .args(["--store", "books", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources on store 'books'."));
+}
+
+/// `source remove` now runs under the `AllStores` policy, so a database with
+/// no stores at all is exit 2 with that policy's message — not a silent
+/// no-op, and no longer the `no store named 'default'` message.
+#[test]
+fn source_remove_by_ulid_no_store_flag_zero_stores_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no stores; run `localdb store add <name>` or pass --store"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `store add` names its store as an argument — `--store` has nothing to
+/// select, so it must exit 2 rather than be silently ignored (the #178
+/// failure mode, still present in `store add` until #201).
+#[test]
+fn store_add_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "store", "add", "newstore"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+
+    // The rejection must also be a no-op: `newstore` must not exist.
+    let stores = cmd_with_dir(&dir)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&stores.stdout)).unwrap();
+    assert!(
+        !v["stores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "newstore"),
+        "a rejected `store add` must not have created the store: {v}"
+    );
+}
+
+/// Same for `store remove` — and deliberately run *without* `--yes`, so it
+/// would block on a confirmation prompt if the rejection didn't come first.
+/// The rejection is the first statement in the command for exactly this
+/// reason: misuse must never get as far as asking the user to confirm a
+/// deletion.
+#[test]
+fn store_remove_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "store", "remove", "research"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+
+    // Nothing was deleted, and nothing was prompted for.
+    cmd_with_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("research"));
+}
+
+/// `init` runs before any store exists, so `--store` is meaningless — exit 2,
+/// and (since the check is the first statement) without writing a config.
+#[test]
+fn init_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("config.yaml");
+
+    let output = cmd()
+        .env("LOCALDB_CONFIG", &config_path)
+        .args(["--store", "books", "init"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+    assert!(
+        !config_path.exists(),
+        "a rejected `init` must not have written a config file"
+    );
+}
+
+/// `serve` serves every store regardless, so `--store` is rejected — and the
+/// check must precede binding a port, which is what makes this test able to
+/// complete at all (a daemon that started would run until killed).
+#[test]
+fn serve_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "serve"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+    assert!(
+        !dir.path().join("data").join("daemon.sock").exists(),
+        "a rejected `serve` must not have created a daemon socket"
+    );
+}
+
+/// `mcp -s <unknown>` exits 3 instead of starting a server that silently
+/// exposes zero stores (#201). Embedded mode, no daemon running: validation
+/// happens before `serve_embedded_stdio`, so the process exits without ever
+/// reading stdin — which is why this can use `.output()` at all.
+#[test]
+fn mcp_unknown_store_flag_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "nosuchstore", "mcp"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "an unknown --store must be store_not_found, not a silently empty server; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `mcp` on a database with no stores must still start cleanly (exit 0 on
+/// stdin EOF) rather than exit 2. This pins the `AllStoresAllowEmpty` policy:
+/// an MCP server that exits non-zero at startup reads to its client as
+/// broken, not as empty, so a later "simplification" back to `AllStores`
+/// would turn a fresh install into a broken-looking one.
+#[test]
+fn mcp_zero_stores_still_starts() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    // Empty stdin => immediate EOF => clean shutdown (see
+    // `mcp_exits_cleanly_on_stdin_eof`).
+    let output = cmd_with_dir(&dir)
+        .arg("mcp")
+        .write_stdin("")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "a storeless database must start an MCP server exposing zero stores, not exit 2; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The `search` half of the same policy: a query against a storeless database
+/// is "no results", exit 0 — not exit 2.
+#[test]
+fn search_zero_stores_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["search", "anything"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "search on a storeless database must exit 0 with no results; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No results"));
+}
+
+/// `-s`/`--store` is repeatable and every name is resolved, not truncated to
+/// the first (the exact #178 failure mode for explicit multi-name usage):
+/// `source list -s books -s research` must return sources from both stores.
+#[test]
+fn source_list_repeated_store_flags_returns_both_not_just_first() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json", "--store", "books", "--store", "research", "source", "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources must be an array");
+    let store_names: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        store_names,
+        ["books", "research"].into_iter().collect(),
+        "repeated -s flags must resolve every name, not just the first: {v}"
+    );
+}
+
+// -- Error branches on data-modifying paths (source add/remove, index) -----
+// coverage gate: data-modifying paths must be >=90% (CLAUDE.md).
+
+/// `source add --store <unknown>` exits 3 (store_not_found), even though the
+/// implicit-default resolution would otherwise apply.
+#[test]
+fn source_add_unknown_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+    let fixture = dir.path().join("unknown-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "nosuchstore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `source add --store ../evil` exits 2 (invalid/traversal store name),
+/// rejected before any store lookup is attempted.
+#[test]
+fn source_add_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+    let fixture = dir.path().join("evil-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "../evil",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+/// `source remove --store <unknown> <id>` exits 3.
+#[test]
+fn source_remove_unknown_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "nosuchstore",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `source remove --store ../evil <id>` exits 2.
+#[test]
+fn source_remove_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "../evil",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+/// `index --store <unknown>` exits 3.
+#[test]
+fn index_unknown_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "nosuchstore", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `index --store ../evil` exits 2.
+#[test]
+fn index_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "../evil", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Coverage gate: data-modifying paths (source.rs, index.rs) must be >=90%
+// line coverage (specs/01-architecture.md §7 / CLAUDE.md). The tests below
+// close gaps found via `cargo llvm-cov report --text` after the store-scope
+// defaults rework (#178/#118/#144).
+// ---------------------------------------------------------------------------
+
+/// Requests recorded by [`start_recording_mock_server`] /
+/// [`start_routing_mock_server`]: one `(start_line, json_body)` pair per
+/// request received, in arrival order.
+type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// A single `(method, path_prefix, status_line, body)` route for
+/// [`start_routing_mock_server`].
+///
+/// `method` matches the request's HTTP method exactly (e.g. `"GET"`,
+/// `"POST"`), or matches *any* method when left `""`; `path_prefix` matches
+/// via [`str::starts_with`] against the request's path **with its query
+/// string still attached** (e.g. `"/v1/stores?cursor=20"`) — `""` matches
+/// any path. A bare prefix with no `?` (e.g. `"/v1/stores"`) therefore still
+/// matches every page of that resource regardless of `?cursor=`, exactly as
+/// before; a prefix that includes a literal `?cursor=...` matches only that
+/// specific page, which is how pagination-trap fixtures give page 1 and page
+/// 2 of the same endpoint different bodies — list the cursor-specific route
+/// before the bare-path fallback (first-match-wins). `body` is owned
+/// (`String`, not `&'static str`) so callers can build it at runtime — e.g.
+/// [`paginated_list_body`]/[`paginated_list_page`] for a `GET /v1/stores`
+/// page — without resorting to `Box::leak`.
+type MockRoute = (&'static str, &'static str, &'static str, String);
+
+/// Fallback response served when no route matches: a 404 with a JSON error
+/// body shaped like the daemon's real error envelope (`{"code": ...,
+/// "message": ...}`, see `cli/src/daemon_client.rs::decode_daemon_error`),
+/// so a test that forgets a route fails with a clear CLI-level error
+/// instead of the mock server hanging or panicking.
+const UNMATCHED_ROUTE_STATUS: &str = "HTTP/1.1 404 Not Found";
+const UNMATCHED_ROUTE_BODY: &str =
+    r#"{"code":"resource_not_found","message":"no mock route matched this request"}"#;
+
+/// Spin up a minimal mock HTTP server that dispatches each request to the
+/// first route in `routes` whose method matches (exactly, or any method if
+/// `""`) and whose path starts with `path_prefix` — **first-match-wins**,
+/// so callers should list more specific routes (e.g. an exact path) before
+/// more general ones (e.g. a shared prefix or a catch-all `("", "", ..,
+/// ..)`). Requests matching no route get [`UNMATCHED_ROUTE_STATUS`] /
+/// [`UNMATCHED_ROUTE_BODY`] rather than hanging.
+///
+/// Every request's start-line and raw JSON body (if any) is recorded for
+/// assertions, mirroring `start_recording_mock_server`. `routes` is taken
+/// by value (rather than `&'static [MockRoute]`) so callers can build it
+/// from ordinary runtime `&'static str` arguments (as
+/// `start_recording_mock_server` does) without needing const-promotion or
+/// leaking memory.
+fn start_routing_mock_server(routes: Vec<MockRoute>) -> (u16, RecordedRequests) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let (listener, port) = start_mock_daemon();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            let path = request_line.trim().to_string();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body_buf = vec![0u8; content_length];
+            let req_body = if content_length > 0 && reader.read_exact(&mut body_buf).is_ok() {
+                String::from_utf8_lossy(&body_buf).to_string()
+            } else {
+                String::new()
+            };
+
+            received_clone
+                .lock()
+                .unwrap()
+                .push((path.clone(), req_body));
+
+            // The recorded `path` is the whole trimmed request line, e.g.
+            // `"GET /v1/stores?limit=50 HTTP/1.1"`; pull out method + the
+            // path *with its query string still attached* for route
+            // matching (see `MockRoute`'s doc comment — this is what lets a
+            // cursor-specific route prefix match only that page).
+            let mut parts = path.split_whitespace();
+            let req_method = parts.next().unwrap_or("");
+            let req_path = parts.next().unwrap_or("");
+
+            let (status_line, body) = routes
+                .iter()
+                .find(|(method, prefix, _, _)| {
+                    (method.is_empty() || *method == req_method) && req_path.starts_with(prefix)
+                })
+                .map(|(_, _, status_line, body)| (*status_line, body.clone()))
+                .unwrap_or((UNMATCHED_ROUTE_STATUS, UNMATCHED_ROUTE_BODY.to_string()));
+
+            let response = format!(
+                "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    (port, received)
+}
+
+/// Spin up a minimal mock HTTP server that answers every request with the
+/// same fixed status line + JSON body, recording each request's start-line
+/// and raw JSON body (if any) for assertions. Unlike `start_mock_daemon`'s
+/// inline callers above, this variant also captures the request body so
+/// tests can assert on what the CLI actually sent (e.g. the `spec` object
+/// for url-kind sources).
+///
+/// A thin wrapper over [`start_routing_mock_server`] with a single
+/// catch-all route (`""`/`""`) matching any method and any path.
+fn start_recording_mock_server(
+    status_line: &'static str,
+    body: &'static str,
+) -> (u16, RecordedRequests) {
+    start_routing_mock_server(vec![("", "", status_line, body.to_string())])
+}
+
+/// Build a `PaginatedList` JSON body (`server/src/handlers/mod.rs`) with no
+/// further pages, for stubbing routes like `GET /v1/stores` in
+/// [`start_routing_mock_server`] tests.
+fn paginated_list_body(items_json: &[&str]) -> String {
+    format!(
+        r#"{{"items":[{}],"next_cursor":null,"total":{}}}"#,
+        items_json.join(","),
+        items_json.len()
+    )
+}
+
+/// Like [`paginated_list_body`], but with an explicit `next_cursor` (`None`
+/// renders `null`) and `total` — for building a *page* of a larger list, to
+/// drive the pagination-trap tests (a match sitting on page 2+, or a scope
+/// with more than `default_limit()` (20) items).
+fn paginated_list_page(items_json: &[String], next_cursor: Option<&str>, total: usize) -> String {
+    let cursor_json = match next_cursor {
+        Some(c) => format!("\"{c}\""),
+        None => "null".to_string(),
+    };
+    format!(
+        r#"{{"items":[{}],"next_cursor":{},"total":{}}}"#,
+        items_json.join(","),
+        cursor_json,
+        total
+    )
+}
+
+/// One `StoreRecord` (`server/src/state.rs`) JSON object, for
+/// [`paginated_list_body`]/[`paginated_list_page`] fixtures stubbing
+/// `GET /v1/stores`. `id` (issue #187 stage 5) mirrors the real handler's
+/// shape now that `store add`'s daemon-routed `--json` output needs it for
+/// parity with embedded mode.
+fn store_record_json(name: &str) -> String {
+    format!(
+        r#"{{"name":"{name}","id":"01STOREID000000000000000A","visibility":"private","backend":"libsql"}}"#
+    )
+}
+
+/// One `SourceRecord` (`server/src/state.rs`) JSON object, for
+/// [`paginated_list_body`]/[`paginated_list_page`] fixtures stubbing
+/// `GET /v1/stores/{name}/sources`. Only `id` is inspected by the CLI's
+/// owner-walk (`cli/src/cmds/index.rs::daemon_store_has_source`), but the
+/// rest of the shape is filled in so the body is a valid `SourceRecord`.
+fn source_record_json(id: &str, store_name: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","store_id":"{store_name}","kind":"path","spec":{{"root":"/tmp/x"}},"preset":"prose","refresh":null}}"#
+    )
+}
+
+// -- issue #187 stage 3: unified job model — SSE/poll job-attach fixtures --
+
+/// A minimal terminal `IndexJob` JSON body (`core::types::IndexJob`) in the
+/// `done` state, for stubbing `GET /v1/jobs/{id}/events` (as the `data:` of
+/// its sole `event: job` SSE frame — see [`sse_done_body`]) or `GET
+/// /v1/jobs/{id}` (poll fallback) in daemon-routed `index`/`source add`
+/// auto-index tests (issue #187 stage 3: both now attach to the submitted
+/// job to completion instead of just printing "submitted").
+///
+/// `IndexJobStats` has struct-level `#[serde(default)]`, so `stats_json` only
+/// needs to set the fields a given test actually cares about — `"{}"` is a
+/// valid (all-zero) `IndexJobStats`.
+fn index_job_done_json(job_id: &str, store_id: &str, stats_json: &str) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"done","stats":{stats_json},"created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// A terminal `IndexJob` JSON body in the `failed` state, for tests covering
+/// a daemon job that fails after being accepted.
+fn index_job_failed_json(job_id: &str, store_id: &str, error: &str) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// Like [`index_job_failed_json`], but with an explicit `error_code` (issue
+/// #187 review, finding 3) — for stubbing a daemon job whose failure came
+/// from a typed `core::Error` (e.g. `"invalid_config"`), so
+/// `cli::job_attach::finish_job` can reconstruct the original variant and
+/// exit with its code instead of collapsing to `Error::Internal` (exit 1).
+fn index_job_failed_json_with_code(
+    job_id: &str,
+    store_id: &str,
+    error: &str,
+    error_code: &str,
+) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","error_code":"{error_code}","created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// Wrap a terminal `IndexJob` JSON body (from [`index_job_done_json`] /
+/// [`index_job_failed_json`]) as the single-frame SSE body `GET
+/// /v1/jobs/{id}/events` returns once a job is already finished — a bare
+/// `event: job` frame, matching `server/src/handlers/jobs.rs`'s
+/// `terminal_job_event`.
+fn sse_done_body(job_json: &str) -> String {
+    format!("event: job\ndata: {job_json}\n\n")
+}
+
+// -- source add: local (non-daemon) error/success branches -----------------
+
+/// `source add <nonexistent path>` exits 2 (`normalize_path_source` fails).
+#[test]
+fn source_add_nonexistent_path_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let missing = dir.path().join("does-not-exist-at-all");
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "s1", "source", "add", missing.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "adding a nonexistent path should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `source add --refresh <garbage>` exits 2 (`validate_refresh_interval`
+/// fails) before the source row is ever created.
+#[test]
+fn source_add_invalid_refresh_interval_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "s1",
+            "source",
+            "add",
+            "--refresh",
+            "not-a-duration",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "invalid --refresh value should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `source add <url>` (no daemon) creates a url-kind source locally. The
+/// target host refuses the connection immediately (nothing listens on
+/// 127.0.0.1:1), so the WarnAndContinue auto-index step fails quietly — the
+/// command itself must still succeed and the source must be persisted with
+/// `kind: url`.
+#[test]
+fn source_add_url_kind_local_creates_url_source() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "webstore"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "webstore",
+            "source",
+            "add",
+            "http://127.0.0.1:1/doc.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "adding a url source should succeed even if the fetch later fails; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["kind"].as_str().unwrap(), "url");
+
+    let list = cmd_with_dir(&dir)
+        .args(["--json", "--store", "webstore", "source", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&list.stdout)).unwrap();
+    let sources = lv["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["kind"].as_str().unwrap(), "url");
+    assert_eq!(
+        sources[0]["url"].as_str().unwrap(),
+        "http://127.0.0.1:1/doc.txt"
+    );
+    assert!(sources[0]["root"].is_null());
+}
+
+/// A source root that becomes unreadable between `source add` and its
+/// auto-index step surfaces as a warning (WarnAndContinue mode), not a
+/// command failure: `run_source_ingestion` returns `Err`, which
+/// `run_embedded_index_with` folds into the summary and reports via
+/// `eprintln!` rather than propagating.
+#[test]
+#[cfg(unix)]
+fn source_add_auto_index_permission_denied_warns_but_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "permstore"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("perm-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("note.md"), "# Note\n\nhello\n").unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "permstore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    // Restore permissions immediately so `TempDir`'s Drop can clean up even
+    // if an assertion below fails.
+    let _ = std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755));
+
+    assert!(
+        output.status.success(),
+        "source add should still succeed; auto-index errors only warn. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: auto-index error for source"),
+        "expected an auto-index warning in stderr; got: {stderr}"
+    );
+}
+
+// -- source add: daemon-routing branches ------------------------------------
+
+/// `source add <url>` with a daemon running, non-`--json`: exercises the
+/// url-kind `spec` shape (`{"url": ...}`) and the plain-text success print,
+/// both cold in the pre-existing `source_add_routes_to_daemon_without_panic`
+/// test (which only used `--json` and a path source). Issue #187 review
+/// finding 1: the daemon-only `(via daemon)` suffix is gone — this is now
+/// byte-identical to embedded mode's line (see
+/// `source_add_shape_parity_between_embedded_and_daemon_mock` below).
+#[test]
+fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("mystore")]);
+    let add_body = r#"{"id":"01ABCDEFGHIJKLMNOPQRSTUVWX","store":"mystore","kind":"url"}"#;
+    let (port, received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores/mystore/sources",
+            "HTTP/1.1 200 OK",
+            add_body.to_string(),
+        ),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "source",
+            "add",
+            "--store",
+            "mystore",
+            "https://example.com/page",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "daemon-routed source add should succeed; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Added source 01ABCDEFGHIJKLMNOPQRSTUVWX to store 'mystore'")
+            && !stdout.contains("via daemon"),
+        "expected the same success line embedded mode prints, with no daemon-mode suffix; got: {stdout}"
+    );
+
+    let reqs = received.lock().unwrap();
+    let (path, req_body) = reqs
+        .iter()
+        .find(|(line, _)| line.starts_with("POST"))
+        .expect("mock daemon should have received the POST /v1/stores/mystore/sources request");
+    assert!(path.contains("/v1/stores/mystore/sources"), "path: {path}");
+    let body_json: serde_json::Value = serde_json::from_str(req_body).unwrap();
+    assert_eq!(body_json["kind"].as_str().unwrap(), "url");
+    assert_eq!(
+        body_json["spec"]["url"].as_str().unwrap(),
+        "https://example.com/page"
+    );
+}
+
+/// Shape parity (issue #187 review, finding 1): `source add`'s daemon and
+/// embedded branches used to diverge in what they printed — the daemon
+/// branch echoed the raw persisted `SourceRecord` (`--json`) plus a `(via
+/// daemon)` text suffix, while embedded mode printed a reduced
+/// `{id, kind, status, store}` object and a plain text line. Both now funnel
+/// through the same `render_source_add_item`/`render_source_add_summary`
+/// (`cli/src/cmds/source.rs`), so this asserts byte-identical text *and*
+/// `--json` output, one comparison each (each needs its own real generated
+/// ULID, so the two can't share one embedded run) — mirroring
+/// `index_shape_parity_between_embedded_and_daemon_mock`'s approach of
+/// deriving the daemon-mock's response from a real embedded run's output
+/// instead of hand-picking values that might happen to already agree.
+#[test]
+fn source_add_shape_parity_between_embedded_and_daemon_mock() {
+    // -- text mode ----------------------------------------------------------
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        embedded_text.status.success(),
+        "embedded source add should succeed; stderr: {}",
+        String::from_utf8_lossy(&embedded_text.stderr)
+    );
+    let embedded_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    // Pull the real generated ULID out of the embedded run's output so the
+    // daemon-mock can be made to "persist" a source under the identical id
+    // — text/json output would trivially differ on id otherwise.
+    let real_id = embedded_stdout
+        .strip_prefix("Added source ")
+        .and_then(|s| s.split(' ').next())
+        .expect("embedded text output must start with 'Added source <id>'")
+        .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let daemon_fixture = daemon_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&daemon_fixture).unwrap();
+    let stores_body = paginated_list_body(&[&store_record_json("parity")]);
+    let add_body = format!(r#"{{"id":"{real_id}","store":"parity","kind":"path"}}"#);
+    let (port, _received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores/parity/sources",
+            "HTTP/1.1 200 OK",
+            add_body,
+        ),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            daemon_fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_text.status.success(),
+        "daemon-routed source add should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_text.stderr)
+    );
+    let daemon_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+
+    assert_eq!(
+        embedded_stdout, daemon_stdout,
+        "text output must be byte-identical between embedded and daemon-mock"
+    );
+
+    // -- --json mode ----------------------------------------------------------
+    // A fresh store/fixture pair — re-adding the same root to "parity" would
+    // hit the UNIQUE(store_id, root) constraint — so this comparison gets its
+    // own real generated id, independent of the text-mode one above.
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity-json"])
+        .assert()
+        .success();
+    let fixture_json = embedded_dir.path().join("parity-json-docs");
+    std::fs::create_dir_all(&fixture_json).unwrap();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args([
+            "--json",
+            "--store",
+            "parity-json",
+            "source",
+            "add",
+            fixture_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        embedded_json.status.success(),
+        "embedded source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&embedded_json.stderr)
+    );
+    let embedded_json_stdout = String::from_utf8_lossy(&embedded_json.stdout).to_string();
+    let embedded_v: serde_json::Value = serde_json::from_str(&embedded_json_stdout).unwrap();
+    let real_id_json = embedded_v["id"]
+        .as_str()
+        .expect("embedded --json output must have an 'id' field")
+        .to_string();
+
+    let daemon_json_fixture = daemon_dir.path().join("parity-json-docs");
+    std::fs::create_dir_all(&daemon_json_fixture).unwrap();
+    let stores_body2 = paginated_list_body(&[&store_record_json("parity-json")]);
+    let add_body2 = format!(r#"{{"id":"{real_id_json}","store":"parity-json","kind":"path"}}"#);
+    let (port2, _received2) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body2),
+        (
+            "POST",
+            "/v1/stores/parity-json/sources",
+            "HTTP/1.1 200 OK",
+            add_body2,
+        ),
+    ]);
+    let daemon_url2 = format!("http://127.0.0.1:{}", port2);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url2)
+        .args([
+            "--json",
+            "--store",
+            "parity-json",
+            "source",
+            "add",
+            daemon_json_fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_json_stdout = String::from_utf8_lossy(&daemon_json.stdout).to_string();
+    let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json output must be identical between embedded and daemon-mock"
+    );
+}
+
+/// `source add --store 'a#b'` (daemon-routed): the store name must be
+/// percent-encoded into the URL path segment, not interpolated raw via
+/// `format!`. Before the fix, `format!("{base_url}/v1/stores/{store_name}/sources")`
+/// with `store_name = "a#b"` builds a URL whose path is `/v1/stores/a` with
+/// fragment `b/sources` — the fragment is client-side-only and never reaches
+/// the server, so the POST silently hits the wrong endpoint (finding 1).
+#[test]
+fn source_add_daemon_percent_encodes_store_name_with_fragment_char() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("a#b")]);
+    let add_body = r#"{"id":"01ABCDEFGHIJKLMNOPQRSTUVWX","store":"a#b","kind":"path"}"#;
+    let (port, received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores/a%23b/sources",
+            "HTTP/1.1 200 OK",
+            add_body.to_string(),
+        ),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "source", "add", "--store", "a#b", "."])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed source add with a fragment-char store name should still reach the right \
+         endpoint; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|(line, _)| line.starts_with("POST /v1/stores/a%23b/sources")),
+        "expected the POST to target the percent-encoded path segment \
+         '/v1/stores/a%23b/sources', not be silently truncated at the raw '#'; got: {:?}",
+        reqs
+    );
+}
+
+/// `source add` with a daemon running that responds with an error status:
+/// the CLI must map the error body to the matching exit code (3 for
+/// `store_not_found`), exercising the `Err(e) => exit_err(...)` arm.
+#[test]
+fn source_add_daemon_error_response_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"code":"store_not_found","message":"no such store"}"#;
+    let (port, _received) = start_recording_mock_server("HTTP/1.1 404 Not Found", body);
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "--json",
+            "source",
+            "add",
+            "--store",
+            "nosuchstore",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "daemon store_not_found error should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// -- source add: daemon-routed default-store distinction (finding 4) --------
+//
+// `resolve_daemon_store_scope` (`cli/src/app_db.rs`) must preserve the same
+// implicit-vs-explicit `default` distinction embedded mode already has: an
+// *implicit* `default` (no `--store` given) missing from the daemon's store
+// set is `invalid_request`, exit 2; an *explicit* `--store default` missing
+// is `store_not_found`, exit 3, the same as any other explicit unknown name.
+// Collapsing these two into one case was the reviewer's framing error.
+
+/// `source add` with `--store` omitted and a daemon whose store set has no
+/// `default` member: exit 2 with the exact embedded-mode message, not exit 3.
+#[test]
+fn source_add_daemon_implicit_default_missing_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // The daemon knows about a store, just not one named "default".
+    let stores_body = paginated_list_body(&[&store_record_json("other")]);
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an implicit default missing from the daemon's store set must exit 2, not 3; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no store named 'default'; pass --store <name>"),
+        "stderr: {stderr}"
+    );
+
+    // No POST should ever fire: pre-flight scope resolution must fail before
+    // any mutating request.
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
+        "no source-add POST should fire when scope resolution itself fails; got: {:?}",
+        reqs
+    );
+}
+
+/// `source add --store default` (explicit) against a daemon whose store set
+/// has no `default` member: exit 3 `store_not_found`, same as any other
+/// explicit unknown name — distinct from the implicit-omission case above.
+#[test]
+fn source_add_daemon_explicit_default_missing_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("other")]);
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "source",
+            "add",
+            "--store",
+            "default",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "an explicit --store default absent from the daemon's store set must exit 3, not 2; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
+        "no source-add POST should fire when scope resolution itself fails; got: {:?}",
+        reqs
+    );
+}
+
+// -- source list: empty-scope messages --------------------------------------
+
+/// `source list` on a single, empty store prints the single-store message.
+#[test]
+fn source_list_single_store_empty_prints_singular_message() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty1"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "empty1", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources on store 'empty1'."));
+}
+
+/// `source list` across more than one empty store prints the plural,
+/// scope-wide message rather than naming any single store.
+#[test]
+fn source_list_multi_store_empty_prints_scope_message() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty1"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty2"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "empty1", "--store", "empty2", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources in scope."));
+}
+
+// -- source remove: local (non-daemon) branches ------------------------------
+
+/// `source remove <path>` with no `--store` and no daemon running exits 2
+/// (D3: a path/url argument can't fall back to the implicit default store).
+#[test]
+fn source_remove_path_no_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "remove", "/some/fake/path"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "source remove by path with no --store should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires --store"),
+        "expected the requires---store message; got: {stderr}"
+    );
+}
+
+/// `source remove <ulid>` (single match) succeeds and prints the single-line
+/// non-json format; the source is actually gone afterwards.
+#[test]
+fn source_remove_by_ulid_success_prints_removed_and_deletes() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "rs1"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "rs1",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "rs1", "source", "remove", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("Removed source: {id}")));
+
+    cmd_with_dir(&dir)
+        .args(["--store", "rs1", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources on store 'rs1'."));
+}
+
+/// `source remove --json <ulid>` (single match) prints the flat
+/// `{"status": "ok", "id": ...}` shape.
+#[test]
+fn source_remove_by_ulid_json_output_shape() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "rs2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "rs2",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "rs2", "source", "remove", &id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["status"].as_str().unwrap(), "ok");
+    assert_eq!(v["id"].as_str().unwrap(), id);
+}
+
+/// `source remove <ulid>` for a ulid that simply doesn't exist locally
+/// (`get_source` returns `Ok(None)`) exits 3 — distinct from the
+/// `find_source_by_root_or_url` not-found path already covered by
+/// `source_remove_not_found_exits_3`.
+#[test]
+fn source_remove_by_ulid_not_found_locally_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "rs3"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "rs3",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// D2: a ulid that resolves to a real source, but whose owning store is not
+/// in the resolved scope, is reported as not-found rather than leaking
+/// cross-store existence.
+#[test]
+fn source_remove_by_ulid_store_not_in_scope_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "storeA"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "storeB"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "storeA",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    // The source belongs to storeA; scoping the remove to storeB only must
+    // not find it.
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "storeB", "source", "remove", &id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "removing a ulid whose store is out of scope should exit 3 (not found); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `source remove <path>` scoped to two stores that both have a source at
+/// that same path deletes both, printing one line per store (non-json,
+/// `deleted.len() > 1` branch).
+#[test]
+fn source_remove_by_path_across_two_stores_deletes_both_text() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m1"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("shared-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "m1", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["--store", "m2", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "m1",
+            "--store",
+            "m2",
+            "source",
+            "remove",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "removing a shared path across two stores should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("from store 'm1'") && stdout.contains("from store 'm2'"),
+        "expected a per-store removal line for each store; got: {stdout}"
+    );
+}
+
+/// Same scenario as above, but `--json`: verifies the `{"results": [...]}`
+/// multi-delete shape.
+#[test]
+fn source_remove_by_path_across_two_stores_json_results_array() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m1"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("shared-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "m1", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["--store", "m2", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "m1",
+            "--store",
+            "m2",
+            "source",
+            "remove",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["status"].as_str().unwrap(), "ok");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(results.len(), 2);
+    let store_names: std::collections::HashSet<&str> = results
+        .iter()
+        .map(|r| r["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(store_names, ["m1", "m2"].into_iter().collect());
+}
+
+// -- source remove: daemon-routing success branch ----------------------------
+
+/// `source remove <ulid>` with a daemon actually responding 200 (not just
+/// unreachable, as the existing regression test uses): exercises the
+/// `Ok(v)` success arm for both `--json` and plain-text output.
+#[test]
+fn source_remove_daemon_success_json_and_text() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"status":"ok","id":"01ABCDEFGHIJKLMNOPQRSTUVWX"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let json_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+    assert!(
+        json_out.status.success(),
+        "daemon-routed source remove --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let jv: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).unwrap();
+    assert_eq!(jv["id"].as_str().unwrap(), "01ABCDEFGHIJKLMNOPQRSTUVWX");
+
+    let text_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+    assert!(text_out.status.success());
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    // issue #187 stage 5: the daemon-only "(via daemon)" suffix is gone —
+    // mode is not part of the result, so this line is now byte-identical to
+    // embedded mode's single-item removal line.
+    assert!(
+        stdout.contains("Removed source: 01ABCDEFGHIJKLMNOPQRSTUVWX")
+            && !stdout.contains("via daemon"),
+        "expected the same removal line embedded mode prints, with no daemon-mode suffix; got: {stdout}"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "expected exactly two DELETE requests");
+    for (path, _) in reqs.iter() {
+        assert!(
+            path.starts_with("DELETE "),
+            "expected a DELETE, got: {path}"
+        );
+        assert!(path.contains("/v1/sources/01ABCDEFGHIJKLMNOPQRSTUVWX"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// index.rs coverage gap-fills
+// ---------------------------------------------------------------------------
+
+/// `index --source <unknown-id>` (embedded, single store) exits 3 —
+/// `run_embedded_index_with`'s `StrictExit`-mode `SourceNotFound` arm,
+/// propagated through `run_index_async`'s `exit_err`.
+#[test]
+fn index_unknown_source_id_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "s1",
+            "index",
+            "--source",
+            "01NOSUCHSOURCEIDXXXXXX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "index --source <unknown> should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `index` on a store with zero sources reports "no sources to index"
+/// rather than an empty/zeroed summary.
+#[test]
+fn index_store_with_no_sources_reports_no_sources_message() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "emptystore"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "emptystore", "index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No sources to index on store 'emptystore'.",
+        ));
+}
+
+/// A source root that's unreadable at explicit-`index` time (as opposed to
+/// at `source add` auto-index time) is a `StrictExit`-mode error: it's
+/// counted, printed via the non-warn `eprintln!` arm, and — combined with
+/// `--strict` — forces exit 2. No existing test exercised `--strict`'s
+/// actual failure path at all.
+#[test]
+#[cfg(unix)]
+fn index_permission_denied_root_with_strict_exits_2() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "permstore2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("perm-docs2");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("note.md"), "# Note\n\nhello\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "permstore2",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "permstore2", "index", "--strict"])
+        .output()
+        .unwrap();
+
+    let _ = std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755));
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "index --strict should exit 2 when a source root became unreadable; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error indexing source"),
+        "expected the strict-mode error line in stderr; got: {stderr}"
+    );
+}
+
+/// A source row with a preset that isn't a recognized chunker preset (only
+/// reachable by writing the row directly — the CLI always writes
+/// `preset: "prose"`, so this defends against rows created through another
+/// surface, e.g. a future daemon API accepting an arbitrary preset) is
+/// counted as an indexing error rather than panicking or aborting the run.
+#[tokio::test]
+async fn index_reports_error_for_source_with_invalid_chunker_preset() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "presetstore"])
+        .assert()
+        .success();
+
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    let store_id: String = {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM stores WHERE name = ?",
+                libsql::params!["presetstore".to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("store row must exist");
+        row.get(0).unwrap()
+    };
+
+    conn.execute(
+        "INSERT INTO sources (id, store_id, kind, root, url, include, exclude, preset, refresh, created_at)
+         VALUES (?1, ?2, 'path', ?3, NULL, '[]', '[]', ?4, NULL, ?5)",
+        libsql::params![
+            "01BOGUSPRESETSOURCEID0001".to_string(),
+            store_id,
+            "/nonexistent-root".to_string(),
+            "not-a-real-preset".to_string(),
+            "2024-01-01T00:00:00Z".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(db);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "presetstore", "index"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid chunker preset"),
+        "expected an invalid-chunker-preset error in stderr; got: {stderr}"
+    );
+}
+
+/// `index` fails fast (exit 2, `InvalidConfig`) when the configured
+/// embedding provider can't be constructed — e.g. `perplexity` with no
+/// matching `providers:` block. This is the direct (non-daemon,
+/// non-auto-index) embedder-build call in `run_index_async`, distinct from
+/// the auto-index path's `warn_or_default!`-wrapped one.
+///
+/// The store here MUST have a real source. Since #180 review finding 2, the
+/// embedder is built lazily — only once a store in scope actually has
+/// sources to index — so a store with zero sources never touches the
+/// embedder at all and this config would otherwise report "no sources to
+/// index" (exit 0), not fail. Do not "simplify" this back to a bare
+/// `store add` with no `source add`: that would silently stop exercising the
+/// embedder-creation failure path this test exists to cover. The `source
+/// add` step's own post-add auto-index runs in `WarnAndContinue` mode, so
+/// the broken provider config only warns there — it does not fail the add
+/// itself — leaving the plain `index` call below as the first place this
+/// config is expected to hard-fail.
+#[test]
+fn index_embedder_creation_failure_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "pstore"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("pstore-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "pstore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "pstore", "index"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "index with an unconfigured provider should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// -- index: daemon-routing (run_daemon_index) --------------------------------
+
+/// `index --json --source <id>` with a daemon running, single store in
+/// scope: exercises the unwrapped single-submission JSON print and the
+/// `source_id` field being folded into the request body.
+///
+/// Also covers finding 4: even with only one store in the resolved scope,
+/// the CLI must still verify that store actually owns `source_id` via the
+/// `GET /v1/stores/{name}/sources` owner walk before submitting — the old
+/// single-store short circuit skipped this check entirely, so this fixture
+/// deliberately makes the mock's source list the *authority* the id must be
+/// found in (see `index_daemon_single_store_unknown_source_exits_3` below for
+/// the negative case).
+#[test]
+fn index_daemon_single_store_json_includes_source_id() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Note: NOT created locally — the daemon (via the mock `GET /v1/stores`
+    // route below) is the sole authority on store scope for this path
+    // (finding 1), so the local DB is deliberately left empty.
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let sources_body = paginated_list_body(&[&source_record_json("src-123", "onlystore")]);
+    let job_body = r#"{"id":"job-1","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-1",
+        "onlystore",
+        r#"{"docs_indexed":2,"chunks_written":4,"sources_count":1}"#,
+    ));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-1/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        (
+            "GET",
+            "/v1/stores/onlystore/sources",
+            "HTTP/1.1 200 OK",
+            sources_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--source", "src-123"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed index submission should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    // issue #187 stage 3: `index --json` now attaches and renders the same
+    // unified `render_index_json` single-store shape embedded mode does —
+    // the flat submission-echo body (`{"id": "job-1", ...}`) is gone.
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["docs_indexed"], 2, "{v}");
+    assert!(
+        v.get("jobs").is_none(),
+        "single-store index --json must not wrap in a jobs array"
+    );
+
+    let reqs = received.lock().unwrap();
+    // finding 4: a single-store scope no longer short-circuits the owner
+    // walk — GET /v1/stores (scope resolution), GET
+    // /v1/stores/onlystore/sources (ownership check), POST /v1/jobs, then
+    // GET /v1/jobs/job-1/events (issue #187 stage 3 attach).
+    assert_eq!(reqs.len(), 4, "unexpected requests: {:?}", reqs);
+    let (path, req_body) = reqs
+        .iter()
+        .find(|(line, _)| line.starts_with("POST"))
+        .expect("mock daemon should have received the POST /v1/jobs request");
+    assert!(path.contains("/v1/jobs"), "path: {path}");
+    let body_json: serde_json::Value = serde_json::from_str(req_body).unwrap();
+    assert_eq!(body_json["store_name"].as_str().unwrap(), "onlystore");
+    assert_eq!(body_json["source_id"].as_str().unwrap(), "src-123");
+}
+
+/// `index --source <unknown-id>` (daemon-routed, single store in scope) must
+/// exit 3, matching embedded mode's `index_unknown_source_id_exits_3`
+/// (finding 4). Before the fix, a single-store scope short-circuited straight
+/// to submission with zero ownership verification — this exact case used to
+/// exit 0 with `docs_attached: 0` instead.
+#[test]
+fn index_daemon_single_store_unknown_source_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let empty_sources = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/stores/onlystore/sources",
+            "HTTP/1.1 200 OK",
+            empty_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--source", "bogus-id"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "an unknown --source with a single store in scope must exit 3, matching embedded mode; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
+        "no job should ever be submitted for an unverified source id; got: {:?}",
+        reqs
+    );
+}
+
+/// `index --delete` with a daemon running now sends `deletion_policy:
+/// "delete"` on the submitted job (D6, issue #187 stage 3) — the daemon runs
+/// real ingestion (issue #187) and can honor it, so the old refusal (exit 2)
+/// is gone. Replaces `index_delete_with_daemon_running_exits_2_and_submits_nothing`.
+#[test]
+fn index_daemon_delete_sends_deletion_policy_delete() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let job_body = r#"{"id":"job-del","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-del", "onlystore", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-del/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index", "--delete"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "`--delete` against a daemon must now succeed (D6); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .expect("a job should have been submitted");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(
+        body_json["deletion_policy"].as_str().unwrap(),
+        "delete",
+        "--delete must be carried through as deletion_policy: {body_json}"
+    );
+}
+
+/// The same command *without* `--delete` sends `deletion_policy: "retain"`
+/// and still submits/completes normally.
+#[test]
+fn index_without_delete_still_submits_when_daemon_running() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let job_body = r#"{"id":"job-1","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-1", "onlystore", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-1/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "daemon-routed index without --delete must still succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .expect("a job should be submitted in the ordinary (non-deleting) case");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(body_json["deletion_policy"].as_str().unwrap(), "retain");
+}
+
+/// `index --json` with a daemon running and more than one store in scope:
+/// issue #187 stage 3 unifies daemon-mode rendering with embedded mode's
+/// `render_index_json` — the old `{"jobs": [...]}` submission-echo shape is
+/// gone in favor of the same `{"stores": [...], "total": {...}}` shape a
+/// multi-store embedded run produces.
+#[test]
+fn index_daemon_multi_store_json_wraps_with_store_field() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let job_body = r#"{"id":"job-x","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-x",
+        "alpha",
+        r#"{"docs_indexed":1,"sources_count":1}"#,
+    ));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-x/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed multi-store index should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 2, "{v}");
+    let store_names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|j| j["store"].as_str().unwrap())
+        .collect();
+    assert_eq!(store_names, ["alpha", "beta"].into_iter().collect());
+    assert_eq!(v["total"]["docs_indexed"], 2, "{v}");
+
+    let reqs = received.lock().unwrap();
+    let post_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .count();
+    assert_eq!(post_reqs, 2, "expected one POST per store; got: {:?}", reqs);
+}
+
+/// `index` (non-json) with a daemon running and a single store in scope now
+/// waits for the job and prints the same "Index complete: ..." summary
+/// embedded mode does — the old "submitted to daemon ... (poll with status)"
+/// hint is gone (issue #187 stage 3, D1: both modes attach to completion).
+#[test]
+fn index_daemon_single_store_text_output() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore2")]);
+    let job_body = r#"{"id":"job-2","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-2",
+        "onlystore2",
+        r#"{"docs_indexed":3,"chunks_written":6,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-2/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Index complete: 3 indexed, 0 skipped, 6 chunks written, 0 unsupported, 0 errors",
+        ));
+}
+
+/// `index` (non-json) with a daemon running and more than one store in
+/// scope prefixes each store's completed-job summary line with its store
+/// name — the multi-store embedded rendering, now shared by daemon mode too.
+#[test]
+fn index_daemon_multi_store_text_output_prefixes_store_name() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("gamma"), &store_record_json("delta")]);
+    let job_body = r#"{"id":"job-3","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-3", "gamma", "{}"));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-3/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[gamma] No sources to index.")
+            && stdout.contains("[delta] No sources to index."),
+        "expected a per-store completion line for each store; got: {stdout}"
+    );
+}
+
+/// `index` with a daemon running that rejects every request (including the
+/// scope-resolution `GET /v1/stores` call itself): the CLI must map the
+/// error and exit non-zero.
+#[test]
+fn index_daemon_submission_error_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"code":"store_not_found","message":"errstore"}"#;
+    let (port, _received) = start_recording_mock_server("HTTP/1.1 404 Not Found", body);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "daemon job-submission error should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// index.rs: daemon-routed scope resolution asks the daemon, not the local
+// database (Codex review round 2, findings 1 & 2 — see
+// cli/src/cmds/index.rs's `run_index_async`/`run_daemon_index` for the fixes
+// these tests cover).
+// ---------------------------------------------------------------------------
+
+/// `index --store <name>` where the daemon knows the store but the local DB
+/// does not: must succeed (finding 1). Before the fix, `run_index_async`
+/// resolved `--store` against the local DB *before* ever probing the daemon,
+/// so a daemon-valid, locally-unknown store was rejected `store_not_found`.
+#[test]
+fn index_daemon_explicit_store_known_to_daemon_not_local_succeeds() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // Deliberately never created locally.
+
+    let stores_body = paginated_list_body(&[&store_record_json("remote-only")]);
+    let job_body = r#"{"id":"job-9","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-9", "remote-only", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-9/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--store", "remote-only", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a --store the daemon knows (but the local DB does not) must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST"))
+        .expect("a job should have been submitted");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(body_json["store_name"].as_str().unwrap(), "remote-only");
+}
+
+/// `index` with `--store` omitted against a daemon whose store set differs
+/// entirely from the local DB: jobs must be submitted for the *daemon's*
+/// stores, not the local database's (finding 1, omitted-flag half).
+#[test]
+fn index_daemon_omitted_store_uses_daemon_stores_not_local() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // The local DB has a store the daemon does not report...
+    cmd_with_dir(&dir)
+        .args(["store", "add", "local-only"])
+        .assert()
+        .success();
+
+    // ...and the daemon reports a completely different one.
+    let stores_body = paginated_list_body(&[&store_record_json("daemon-only")]);
+    let job_body = r#"{"id":"job-10","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-10", "daemon-only", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-10/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST"))
+        .expect("a job should have been submitted");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(
+        body_json["store_name"].as_str().unwrap(),
+        "daemon-only",
+        "jobs must target the daemon's own store set, not the local DB's"
+    );
+}
+
+/// A hostile/malformed daemon that returns a `GET /v1/stores` page whose
+/// `next_cursor` never advances must not spin the CLI forever: the
+/// non-advancing-cursor guard in `fetch_all_daemon_store_names`
+/// (`cli/src/app_db.rs`) bails with `Error::Internal`, exit 1.
+#[test]
+fn index_daemon_store_scope_non_advancing_cursor_exits_1() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Page 1 (no cursor) claims a next page at cursor "5"; page 2
+    // (?cursor=5) claims *another* page also at cursor "5" — a
+    // non-advancing cursor a well-behaved daemon would never produce.
+    let page1 = paginated_list_page(&[store_record_json("a")], Some("5"), 2);
+    let page2 = paginated_list_page(&[store_record_json("b")], Some("5"), 2);
+    let (port, _received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores?cursor=5", "HTTP/1.1 200 OK", page2),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", page1),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        1,
+        "a non-advancing pagination cursor must exit 1 (Error::Internal), not hang; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A hostile/malformed daemon whose `GET /v1/stores` pagination *alternates*
+/// between two cursors (`(none)->2->1->2->1->...`) must not spin the CLI
+/// forever either. The naive guard this replaces only compared each new
+/// cursor against the immediately-preceding one, so an alternating cycle
+/// never tripped it — reproduced empirically as a genuine non-terminating
+/// loop (finding 2) before this fix. A `.timeout()` bounds the test itself:
+/// if the cursor-cycle guard regresses, this fails (killed, non-`Some(1)`
+/// exit code) rather than hanging the whole suite.
+#[test]
+fn index_daemon_store_scope_alternating_cursor_exits_1() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // No-cursor page -> next "2"; cursor=2 page -> next "1"; cursor=1 page ->
+    // next "2" again, closing the 1<->2 cycle without ever repeating the
+    // *immediately preceding* cursor.
+    let page_start = paginated_list_page(&[store_record_json("a")], Some("2"), 4);
+    let page_at_2 = paginated_list_page(&[store_record_json("b")], Some("1"), 4);
+    let page_at_1 = paginated_list_page(&[store_record_json("c")], Some("2"), 4);
+    let (port, _received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores?cursor=2", "HTTP/1.1 200 OK", page_at_2),
+        ("GET", "/v1/stores?cursor=1", "HTTP/1.1 200 OK", page_at_1),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", page_start),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .timeout(std::time::Duration::from_secs(15))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an alternating pagination cursor must exit 1 (Error::Internal), not hang; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `GET /v1/stores` itself must be paginated to exhaustion: an all-stores
+/// scope with more than `default_limit()` (20) stores must include every
+/// one of them, not just the first page.
+#[test]
+fn index_daemon_store_scope_paginates_over_20_stores() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let page1_names: Vec<String> = (0..20).map(|i| format!("store-{i:02}")).collect();
+    let page1_items: Vec<String> = page1_names.iter().map(|n| store_record_json(n)).collect();
+    let page1 = paginated_list_page(&page1_items, Some("20"), 21);
+    let page2 = paginated_list_page(&[store_record_json("store-20")], None, 21);
+
+    let job_body = r#"{"id":"job-page2","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-page2", "store-00", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-page2/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores?cursor=20", "HTTP/1.1 200 OK", page2),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", page1),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(
+        stores.len(),
+        21,
+        "every store across both pages must be in the all-stores scope: {v}"
+    );
+    let submitted_names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|j| j["store"].as_str().unwrap())
+        .collect();
+    assert!(
+        submitted_names.contains("store-20"),
+        "the store sitting on page 2 must not be dropped: {:?}",
+        submitted_names
+    );
+
+    let reqs = received.lock().unwrap();
+    let get_stores_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("GET /v1/stores"))
+        .count();
+    assert_eq!(
+        get_stores_reqs, 2,
+        "expected exactly two GET /v1/stores pages; got: {:?}",
+        reqs
+    );
+}
+
+/// `index --source <id>` with more than one store in the resolved daemon
+/// scope must submit exactly one job, to the id's actual owning store
+/// (finding 2) — not one job per store, since `/v1/jobs`'s `create_job`
+/// never validates `source_id`.
+#[test]
+fn index_daemon_source_owner_walk_narrows_to_single_job() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let alpha_sources = paginated_list_body(&[]);
+    let beta_sources = paginated_list_body(&[&source_record_json("src-owned", "beta")]);
+    let job_body = r#"{"id":"job-11","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-11",
+        "beta",
+        r#"{"docs_indexed":1,"sources_count":1}"#,
+    ));
+
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-11/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        (
+            "GET",
+            "/v1/stores/alpha/sources",
+            "HTTP/1.1 200 OK",
+            alpha_sources,
+        ),
+        (
+            "GET",
+            "/v1/stores/beta/sources",
+            "HTTP/1.1 200 OK",
+            beta_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--source", "src-owned"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["docs_indexed"], 1, "{v}");
+    assert!(
+        v.get("jobs").is_none(),
+        "narrowed to one store, this must render the flat single-job shape: {v}"
+    );
+
+    let reqs = received.lock().unwrap();
+    let post_reqs: Vec<_> = reqs.iter().filter(|(l, _)| l.starts_with("POST")).collect();
+    assert_eq!(
+        post_reqs.len(),
+        1,
+        "exactly one job must be submitted, for the owning store; got: {:?}",
+        reqs
+    );
+    let body_json: serde_json::Value = serde_json::from_str(&post_reqs[0].1).unwrap();
+    assert_eq!(body_json["store_name"].as_str().unwrap(), "beta");
+}
+
+/// A multi-store `--store` scope that excludes the source's true owner must
+/// exit 3 — the daemon walk searches only the resolved (explicit) scope, not
+/// every store the daemon has, reproducing embedded mode's hard-filter rule
+/// (`index_source_owner_not_in_explicit_store_scope_exits_3`) for the daemon
+/// path.
+#[test]
+fn index_daemon_source_owner_outside_explicit_multi_store_scope_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // The daemon knows three stores; the source actually lives on "beta",
+    // which is deliberately left out of the explicit --store scope below.
+    let stores_body = paginated_list_body(&[
+        &store_record_json("alpha"),
+        &store_record_json("beta"),
+        &store_record_json("gamma"),
+    ]);
+    let alpha_sources = paginated_list_body(&[]);
+    let gamma_sources = paginated_list_body(&[]);
+
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/stores/alpha/sources",
+            "HTTP/1.1 200 OK",
+            alpha_sources,
+        ),
+        (
+            "GET",
+            "/v1/stores/gamma/sources",
+            "HTTP/1.1 200 OK",
+            gamma_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "--store",
+            "alpha",
+            "--store",
+            "gamma",
+            "index",
+            "--source",
+            "src-on-beta",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "a source outside the explicit --store scope must exit 3, not silently redirect; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
+        "no job should ever be submitted when the owner isn't in scope; got: {:?}",
+        reqs
+    );
+}
+
+/// A source that isn't owned by any store in the (implicit, all-stores)
+/// scope must exit 3, same as the explicit-scope case above.
+#[test]
+fn index_daemon_source_not_found_in_any_scoped_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let empty_sources = paginated_list_body(&[]);
+
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/stores/alpha/sources",
+            "HTTP/1.1 200 OK",
+            empty_sources.clone(),
+        ),
+        (
+            "GET",
+            "/v1/stores/beta/sources",
+            "HTTP/1.1 200 OK",
+            empty_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--source", "nowhere"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "a source id owned by no scoped store must exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
+        "{:?}",
+        reqs
+    );
+}
+
+/// The per-store source-owner walk (`GET /v1/stores/{name}/sources`) must
+/// itself paginate to exhaustion: a match sitting on page 2+ of one store's
+/// source list must still be found, not silently missed the way a single
+/// unpaginated fetch would miss it.
+#[test]
+fn index_daemon_source_owner_walk_paginates_to_page_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let alpha_sources = paginated_list_body(&[]);
+    // beta has 21 sources; the matching one sits on page 2.
+    let beta_page1_items: Vec<String> = (0..20)
+        .map(|i| source_record_json(&format!("src-{i:02}"), "beta"))
+        .collect();
+    let beta_page1 = paginated_list_page(&beta_page1_items, Some("20"), 21);
+    let beta_page2 = paginated_list_page(&[source_record_json("src-on-page-2", "beta")], None, 21);
+    let job_body = r#"{"id":"job-page2-src","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-page2-src", "beta", "{}"));
+
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-page2-src/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        (
+            "GET",
+            "/v1/stores/beta/sources?cursor=20",
+            "HTTP/1.1 200 OK",
+            beta_page2,
+        ),
+        (
+            "GET",
+            "/v1/stores/alpha/sources",
+            "HTTP/1.1 200 OK",
+            alpha_sources,
+        ),
+        (
+            "GET",
+            "/v1/stores/beta/sources",
+            "HTTP/1.1 200 OK",
+            beta_page1,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--source", "src-on-page-2"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a match on page 2 of a store's source list must still be found; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    let post_reqs: Vec<_> = reqs.iter().filter(|(l, _)| l.starts_with("POST")).collect();
+    assert_eq!(post_reqs.len(), 1, "{:?}", reqs);
+    let body_json: serde_json::Value = serde_json::from_str(&post_reqs[0].1).unwrap();
+    assert_eq!(body_json["store_name"].as_str().unwrap(), "beta");
+}
+
+// ---------------------------------------------------------------------------
+// index.rs: unified job model (issue #187 stage 3) — a daemon job that
+// fails, --strict parity with embedded, and the SSE-attach poll fallback.
+// ---------------------------------------------------------------------------
+
+/// A daemon job that ends in the `failed` state must hard-fail `index`
+/// exactly like an embedded pre-flight failure does — exit 1
+/// (`Error::Internal`), with the job's own error text in stderr. This holds
+/// whether or not `--strict` was passed: `--strict` governs the *summary
+/// error-count* path (`report_index_outcomes`/`strict_should_fail`), which a
+/// `Failed` job never reaches — `job_attach::finish_job` hard-errors before
+/// that renderer ever runs, for both daemon and embedded jobs alike.
+#[test]
+fn index_daemon_failed_job_exits_1_regardless_of_strict() {
+    for strict in [false, true] {
+        let dir = TempDir::new().unwrap();
+        write_default_config(&dir);
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let stores_body = paginated_list_body(&[&store_record_json("failstore")]);
+        let job_body = r#"{"id":"job-fail","status":"queued"}"#;
+        let events_body = sse_done_body(&index_job_failed_json(
+            "job-fail",
+            "failstore",
+            "ingestion blew up",
+        ));
+        let (port, _received) = start_routing_mock_server(vec![
+            (
+                "GET",
+                "/v1/jobs/job-fail/events",
+                "HTTP/1.1 200 OK",
+                events_body,
+            ),
+            ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+            ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+        ]);
+
+        let mut args = vec!["index"];
+        if strict {
+            args.push("--strict");
+        }
+        let output = cmd_with_dir(&dir)
+            .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failed daemon job must exit 1 like an embedded hard failure (strict={strict}); \
+             stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ingestion blew up"),
+            "the job's own error text must reach stderr (strict={strict}); got: {stderr}"
+        );
+    }
+}
+
+/// Issue #187 review, finding 3: a daemon job classified with a recognized
+/// `error_code` (here `invalid_config`, the code an embedder-construction
+/// failure carries) must exit with *that* code — 2 — daemon-attached, not
+/// the undifferentiated exit 1 `index_daemon_failed_job_exits_1_regardless_of_strict`
+/// pins for an unclassified failure. This is transport parity with embedded
+/// mode's own pre-flight embedder-construction failure, which has always
+/// exited 2 (`index_embedder_creation_failure_exits_2` above): before this
+/// fix, the daemon stringified every job-level error before it ever reached
+/// the terminal `IndexJob`, so this exact scenario exited 1 daemon-attached
+/// despite being the identical underlying failure as the embedded case.
+#[test]
+fn index_daemon_failed_job_with_invalid_config_code_exits_2_like_embedded() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("failstore")]);
+    let job_body = r#"{"id":"job-fail","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_failed_json_with_code(
+        "job-fail",
+        "failstore",
+        "unconfigured embedder provider",
+        "invalid_config",
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-fail/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a daemon job failure classified as invalid_config must exit 2, matching \
+         embedded's own embedder-construction pre-flight failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unconfigured embedder provider"),
+        "the job's own error text must still reach stderr; got: {stderr}"
+    );
+    // Issue #187 review, finding F4: the daemon's producers must store the
+    // *bare* message, not `Error::to_string()` — `finish_job` reconstructs
+    // the typed error via `Error::from_code`, which re-adds the "invalid
+    // config: " `Display` prefix itself. A doubled prefix here would mean a
+    // producer regressed back to storing the already-prefixed string.
+    assert_eq!(
+        stderr.matches("invalid config:").count(),
+        1,
+        "the \"invalid config: \" prefix must appear exactly once; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid config: invalid config"),
+        "stderr must not show the doubled prefix; got: {stderr}"
+    );
+}
+
+/// A daemon job that completes (`done`) but reports per-source/per-document
+/// errors in its stats must drive `--strict` exactly like embedded's
+/// `strict_should_fail` does: exit 2 with `--strict`, exit 0 without it —
+/// both render the completed summary first (unlike the hard-failure case
+/// above).
+#[test]
+fn index_daemon_job_with_errors_and_strict_exits_2_like_embedded() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("errstore")]);
+    let job_body = r#"{"id":"job-err","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-err",
+        "errstore",
+        r#"{"docs_indexed":2,"chunks_written":3,"error_count":1,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-err/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    // Without --strict: the run completed, so it's exit 0 even with errors.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "without --strict, a completed job with errors must still exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // With --strict: the same completed-with-errors job must exit 2, the
+    // same code `strict_should_fail` gives an embedded run with errors.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index", "--strict"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--strict on a completed daemon job with errors must exit 2, like embedded; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Issue #187 review, finding 4c: `index_daemon_job_with_errors_and_strict_exits_2_like_embedded`
+/// only covers a *single* daemon-mock store; this extends the same scenario
+/// to two stores in scope, asserting two things neither the single-store
+/// test nor `index_daemon_multi_store_json_wraps_with_store_field` (which
+/// has no errors at all) covers:
+///
+/// 1. Exit code parity with embedded's `strict_should_fail` (`cli/src/cmds/index.rs`):
+///    "`--strict` exits 2 if *any* store reported errors" — proven here with
+///    a genuinely multi-store scope, not just summed into a single store's
+///    counters.
+/// 2. `report_index_outcomes` prints the full `--json` document to stdout
+///    *before* the `--strict` exit (`std::process::exit(2)` only happens
+///    after `print_json`) — the "no `--json`-at-strict-exit e2e" gap: a
+///    nonzero exit code alone doesn't prove the results were ever emitted
+///    rather than silently dropped, so this parses stdout and asserts on
+///    the actual per-store and total content.
+#[test]
+fn index_daemon_multi_store_strict_exits_2_and_prints_full_json_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let job_body = r#"{"id":"job-strict","status":"queued"}"#;
+    // Both stores attach to the same mocked job id (the routing mock server
+    // matches by path only, so a single `POST /v1/jobs` route necessarily
+    // answers both stores' submissions identically — see
+    // `index_daemon_multi_store_json_wraps_with_store_field` above for the
+    // same simplification) — each store therefore reports the identical
+    // per-store stats below, and the assertions check the CLI's own
+    // aggregation/rendering of that fan-out, not per-store mock fidelity.
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-strict",
+        "alpha",
+        r#"{"docs_indexed":1,"chunks_written":2,"error_count":1,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-strict/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--strict"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--strict must exit 2 when any store in a multi-store daemon-mock scope reported \
+         errors, matching embedded's strict_should_fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "a --strict exit must still print the full --json document to stdout \
+             (report_index_outcomes prints before exiting), not just the bare exit code: {e}\n\
+             stdout:\n{stdout}"
+        )
+    });
+
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 2, "{v}");
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = stores
+        .iter()
+        .map(|s| (s["store"].as_str().unwrap(), s))
+        .collect();
+    for name in ["alpha", "beta"] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing store entry for '{name}': {v}"));
+        assert_eq!((*entry)["status"], "error", "{v}");
+        assert_eq!((*entry)["docs_indexed"], 1, "{v}");
+        assert_eq!((*entry)["chunks_written"], 2, "{v}");
+        assert_eq!((*entry)["errors"], 1, "{v}");
+    }
+    assert_eq!(v["total"]["status"], "error", "{v}");
+    assert_eq!(v["total"]["docs_indexed"], 2, "{v}");
+    assert_eq!(v["total"]["chunks_written"], 4, "{v}");
+    assert_eq!(v["total"]["errors"], 2, "{v}");
+}
+
+/// SSE-attach fallback: when `GET /v1/jobs/{id}/events` is unavailable (a
+/// 404, e.g. an older daemon predating issue #83), `index` must fall back to
+/// polling `GET /v1/jobs/{id}` and still complete correctly, rather than
+/// failing the command.
+#[test]
+fn index_daemon_sse_404_falls_back_to_polling() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("pollstore")]);
+    let job_body = r#"{"id":"job-poll","status":"queued"}"#;
+    let poll_body = index_job_done_json(
+        "job-poll",
+        "pollstore",
+        r#"{"docs_indexed":5,"chunks_written":9,"sources_count":1}"#,
+    );
+    let (port, received) = start_routing_mock_server(vec![
+        // Listed before the bare "/v1/jobs/job-poll" route below so it wins
+        // for the longer, more specific `/events` path (first-match-wins) —
+        // simulating a daemon that doesn't implement the SSE route at all.
+        (
+            "GET",
+            "/v1/jobs/job-poll/events",
+            "HTTP/1.1 404 Not Found",
+            r#"{"code":"resource_not_found","message":"no such route"}"#.to_string(),
+        ),
+        ("GET", "/v1/jobs/job-poll", "HTTP/1.1 200 OK", poll_body),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "an SSE 404 must fall back to polling, not fail the command; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["docs_indexed"], 5, "{v}");
+    assert_eq!(v["chunks_written"], 9, "{v}");
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/jobs/job-poll/events")),
+        "the SSE route must have been tried first; got: {:?}",
+        reqs
+    );
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/jobs/job-poll HTTP")),
+        "the poll fallback must have been used after the SSE 404; got: {:?}",
+        reqs
+    );
+}
+
+/// Shape parity (D1): the same command produces byte-identical text *and*
+/// `--json` summaries whether it ran embedded or was submitted to (and
+/// completed by) a daemon-mock — because both transports funnel their
+/// result through the exact same `render_index_text`/`render_index_json`.
+///
+/// Rather than hand-picking numbers, this drives a real embedded `index
+/// --json` run first to learn the real stats a trivial one-file store
+/// produces, then builds a daemon-mock job whose `IndexJobStats` mirror
+/// those exact numbers, and asserts *both* the plain-text and `--json`
+/// daemon-routed output are identical to the embedded run's.
+#[test]
+fn index_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello world\n").unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // A second source, so the `index` re-run below has two source records
+    // in scope (both already auto-indexed by `source add`, so it reports
+    // them seen-but-skipped rather than "no sources to index").
+    let fixture2 = embedded_dir.path().join("parity-docs-2");
+    std::fs::create_dir_all(&fixture2).unwrap();
+    std::fs::write(fixture2.join("doc2.md"), "# Doc 2\n\nsecond file\n").unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture2.to_str().unwrap(),
+            "--kind",
+            "path",
+        ])
+        .assert()
+        .success();
+
+    // Both sources are now auto-indexed; a plain `index` re-run reports
+    // real, deterministic "seen but unchanged" numbers (docs_skipped > 0,
+    // everything else 0) without depending on exact chunking output.
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["--store", "parity", "index"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "--store", "parity", "index"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_json_stdout = String::from_utf8_lossy(&embedded_json.stdout).to_string();
+
+    // Daemon-mock run: a job whose `IndexJobStats` mirror the real embedded
+    // run's numbers exactly (both sources already indexed by the earlier
+    // `source add` auto-index runs, so `index` here reports them seen-but-
+    // skipped, not "no sources to index" — that shape only applies when a
+    // store has zero source *records*, not zero pending work).
+    let embedded_v: serde_json::Value = serde_json::from_str(&embedded_json_stdout).unwrap();
+    let stats_json = format!(
+        r#"{{"docs_indexed":{},"docs_skipped":{},"chunks_written":{},"unsupported_format_count":{},"error_count":{},"docs_deleted":{},"docs_prunable":{},"sources_count":2}}"#,
+        embedded_v["docs_indexed"],
+        embedded_v["docs_skipped"],
+        embedded_v["chunks_written"],
+        embedded_v["unsupported"],
+        embedded_v["errors"],
+        embedded_v["docs_deleted"],
+        embedded_v["docs_prunable"],
+    );
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body = paginated_list_body(&[&store_record_json("parity")]);
+    let job_body = r#"{"id":"job-parity","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-parity", "parity", &stats_json));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-parity/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(daemon_text.status.success());
+    let daemon_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(daemon_json.status.success());
+    let daemon_json_stdout = String::from_utf8_lossy(&daemon_json.stdout).to_string();
+
+    assert_eq!(
+        embedded_stdout, daemon_stdout,
+        "text summary must be byte-identical between embedded and daemon-mock"
+    );
+    let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+
+    // Both transports now surface a `job_id` —
+    // the embedded engine's own local queue id, the mock's fixed
+    // "job-parity" here — but by construction these are two genuinely
+    // different, run-specific ids and can never be shape-identical the way
+    // every other field is. Assert both are *present* (parity of the key
+    // existing), then strip it from each before the full-shape comparison.
+    assert!(
+        embedded_v.get("job_id").and_then(|v| v.as_str()).is_some(),
+        "expected a job_id in the embedded run's JSON: {embedded_v}"
+    );
+    assert!(
+        daemon_v.get("job_id").and_then(|v| v.as_str()).is_some(),
+        "expected a job_id in the daemon-mock run's JSON: {daemon_v}"
+    );
+    let mut embedded_v_no_job_id = embedded_v.clone();
+    let mut daemon_v_no_job_id = daemon_v.clone();
+    embedded_v_no_job_id
+        .as_object_mut()
+        .unwrap()
+        .remove("job_id");
+    daemon_v_no_job_id.as_object_mut().unwrap().remove("job_id");
+    assert_eq!(
+        embedded_v_no_job_id, daemon_v_no_job_id,
+        "--json summary (aside from the necessarily-distinct job_id) must be identical \
+         between embedded and daemon-mock"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// index.rs: --source scoped to its owning store, and lazy embedder
+// construction (PR #180 code-review findings 1 & 2 — see
+// cli/src/cmds/index.rs's `run_index_async` for the fix these tests cover).
+// ---------------------------------------------------------------------------
+
+/// Look up a store's source ULID via `source list --json`, for tests that
+/// need a real source id owned by a specific store (`setup_multi_store`
+/// hands back fixture paths, not ids).
+fn source_id_for_store(dir: &TempDir, store: &str) -> String {
+    let output = cmd_with_dir(dir)
+        .args(["--json", "--store", store, "source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source list --store {store} failed"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    v["sources"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("store '{store}' should have one source: {v}"))
+        .to_string()
+}
+
+/// `index --source <id>` with NO `--store` flag (scope = all stores) must
+/// resolve the source's owning store and index only that store — not abort
+/// on the first store in scope that doesn't own it. Pre-fix, `run_index_async`
+/// passed the same globally-unique `source_id` to every store in the
+/// resolved scope; `run_embedded_index_with` looked it up within each
+/// store's own source list and, under `StrictExit`, returned
+/// `Err(SourceNotFound)` the instant it reached a store that didn't own it —
+/// aborting the whole run rather than reaching `research`.
+///
+/// Note the JSON shape assertion: narrowing to research's one store means
+/// `render_index_json` collapses to the flat single-store shape (no
+/// `stores`/`store` wrapper — that wrapper is reserved for >1 outcome, and
+/// single-store JSON must stay byte-identical to the pre-multi-store
+/// format), not a 3-entry `stores` array with only `research` populated.
+#[test]
+fn index_source_scoped_to_owning_store_when_no_store_flag() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research
+    let research_source_id = source_id_for_store(&dir, "research");
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "index", "--source", &research_source_id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index --source <id owned by research>, no --store, should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(
+        v.get("stores").is_none(),
+        "a --source scoped to exactly one store must render single-store JSON, not the \
+         multi-store wrapper (which would mean every store in scope got touched): {v}"
+    );
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["errors"], 0, "{v}");
+    // `setup_multi_store`'s `source add` already auto-indexed this document,
+    // so this explicit re-index of the same source finds it unchanged
+    // (skipped) rather than indexing it again — that's expected, and still
+    // proves the run reached research: the pre-fix bug never got this far at
+    // all (it exited 3 on the first non-owning store).
+    assert_eq!(
+        v["docs_skipped"], 1,
+        "research's one fixture document should have been seen (and skipped as \
+         already-indexed): {v}"
+    );
+}
+
+/// `--store books --source <id-owned-by-research>` must exit 3: an explicit
+/// `--store` scope is a hard filter — a source outside it is exactly as
+/// "not found" as an id that doesn't exist at all. The fix must not silently
+/// redirect to the source's real owner just because it's reachable.
+#[test]
+fn index_source_owner_not_in_explicit_store_scope_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+    let research_source_id = source_id_for_store(&dir, "research");
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "index", "--source", &research_source_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "a source outside the explicit --store scope must exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Multi-store `index` where every store in scope has zero sources: the run
+/// must succeed (exit 0) and report "no sources" for each — and, per review
+/// finding 2, must do so WITHOUT ever constructing the embedder. Proven here
+/// (not just asserted) by pointing config at an embedding provider that
+/// would fail to construct (no matching `providers:` entry): under the
+/// pre-fix eager-build behavior — which built the embedder up front,
+/// unconditionally, before checking whether any store had sources — this
+/// would exit 2 instead.
+#[test]
+fn index_multi_store_all_empty_reports_no_sources_and_skips_embedder_build() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty-a"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty-b"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "an all-empty multi-store scope must succeed even with a broken embedding \
+         provider config, since no store has sources requiring an embedder; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores array");
+    assert_eq!(stores.len(), 2);
+    for s in stores {
+        assert_eq!(s["status"], "ok", "store entry: {s}");
+        assert_eq!(s["message"], "no sources to index", "store entry: {s}");
+    }
+    assert_eq!(v["total"]["message"], "no sources to index");
+}
+
+// ---------------------------------------------------------------------------
+// source.rs: PR #180 code-review findings 3 & 5 — see
+// cli/src/cmds/source.rs's `run_source_add_async`/`run_source_remove_async`
+// for the fixes these tests cover.
+//
+// Finding 3: `source add --json` across more than one store printed one
+// complete JSON document per store, back to back, so the whole of stdout was
+// not parseable by a single `serde_json::from_str`. Fixed by accumulating
+// per-store results and emitting exactly one top-level document (flat shape
+// for exactly one store, `{"status":"ok","results":[...]}` for more than
+// one — mirroring `run_source_remove_async`'s existing convention), in both
+// the local and daemon-routed branches.
+//
+// Finding 5: `run_source_remove_async`'s daemon branch fired the DELETE
+// before ever validating `--store` names for traversal-safety, unlike
+// `source add`'s daemon branch. Fixed by validating every `ctx.stores` name
+// with `validate_store_name` before the DELETE — syntax-checking only, no
+// local existence check (a daemon may own a different data directory than
+// the local DB, per `resolve_daemon_store_scope`'s doc comment in
+// `cli/src/app_db.rs`).
+// ---------------------------------------------------------------------------
+
+/// Local (non-daemon) `source add --json` across two stores must produce
+/// exactly one parseable JSON document — the core finding-3 regression: the
+/// pre-fix code called `print_json` once per store inside the loop, so
+/// `serde_json::from_str` over the whole of stdout would fail here.
+#[test]
+fn source_add_json_multi_store_is_single_document_local() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research, each pre-seeded
+
+    let fixture = dir.path().join("shared-add-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "books",
+            "--store",
+            "default",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "multi-store source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must parse as exactly one JSON document (finding 3 regression): {e}\n\
+             stdout:\n{stdout}"
+        )
+    });
+
+    assert_eq!(v["status"], "ok", "{v}");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(results.len(), 2, "{v}");
+    let names: std::collections::HashSet<&str> = results
+        .iter()
+        .map(|r| r["store"]["name"].as_str().expect("store.name"))
+        .collect();
+    assert_eq!(names, ["books", "default"].into_iter().collect());
+}
+
+/// Single-store `source add --json` keeps the exact pre-existing flat shape
+/// (no `results` key) — the counterpart to the multi-store test above.
+/// `source_add_json_output` already covers this; this test additionally
+/// pins down the negative assertion (`results` must be absent) so the
+/// single-vs-multi branch split can't silently start wrapping everything.
+#[test]
+fn source_add_json_single_store_has_no_results_key() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let fixture = dir.path().join("single-add-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "books",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["status"], "ok", "{v}");
+    assert!(v.get("id").is_some(), "{v}");
+    assert_eq!(v["store"]["name"], "books", "{v}");
+    assert!(
+        v.get("results").is_none(),
+        "single-store output must not gain a 'results' wrapper: {v}"
+    );
+}
+
+/// Daemon-routed `source add --json` across two stores must also collapse to
+/// exactly one parseable JSON document — the daemon branch has the same
+/// per-store `print_json` bug as the local branch, fixed the same way.
+#[test]
+fn source_add_json_multi_store_is_single_document_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let add_body = r#"{"id":"01ABCDEFGHIJKLMNOPQRSTUVWX","store":"whichever","kind":"path"}"#;
+    let (port, received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores",
+            "HTTP/1.1 200 OK",
+            add_body.to_string(),
+        ),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let fixture = dir.path().join("daemon-multi-add-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args([
+            "--json",
+            "--store",
+            "alpha",
+            "--store",
+            "beta",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon multi-store source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must parse as exactly one JSON document (finding 3 regression, daemon \
+             path): {e}\nstdout:\n{stdout}"
+        )
+    });
+    assert_eq!(v["status"], "ok", "{v}");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(results.len(), 2, "{v}");
+
+    let reqs = received.lock().unwrap();
+    // D3 (issue #187 stage 3): `source add`'s daemon branch now also
+    // submits a best-effort auto-index job per added source
+    // (`POST /v1/jobs`), so only the `POST /v1/stores/.../sources` add
+    // requests are counted here — the auto-index submissions aren't stubbed
+    // by this fixture and 404 harmlessly (WarnAndContinue).
+    let post_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/stores"))
+        .count();
+    assert_eq!(post_reqs, 2, "expected one POST per store; got: {:?}", reqs);
+}
+
+// -- source add: finding 5, mid-loop --json failures preserve results ------
+
+/// Local (non-daemon) `source add --json` across two stores where the
+/// *second* store's write genuinely fails must not discard the first
+/// store's already-persisted result (Codex review round 2, finding 5's
+/// residual "genuine mid-loop error" case — the common unknown-store-name
+/// case is already closed by work item 1's/finding-4's pre-flight scope
+/// validation, so this test forces a different, real failure: a duplicate
+/// `(store_id, root)` trips the registry's `UNIQUE constraint failed` ->
+/// `invalid_request` mapping, exit 2, in `store-libsql/src/registry/sources.rs`).
+#[test]
+fn source_add_json_multi_store_mid_loop_failure_preserves_partial_results_local() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    cmd_with_dir(&dir)
+        .args(["store", "add", "a"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "b"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("dup-root-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    // Pre-seed store "b" with a source at the same root, so the loop's
+    // second iteration (store "b") hits a genuine UNIQUE-constraint failure
+    // while the first iteration (store "a") succeeds.
+    cmd_with_dir(&dir)
+        .args(["--store", "b", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "a",
+            "--store",
+            "b",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a genuine mid-loop store failure should exit with the error's own code (2, \
+         invalid_request); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must still be exactly one JSON document on a mid-loop failure: {e}\n\
+             stdout:\n{stdout}"
+        )
+    });
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_request", "{v}");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(
+        results.len(),
+        1,
+        "store a's already-persisted result must be preserved: {v}"
+    );
+    assert_eq!(results[0]["store"]["name"], "a", "{v}");
+}
+
+/// Daemon-routed `source add --json` across two stores where the daemon
+/// fails the *second* store's request (e.g. a transient 500): the first
+/// store's already-succeeded result must not be discarded — the daemon-branch
+/// counterpart to the local-branch test above.
+#[test]
+fn source_add_daemon_json_multi_store_mid_loop_failure_preserves_partial_results() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let ok_body = r#"{"id":"01ABCDEFGHIJKLMNOPQRSTUVWX","store":"alpha","kind":"path"}"#;
+    let err_body = r#"{"code":"invalid_request","message":"boom"}"#;
+    let (port, _received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores/alpha/sources",
+            "HTTP/1.1 200 OK",
+            ok_body.to_string(),
+        ),
+        (
+            "POST",
+            "/v1/stores/beta/sources",
+            "HTTP/1.1 500 Internal Server Error",
+            err_body.to_string(),
+        ),
+    ]);
+
+    let fixture = dir.path().join("daemon-mid-loop-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "--json",
+            "--store",
+            "alpha",
+            "--store",
+            "beta",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a mid-loop daemon error should exit with the mapped error's own code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must still be exactly one JSON document on a mid-loop failure: {e}\n\
+             stdout:\n{stdout}"
+        )
+    });
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_request", "{v}");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(
+        results.len(),
+        1,
+        "alpha's already-succeeded result must be preserved: {v}"
+    );
+    assert_eq!(results[0]["id"], "01ABCDEFGHIJKLMNOPQRSTUVWX", "{v}");
+}
+
+/// Daemon-routed `source remove` with a syntactically invalid `--store`
+/// (traversal attempt) must exit 2 *before* the DELETE ever fires — the core
+/// finding-5 regression. Proven not just by the exit code but by asserting
+/// the mock daemon recorded zero requests.
+#[test]
+fn source_remove_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"status":"ok","id":"01ABCDEFGHIJKLMNOPQRSTUVWX"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args([
+            "--store",
+            "../evil",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the DELETE fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Daemon-routed `source remove` with a `--store` name that is syntactically
+/// valid but unknown to the *local* database must still reach the daemon:
+/// the daemon (not the local DB) is the authority on which stores exist for
+/// this path (`resolve_daemon_store_scope`'s doc comment in
+/// `cli/src/app_db.rs`), and `LOCALDB_DAEMON_URL` may point at a daemon with
+/// an entirely different data directory. This is the deliberate flip side of
+/// the test above: validation must reject bad syntax, but must NOT reject
+/// names just because this process has never heard of them.
+#[test]
+fn source_remove_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"status":"ok","id":"01ABCDEFGHIJKLMNOPQRSTUVWX"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args([
+            "--store",
+            "totally-unknown-store",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a syntactically valid --store name must reach the daemon even if locally unknown; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "expected exactly one DELETE request to reach the daemon; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("DELETE "), "{:?}", reqs[0]);
+    assert!(
+        reqs[0].0.contains("/v1/sources/01ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{:?}",
+        reqs[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H2 (Codex review, PR #212) — `status`, `store list`, and `store remove`
+// must validate `--store`/positional store names for traversal-safety
+// *before* contacting the daemon, exactly like `source remove` above.
+// ---------------------------------------------------------------------------
+
+/// Daemon-routed `status --store ../evil` must exit 2 before the `GET
+/// /v1/status` request ever fires.
+#[test]
+fn status_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"stores":[],"database":{"path":"/tmp/x.db","size_bytes":0,"wal_size_bytes":0,"largest_tables":[]}}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "../evil", "status"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the daemon status request fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// `--store` name must still reach the daemon for `status`.
+#[test]
+fn status_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"stores":[],"database":{"path":"/tmp/x.db","size_bytes":0,"wal_size_bytes":0,"largest_tables":[]}}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let _output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "totally-unknown-store", "status"])
+        .output()
+        .unwrap();
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a syntactically valid --store name must reach the daemon even if locally unknown; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("GET "), "{:?}", reqs[0]);
+    assert!(reqs[0].0.contains("/v1/status"), "{:?}", reqs[0]);
+}
+
+/// Daemon-routed `store list --store ../evil` must exit 2 before the `GET
+/// /v1/stores` request ever fires.
+#[test]
+fn store_list_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![("", "", "HTTP/1.1 200 OK", body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "../evil", "store", "list"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the daemon store-list request fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// `--store` name must still reach the daemon for `store list`.
+#[test]
+fn store_list_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = paginated_list_body(&[&store_record_json("other-store")]);
+    let (port, received) = start_routing_mock_server(vec![("", "", "HTTP/1.1 200 OK", body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let _output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "totally-unknown-store", "store", "list"])
+        .output()
+        .unwrap();
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a syntactically valid --store name must reach the daemon even if locally unknown; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("GET "), "{:?}", reqs[0]);
+    assert!(reqs[0].0.contains("/v1/stores"), "{:?}", reqs[0]);
+}
+
+/// Daemon-routed `store remove ../bad --yes` must exit 2 before the `DELETE
+/// /v1/stores/{name}` request ever fires. Also pins that embedded and daemon
+/// mode now agree (exit 2, not the old daemon-only exit 3).
+#[test]
+fn store_remove_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"status":"ok","name":"../bad"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "../bad"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe store name must exit 2 before the daemon DELETE fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when the store name fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// store name must still reach the daemon for `store remove`.
+#[test]
+fn store_remove_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"status":"ok","name":"totally-unknown-store"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "totally-unknown-store"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a syntactically valid store name must reach the daemon even if locally unknown; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "expected exactly one DELETE request to reach the daemon; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("DELETE "), "{:?}", reqs[0]);
+    assert!(
+        reqs[0].0.contains("/v1/stores/totally-unknown-store"),
+        "{:?}",
+        reqs[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding 4 — `status` and `store list` now validate/resolve explicit
+// `--store` instead of silently ignoring it — see
+// cli/src/cmds/status.rs's `run_status_async` and cli/src/cmds/store.rs's
+// `run_store_list_async`, both of which now route through
+// `resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores)`
+// (cli/src/app_db.rs) instead of calling `db.backend().list_stores()`
+// directly. specs/05-surfaces.md §2.2's repeatable-and-validated rule for
+// `--store` was never actually an exemption for these two commands — only
+// the *default* (all stores) when `-s` is omitted was already correct.
+//
+// A deliberate side effect (approved, not a bug): a database with zero
+// stores now falls into `resolve_store_scope`'s `AllStores` empty-set
+// branch, which is exit 2 ("no stores; run `localdb store add <name>` or
+// pass --store"), not a silent empty-list exit 0. This is intentional ahead
+// of implicit init (an auto-created `default` store) — see the reworked
+// `store_list_with_minimal_config_and_no_stores_exits_2_with_no_stores_message`
+// test above, and `status_zero_stores_exits_2_with_no_stores_message` below.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn store_list_unknown_store_name_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "typo", "store", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "unknown --store name should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn status_unknown_store_name_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "typo", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "unknown --store name should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn store_list_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "../evil", "store", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "traversal --store name should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn status_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "../evil", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "traversal --store name should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--store books status` on a multi-store DB must show only `books`, not
+/// every store — the core Finding-4 regression for `status`.
+#[test]
+fn status_explicit_store_filters_to_that_store() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "books", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 1, "expected exactly one store; got: {v}");
+    assert_eq!(stores[0]["name"].as_str().unwrap(), "books");
+}
+
+/// `--store books store list` on a multi-store DB must show only `books` —
+/// the core Finding-4 regression for `store list`.
+#[test]
+fn store_list_explicit_store_filters_to_that_store() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "books", "store", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 1, "expected exactly one store; got: {v}");
+    assert_eq!(stores[0]["name"].as_str().unwrap(), "books");
+}
+
+/// Repeated `-s a -s b` must resolve both, deduped, in first-seen order —
+/// exercised here for `status`; `store list` shares the same resolver.
+#[test]
+fn status_repeated_store_flags_resolve_both_in_order() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json", "--store", "research", "--store", "books", "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    let names: Vec<&str> = stores.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["research", "books"], "got: {v}");
+}
+
+/// Repeated `-s a -s b` for `store list`, mirroring the `status` case above.
+#[test]
+fn store_list_repeated_store_flags_resolve_both_in_order() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json", "--store", "research", "--store", "books", "store", "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    let names: Vec<&str> = stores.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["research", "books"], "got: {v}");
+}
+
+/// No `--store` at all must still behave exactly as before: every store in
+/// scope, for both commands.
+#[test]
+fn status_and_store_list_no_flag_show_all_stores() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research
+
+    for args in [vec!["--json", "status"], vec!["--json", "store", "list"]] {
+        let output = cmd_with_dir(&dir).args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{:?}; stderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        let stores = v["stores"].as_array().expect("stores must be an array");
+        let mut names: Vec<&str> = stores.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["books", "default", "research"], "{:?}", args);
+    }
+}
+
+/// `status` equivalent of `store_list_with_minimal_config_and_no_stores_exits_2_with_no_stores_message`
+/// above: a minimal config with a fresh, empty data dir (no stores at all)
+/// must still load via the lenient path (F1-cli) — proven by the "no
+/// stores" message rather than an "invalid config" one — and then fail
+/// loudly with exit 2 per the all-stores zero-store policy, ahead of
+/// implicit init.
+#[test]
+fn status_zero_stores_exits_2_with_no_stores_message() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = format!(
+        "version: 1\npaths:\n  data: {}\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+
+    let output = cmd_with_dir(&dir).arg("status").output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "status with zero stores should exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no stores"),
+        "expected the no-stores message; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid config"),
+        "the minimal config must not be rejected as invalid; stderr: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue #187 stage 5: declarative command table / renderer unification.
+//
+// Every command below is now driven through `command_table::dispatch`
+// (`cli/src/command_table.rs`): daemon-detected routes to `run_daemon`,
+// no-daemon routes to `run_embedded`, and -- for `store list`/`source
+// list`/`status`/`search` -- both branches feed the *same* renderer. These
+// tests exercise the daemon side of that (some, like `store list`/`source
+// list`/`status`, for the first time ever -- decision D2) and, where
+// meaningful, assert embedded and daemon-mock output are byte-identical.
+// ---------------------------------------------------------------------------
+
+/// `store list` daemon-routing (D2): before this stage, `store list` never
+/// probed for a daemon at all (issue #187 §2 -- "routed to daemon" was a
+/// false spec claim). Builds the daemon-mock's `GET /v1/stores` fixture to
+/// mirror an embedded run's own two stores, and asserts both `--json` and
+/// text output are byte-identical between the two transports.
+#[test]
+fn store_list_daemon_routes_and_matches_embedded_shape() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "alpha"])
+        .assert()
+        .success();
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "beta"])
+        .assert()
+        .success();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["store", "list"])
+        .output()
+        .unwrap();
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed store list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json store list must be identical between embedded and daemon-mock"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "list"])
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text store list must be identical between embedded and daemon-mock"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/stores")),
+        "expected a GET /v1/stores request; got {:?}",
+        reqs
+    );
+}
+
+/// `source list` daemon-routing (D2), the first daemon test for this
+/// command -- issue #187 §2 documented the missing daemon branch as a
+/// "known limitation" rather than fixing it. Builds the daemon-mock's
+/// fixture from an embedded run's own persisted source (same id/root), and
+/// asserts `--json` and text output are byte-identical between the two
+/// transports.
+#[test]
+fn source_list_daemon_routes_and_matches_embedded_shape() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "mystore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    // Mirror the embedded run's own persisted source exactly (same
+    // id/root/store_id), so the daemon-mock fixture describes the same
+    // logical source and `embedded_v == daemon_v` is a meaningful check —
+    // `store_id` (issue #187 review, finding 2) is a real internal store
+    // ULID minted by `store add`, not the store's name, so it has to be
+    // pulled from the embedded run's own output rather than guessed.
+    let src_id = embedded_v["sources"][0]["id"].as_str().unwrap().to_string();
+    let store_id = embedded_v["sources"][0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let root = embedded_v["sources"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let src_json = serde_json::json!({
+        "id": src_id,
+        "store_id": store_id,
+        "kind": "path",
+        "spec": { "root": root },
+        "preset": "prose",
+    })
+    .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body = paginated_list_body(&[&store_record_json("mystore")]);
+    let sources_body = paginated_list_body(&[&src_json]);
+    let (port, received) = start_routing_mock_server(vec![
+        // The more specific `/v1/stores/mystore/sources` route must be
+        // listed before the bare `/v1/stores` one — `start_routing_mock_server`
+        // is first-match-wins on a path *prefix*, and every sources path
+        // also starts with `/v1/stores`.
+        (
+            "GET",
+            "/v1/stores/mystore/sources",
+            "HTTP/1.1 200 OK",
+            sources_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json source list must be identical between embedded and daemon-mock"
+    );
+    // Issue #187 review, finding 2: `store_id` must be present (not just
+    // `store.name`) on both transports — the shared renderer this test
+    // otherwise exercises had dropped it entirely.
+    assert_eq!(
+        daemon_v["sources"][0]["store_id"], store_id,
+        "daemon-routed source list --json must include store_id: {daemon_v}"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text source list must be identical between embedded and daemon-mock"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/stores/mystore/sources")),
+        "expected a GET /v1/stores/mystore/sources request; got {:?}",
+        reqs
+    );
+}
+
+/// Regression test for issue #187 review, finding G4: `command_table::dispatch`
+/// used to require every call site to open the local `AppDb` *before*
+/// probing for a daemon, even though the daemon branch never used it — so a
+/// broken local store (unwritable, locked, schema-too-new — all real cases
+/// that `exit_err` on open) would preempt a healthy daemon that never needed
+/// the local DB at all. This test breaks the local DB deterministically
+/// (stamps a schema version this build's migration chain will never reach,
+/// via `stamp_user_version`, so `LibsqlDb::open` returns
+/// `Error::InvalidConfig` — see `store-libsql/src/connection.rs`'s
+/// `VersionDisposition::TooNew` arm) and checks both transports: embedded
+/// `source list` must still fail exactly as it always did (same exit code /
+/// message, just reached after the daemon probe instead of before), and
+/// daemon-routed `source list` against the identical broken local DB must
+/// succeed.
+#[test]
+fn source_list_routes_to_daemon_when_local_db_schema_is_incompatible() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Stamp a schema version far beyond anything this binary's migration
+    // chain will ever reach, so every subsequent `AppDb::open` on this file
+    // hits `VersionDisposition::TooNew` -> `Error::InvalidConfig`.
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    // No daemon detected: embedded `source list` must fail exactly as it did
+    // before this fix -- exit 2 (invalid_config), mentioning the mismatch.
+    let no_daemon = cmd_with_dir(&dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        no_daemon.status.code().unwrap(),
+        2,
+        "embedded source list against a too-new local schema must exit 2 (invalid_config); stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&no_daemon.stdout),
+        String::from_utf8_lossy(&no_daemon.stderr)
+    );
+    let no_daemon_stderr = String::from_utf8_lossy(&no_daemon.stderr);
+    assert!(
+        no_daemon_stderr.contains("newer than this build"),
+        "expected the schema-too-new error message; stderr: {no_daemon_stderr}"
+    );
+
+    // Same directory, same broken `localdb.db` on disk -- but now a daemon is
+    // detected via `LOCALDB_DAEMON_URL`. Before the G4 fix, `dispatch`'s
+    // caller had already opened (and failed to open) the local `AppDb`
+    // before this point; after the fix, `open_db` is only ever invoked from
+    // `dispatch`'s `NotRunning` arm, so the daemon branch must succeed
+    // without ever touching the broken local DB.
+    let stores_body = paginated_list_body(&[&store_record_json("s1")]);
+    let sources_body = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/stores/s1/sources",
+            "HTTP/1.1 200 OK",
+            sources_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let with_daemon = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        with_daemon.status.success(),
+        "daemon-routed source list must succeed even though the local DB schema is too new; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&with_daemon.stdout),
+        String::from_utf8_lossy(&with_daemon.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/stores")),
+        "expected at least a GET /v1/stores request; got {:?}",
+        reqs
+    );
+}
+
+/// Daemon-transport counterpart of
+/// `source_list_shows_store_column_even_when_one_scoped_store_is_empty`
+/// (issue #187 review, finding 1) — shape-parity style with
+/// `source_list_daemon_routes_and_matches_embedded_shape` above: builds the
+/// same "two stores in scope, only one has sources" fixture through an
+/// embedded run first, then reproduces it against a daemon-mock and asserts
+/// both text and `--json` output are byte-identical between the two
+/// transports. Before the fix, the daemon branch had the identical bug as
+/// embedded (the shared renderer, not either transport's own resolver, was
+/// at fault): the store-name column disappeared because `empty` never
+/// contributed an item.
+#[test]
+fn source_list_daemon_shows_store_column_even_when_one_scoped_store_is_empty() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    for name in ["populated", "empty"] {
+        cmd_with_dir(&embedded_dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+    let fixture = embedded_dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "populated",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let embedded_args = ["--store", "populated", "--store", "empty", "source", "list"];
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json"])
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+    // Sanity check on the embedded fixture itself, matching the equivalent
+    // assertion in `source_list_shows_store_column_even_when_one_scoped_store_is_empty`:
+    // only 'populated' produced a source, but the column must still appear.
+    assert!(
+        embedded_text_stdout
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("populated  "),
+        "embedded fixture sanity check failed: {embedded_text_stdout}"
+    );
+
+    let src_id = embedded_v["sources"][0]["id"].as_str().unwrap().to_string();
+    let store_id = embedded_v["sources"][0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let root = embedded_v["sources"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let src_json = serde_json::json!({
+        "id": src_id,
+        "store_id": store_id,
+        "kind": "path",
+        "spec": { "root": root },
+        "preset": "prose",
+    })
+    .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body =
+        paginated_list_body(&[&store_record_json("populated"), &store_record_json("empty")]);
+    let populated_sources = paginated_list_body(&[&src_json]);
+    let empty_sources = paginated_list_body(&[]);
+    let (port, _received) = start_routing_mock_server(vec![
+        // The specific `/sources` routes must be listed before the bare
+        // `/v1/stores` fallback — first-match-wins on a path *prefix*.
+        (
+            "GET",
+            "/v1/stores/populated/sources",
+            "HTTP/1.1 200 OK",
+            populated_sources,
+        ),
+        (
+            "GET",
+            "/v1/stores/empty/sources",
+            "HTTP/1.1 200 OK",
+            empty_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json"])
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json source list must be identical between embedded and daemon-mock"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text source list must be identical between embedded and daemon-mock, \
+         including the store-name column surviving an empty scoped store"
+    );
+}
+
+/// `status` daemon-routing (D2), the first daemon test for this command --
+/// before this stage the daemon probe only produced a display string and
+/// every count still came from the local DB regardless of mode (issue #187
+/// §2). Asserts the daemon's `GET /v1/status` per-store stats and database
+/// section (`server/src/handlers/status.rs`, extended in this stage) flow
+/// through to both `--json` and text output.
+#[test]
+fn status_daemon_reports_daemon_provided_per_store_stats() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let status_body = serde_json::json!({
+        "daemon": true,
+        "store_count": 1,
+        "source_count": 2,
+        "job_count": 0,
+        "stores": [
+            {
+                "name": "mystore",
+                "visibility": "private",
+                "backend": "libsql",
+                "document_count": 3,
+                "chunk_count": 30,
+            }
+        ],
+        "database": {
+            "path": "/fake/localdb.db",
+            "exists": true,
+            "size_bytes": 900,
+            "wal_size_bytes": 100,
+            "total_size_bytes": 1000,
+            "bytes_per_chunk": 33,
+            "largest_tables": [{"name": "chunks", "bytes": 900}],
+        },
+    })
+    .to_string();
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/status", "HTTP/1.1 200 OK", status_body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let json_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        json_out.status.success(),
+        "daemon-routed status --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).unwrap();
+    assert!(v["daemon"].as_str().unwrap().starts_with("running"), "{v}");
+    assert_eq!(v["stores"][0]["name"], "mystore", "{v}");
+    assert_eq!(v["stores"][0]["document_count"], 3, "{v}");
+    assert_eq!(v["stores"][0]["chunk_count"], 30, "{v}");
+    assert_eq!(v["database"]["total_size_bytes"], 1000, "{v}");
+    assert_eq!(v["database"]["bytes_per_chunk"], 33, "{v}");
+    assert_eq!(v["database"]["largest_tables"][0]["name"], "chunks", "{v}");
+
+    let text_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(text_out.status.success());
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    assert!(stdout.contains("mystore"), "{stdout}");
+    assert!(stdout.contains("3 documents, 30 chunks"), "{stdout}");
+    assert!(stdout.contains("largest tables"), "{stdout}");
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/status")),
+        "expected a GET /v1/status request; got {:?}",
+        reqs
+    );
+}
+
+/// Regression for issue #187 §2's `search` divergence: the daemon branch
+/// used to hand-walk the raw JSON response and silently drop `heading_path`
+/// (`cli/src/cmds/search.rs`, pre-stage-5 ~100-121) because it rendered
+/// straight from `serde_json::Value` instead of deserializing into
+/// `Citation` like the embedded branch did. Asserts the heading-path
+/// breadcrumb IS rendered from a daemon response.
+#[test]
+fn search_daemon_renders_heading_path_breadcrumb() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let citation = serde_json::json!({
+        "chunk_id": "chunk1",
+        "resource_id": "doc1",
+        "store": {"id": "01HN1Y28MYWN6X5DSKZMNE1T5W", "name": "mystore"},
+        "uri": "file:///docs/api.md",
+        "heading_path": ["API", "Auth"],
+        "block": {"seq": 0},
+        "chunk_position": {"seq_in_block": 0},
+        "location": {"span": {"start": 0, "end": 10}},
+        "snippet": "some snippet text about tokens",
+        "score": {"fused": 1.0},
+        "provenance": {"fetched_at": "2026-01-01T00:00:00Z", "content_hash": "abc"},
+    });
+    let body = serde_json::json!({ "citations": [citation] }).to_string();
+    let (port, _received) =
+        start_routing_mock_server(vec![("POST", "/v1/search", "HTTP/1.1 200 OK", body)]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["search", "auth"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed search should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("file:///docs/api.md > API > Auth"),
+        "expected the heading-path breadcrumb rendered from the daemon response; got: {stdout}"
+    );
+}
+
+/// `search --json` shape parity: the daemon branch's `citations` must be
+/// exactly the JSON `Citation` shape (via `serde_json::from_value` into
+/// `core::Citation`, issue #187 stage 5) -- asserted here by round-tripping
+/// a fixed citation through the daemon mock and confirming the fields the
+/// old hand-walking code used to drop survive intact.
+#[test]
+fn search_daemon_json_citations_round_trip_exactly() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let citation = serde_json::json!({
+        "chunk_id": "chunk1",
+        "resource_id": "doc1",
+        "store": {"id": "01HN1Y28MYWN6X5DSKZMNE1T5W", "name": "mystore"},
+        "uri": "file:///docs/api.md",
+        "heading_path": ["API", "Auth"],
+        "block": {"seq": 0, "kind": "text"},
+        "chunk_position": {"seq_in_block": 0},
+        "location": {"span": {"start": 0, "end": 10}},
+        "snippet": "some snippet text about tokens",
+        "score": {"fused": 1.0, "dense": 0.5, "bm25": 0.2},
+        "provenance": {"fetched_at": "2026-01-01T00:00:00Z", "content_hash": "abc"},
+        "title": null,
+        "metadata": {"kind": "document"},
+    });
+    let body = serde_json::json!({ "citations": [citation.clone()] }).to_string();
+    let (port, _received) =
+        start_routing_mock_server(vec![("POST", "/v1/search", "HTTP/1.1 200 OK", body)]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "search", "auth"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["citations"][0]["heading_path"], citation["heading_path"]);
+    assert_eq!(v["citations"][0]["uri"], citation["uri"]);
+    assert_eq!(v["citations"][0]["snippet"], citation["snippet"]);
+}
+
+/// `store add` shape parity: embedded and daemon-mock must produce
+/// byte-identical `--json` and text output (issue #187 stage 5) -- the
+/// daemon-only `(via daemon)` suffix the old hand-written branch printed is
+/// gone.
+#[test]
+fn store_add_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity-store"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+    assert!(
+        !embedded_text_stdout.contains("via daemon"),
+        "sanity: embedded output must never mention daemon mode"
+    );
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let add_body = r#"{"name":"parity-store","id":"01STOREID000000000000000A","visibility":"private","backend":"libsql"}"#;
+    let (port, received) = start_routing_mock_server(vec![(
+        "POST",
+        "/v1/stores",
+        "HTTP/1.1 201 Created",
+        add_body.to_string(),
+    )]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "add", "parity-store"])
+        .output()
+        .unwrap();
+    assert!(daemon_text.status.success());
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text `store add` output must be identical between embedded and daemon-mock, with no \
+         '(via daemon)' suffix"
+    );
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "store", "add", "parity-store-2"])
+        .output()
+        .unwrap();
+    assert!(daemon_json.status.success());
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(daemon_v["status"], "ok", "{daemon_v}");
+    assert_eq!(daemon_v["name"], "parity-store", "{daemon_v}");
+    assert!(daemon_v.get("id").is_some(), "{daemon_v}");
+
+    let reqs = received.lock().unwrap();
+    assert!(reqs.iter().any(|(l, _)| l.starts_with("POST /v1/stores")));
+}
+
+/// `store remove` shape parity, mirroring `store_add_shape_parity_...`
+/// above: embedded and daemon-mock text output must be byte-identical, with
+/// no `(via daemon)` suffix.
+#[test]
+fn store_remove_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "removeme"])
+        .assert()
+        .success();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["store", "remove", "--yes", "removeme"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let remove_body = r#"{"status":"ok"}"#;
+    let (port, received) = start_routing_mock_server(vec![(
+        "DELETE",
+        "/v1/stores/removeme",
+        "HTTP/1.1 204 No Content",
+        remove_body.to_string(),
+    )]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "removeme"])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_text.status.success(),
+        "daemon-routed store remove should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_text.stderr)
+    );
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text `store remove` output must be identical between embedded and daemon-mock, with no \
+         '(via daemon)' suffix"
+    );
+    assert!(!daemon_text_stdout.contains("via daemon"));
+
+    let reqs = received.lock().unwrap();
+    assert!(reqs
+        .iter()
+        .any(|(l, _)| l.starts_with("DELETE /v1/stores/removeme")));
 }

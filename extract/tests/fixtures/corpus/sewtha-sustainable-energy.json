@@ -1,0 +1,18 @@
+{
+  "file": "sewtha-sustainable-energy.pdf",
+  "expect": "ok",
+  "pages": 383,
+  "page_phrases": {
+    "1": ["This Cover-sheet must not appear in the printed book", "Version 3.5.2. November 3, 2008"],
+    "2": ["The quest for safe, secure and sustainable energy", "a really valuable contribution to the continuing discussion"],
+    "3": ["really understanding the complex issues of energy supply", "comprehensively reveals the true facts about sustainable energy"],
+    "4": [],
+    "5": [],
+    "6": ["David JC MacKay"],
+    "134": ["However, we must be realistic in our planning", "Some trains, coaches, and buses are not full", "seems a promising way to deliver passenger transportation"],
+    "210": ["watching England play footie against Sweden", "many industrial users of electricity are on special contracts", "Could Britain adopt the Danish solution"],
+    "287": ["We can work out two sorts of transport", "the energy cost of moving weight around", "the size of the plane, nor on its weight"]
+  },
+  "title_contains": "Sustainable",
+  "notes": "Rendered pages 1-6 are the electronic edition's front matter, not the printed book's page 1-6: page 1 is an internal 'Cover-sheet' (version/date stamp) explicitly marked not to appear in the printed book; pages 2-3 are two-column endorsement blurbs (each attributed to a named person -- attributions themselves were avoided as phrase sources since they are name/title lines, not prose); page 4 and page 6 repeat the bare book title 'Sustainable Energy -- without the hot air' (page 6 also adds 'David JC MacKay' / 'UIT' / 'CAMBRIDGE, ENGLAND' as separate short lines) so that title string is NOT a good page-pinpointing phrase (it recurs verbatim on at least pages 1, 4, and 6); page 5 is essentially blank apart from the running copyright header. Pages 4 and 5 therefore get zero page_phrases -- there is no unique, non-repeated body prose on them. Every rendered page (2 onward) carries an identical running header 'Copyright David JC MacKay 2009. This electronic copy is provided, free, for personal use only. See www.withouthotair.com.' -- deliberately excluded from all phrases as a header. Pages 134, 210, and 287 are ordinary body-text pages from deep in the book (printed page numbers 121, 197, and 274 respectively, per the running folio -- PDF page number was used as the JSON key, matching the render filenames) with normal single-column prose, an inline figure/photo, and a data table; phrases were drawn only from plain body paragraphs, avoiding the colored inline kWh/GW figures, table cells, and figure captions. No blank, rotated, or scanned-looking pages were observed; rendering is clean vector text throughout (LaTeX-typeset, hyphens are real intra-word hyphens, not line-wrap artifacts, except where explicitly noted during phrase selection)."
+}

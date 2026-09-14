@@ -14,14 +14,14 @@
 //! round trips a browser would.
 
 use localdb_core::{
-    config::loader::{load_config, LoadOptions},
     Error,
+    config::loader::{LoadOptions, load_config},
 };
 use serde_json::json;
 
 use crate::{
     credentials::CredentialEntry,
-    daemon_client::{probe_daemon, resolved_config_file, CliContext, DaemonState},
+    daemon_client::{CliContext, DaemonState, probe_daemon, resolved_config_file},
     normalize::{exit_err, print_json},
 };
 
@@ -663,12 +663,14 @@ mod tests {
                 },
             },
             providers: vec![],
+            ..Default::default()
         };
         yaml_config.version = 1;
         let queue = JobQueue::new();
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().to_path_buf().join("models"),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
             AuthMode::Enforced,
@@ -676,11 +678,11 @@ mod tests {
         .await
         .unwrap();
 
-        let mcp_provider: Arc<dyn mcp::StoreProvider> =
-            Arc::new(mcp::StaticStoreProvider::new(vec![]));
         let router = server::build_router(
             state.clone(),
-            mcp_provider,
+            std::sync::Arc::new(server::mcp_bridge::AppStateStoreProvider::new(
+                state.clone(),
+            )),
             Arc::new(localdb_core::FakeEmbedder::new(1)),
             vec![],
         );

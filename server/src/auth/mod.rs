@@ -12,8 +12,8 @@ pub mod oauth;
 pub mod register;
 
 use localdb_core::{
-    auth::{mint_secret, AuthStore as _},
     Error,
+    auth::{AuthStore as _, mint_secret},
 };
 
 use crate::state::AppState;
@@ -79,8 +79,6 @@ pub type ServerAuthService = localdb_core::auth::AuthService<store_libsql::Libsq
 /// would suppress the setup code in that case, starting the daemon
 /// auth-enforced with zero admins and no way to create one via the API
 /// (every admin-management route requires an admin principal already).
-///
-/// Nothing consumes the code in T3.
 pub async fn generate_setup_code_if_needed(state: &AppState) -> Result<Option<String>, Error> {
     if state.auth_mode() != AuthMode::Enforced {
         return Ok(None);
@@ -96,7 +94,7 @@ pub async fn generate_setup_code_if_needed(state: &AppState) -> Result<Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::auth::{hash_secret, Role};
+    use localdb_core::auth::{Role, hash_secret};
     use localdb_core::config::schema::RawConfig;
 
     async fn make_state(auth_mode: AuthMode) -> (tempfile::TempDir, AppState) {
@@ -107,6 +105,7 @@ mod tests {
             paths: Default::default(),
             defaults: Default::default(),
             providers: vec![],
+            ..Default::default()
         };
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
@@ -116,6 +115,7 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().to_path_buf().join("models"),
             queue.clone(),
             crate::scheduler::UrlRefreshScheduler::new(queue),
             auth_mode,

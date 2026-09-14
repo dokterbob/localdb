@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/dokterbob/localdb/blob/main/docs/
     about: User-facing documentation — CLI reference, configuration, search, MCP, daemon.
   - name: Vision
-    url: https://github.com/dokterbob/localdb/blob/main/VISION.md
+    url: https://github.com/dokterbob/localdb/blob/main/docs/vision.md
     about: Long-horizon goals and federation direction for localdb.

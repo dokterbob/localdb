@@ -5,8 +5,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::StoreVisibility;
 use crate::Error;
+use crate::types::StoreVisibility;
 
 /// A user's role. Only two roles exist (D7): `admin` sees and manages
 /// everything; `member` is scoped by store grants.
@@ -75,6 +75,16 @@ impl Principal {
     ///   `private` store are rejected at grant time
     ///   (`AuthService::grant_store`), so a well-formed `Granted` set never
     ///   actually contains one, but this check is the backstop.
+    pub fn require_read_store(&self, name: &str, visibility: StoreVisibility) -> Result<(), Error> {
+        if self.can_read_store(name, visibility) {
+            Ok(())
+        } else {
+            Err(Error::Forbidden {
+                message: format!("you do not have access to store '{name}'"),
+            })
+        }
+    }
+
     pub fn can_read_store(&self, store_name: &str, visibility: StoreVisibility) -> bool {
         match self.role {
             Role::Admin => true,

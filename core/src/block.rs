@@ -48,6 +48,12 @@ pub struct Resource {
     /// Change detection token from the source system.
     pub external_etag: Option<String>,
 
+    /// Raw HTTP `Last-Modified` conditional-GET validator, beside
+    /// `external_etag`. See specs/02-domain-model.md §2: unlike
+    /// `external_etag`, this is deliberately not an input to
+    /// `core::ids::compute_metadata_hash`.
+    pub external_last_modified: Option<String>,
+
     /// blake3 of ordered block canonical texts concatenated.
     pub content_hash: String,
 
@@ -63,8 +69,12 @@ pub struct Resource {
     /// When first indexed (RFC 3339).
     pub added_at: String,
 
-    /// When content last changed (RFC 3339).
-    pub modified_at: String,
+    /// The source's own claim about when the content last changed (RFC
+    /// 3339). `None` when the source makes no such claim (e.g. an ingestor
+    /// with no reliable modification-time signal). Never our clock — see
+    /// `added_at` for that. Persisted as NULL in the store layer's nullable
+    /// `resources.modified_at` column.
+    pub modified_at: Option<String>,
 
     /// Conversation thread identifier (conversation resources only).
     pub thread_id: Option<String>,
@@ -484,6 +494,7 @@ mod tests {
             uri: Uri::parse("file:///test.md").unwrap(),
             external_id: None,
             external_etag: None,
+            external_last_modified: None,
             content_hash: "hash123".to_string(),
             title: Some("Test".to_string()),
             mime: Some("text/markdown".to_string()),
@@ -495,7 +506,7 @@ mod tests {
                 ..Default::default()
             }),
             added_at: "2026-06-30T00:00:00Z".to_string(),
-            modified_at: "2026-06-30T00:00:00Z".to_string(),
+            modified_at: Some("2026-06-30T00:00:00Z".to_string()),
             thread_id: None,
             channel: None,
             participants: vec![],

@@ -1,0 +1,29 @@
+# The one toolchain this repo builds and lints with, everywhere.
+#
+# Without a pin, CI installs whatever `stable` resolves to on the day it runs,
+# so a new stable release turns every open PR red the moment it lands a new
+# lint — a failure that has nothing to do with the branch it appears on, and
+# that no contributor can reproduce until their own toolchain happens to catch
+# up. Bumping `channel` is how new lints arrive: deliberately, in one PR, fixed
+# once.
+#
+# `components` and `targets` are declared here rather than in the workflow so
+# rustup provisions them for *this* toolchain. The cross-compile matrix in
+# `.github/workflows/ci.yml` builds each of the targets below; dropping one
+# here breaks that lane.
+#
+# This is not the MSRV. `Cargo.toml`'s `rust-version` is the oldest toolchain
+# the crates support and moves on its own schedule.
+#
+# Note: a `cargo` installed by something other than rustup — Homebrew's `rust`
+# formula, a distro package — ignores this file entirely. Check with
+# `cargo --version`: if it does not match `channel`, put rustup's shim
+# directory ahead of it on `PATH`.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]

@@ -5,7 +5,7 @@ use super::sql::{role_to_sql, row_to_user};
 use crate::connection::{map_libsql_err, LibsqlDb};
 
 pub(crate) async fn create_user(db: &LibsqlDb, user: &UserRow) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "INSERT INTO users (id, name, role, created_at) VALUES (?, ?, ?, ?)",
         libsql::params![
@@ -33,7 +33,7 @@ pub(crate) async fn create_user(db: &LibsqlDb, user: &UserRow) -> Result<(), Err
 }
 
 pub(crate) async fn get_user(db: &LibsqlDb, id: &str) -> Result<Option<UserRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT id, name, role, created_at FROM users WHERE id = ?",
@@ -48,7 +48,7 @@ pub(crate) async fn get_user(db: &LibsqlDb, id: &str) -> Result<Option<UserRow>,
 }
 
 pub(crate) async fn get_user_by_name(db: &LibsqlDb, name: &str) -> Result<Option<UserRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT id, name, role, created_at FROM users WHERE name = ?",
@@ -63,7 +63,7 @@ pub(crate) async fn get_user_by_name(db: &LibsqlDb, name: &str) -> Result<Option
 }
 
 pub(crate) async fn list_users(db: &LibsqlDb) -> Result<Vec<UserRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT id, name, role, created_at FROM users ORDER BY created_at",
@@ -79,7 +79,7 @@ pub(crate) async fn list_users(db: &LibsqlDb) -> Result<Vec<UserRow>, Error> {
 }
 
 pub(crate) async fn update_user_role(db: &LibsqlDb, id: &str, role: Role) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE users SET role = ? WHERE id = ?",
@@ -96,7 +96,7 @@ pub(crate) async fn update_user_role(db: &LibsqlDb, id: &str, role: Role) -> Res
 }
 
 pub(crate) async fn delete_user(db: &LibsqlDb, id: &str) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "DELETE FROM users WHERE id = ?",
@@ -118,7 +118,7 @@ pub(crate) async fn try_delete_user_unless_last_admin(
     db: &LibsqlDb,
     id: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "DELETE FROM users WHERE id = ? AND ( \
@@ -141,7 +141,7 @@ pub(crate) async fn try_demote_user_unless_last_admin(
     db: &LibsqlDb,
     id: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE users SET role = 'member' WHERE id = ? AND role = 'admin' \
@@ -154,7 +154,7 @@ pub(crate) async fn try_demote_user_unless_last_admin(
 }
 
 pub(crate) async fn count_users(db: &LibsqlDb) -> Result<u64, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query("SELECT COUNT(*) FROM users", ())
         .await
@@ -175,7 +175,7 @@ pub(crate) async fn count_users(db: &LibsqlDb) -> Result<u64, Error> {
 /// setup-code bootstrap decision, which must key off admin existence rather
 /// than mere user existence.
 pub(crate) async fn admin_exists(db: &LibsqlDb) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')",

@@ -21,10 +21,27 @@
 //! the rendered "up" SQL (or `RustStep::apply`) runs, the rendered "down" SQL
 //! (or unsupported reason) is persisted as a `schema_migrations` row, and
 //! `PRAGMA user_version` is advanced — all before committing. On any failure
-//! the transaction is rolled back **explicitly** rather than relying on
-//! `Drop`, since drop-rollback semantics for local libsql connections were
-//! unconfirmed at the time this runner was written (see the partial-failure
-//! test below, which is the gate for that assumption).
+//! the transaction is rolled back **explicitly**, not via `Drop`. Explicit
+//! `rollback()` returns a `Result` we can log and act on, so it's
+//! deliberately kept as the primary error path here — strictly better than
+//! the alternative: dropping an uncommitted `libsql::Transaction` does run a
+//! synchronous ROLLBACK too (its default `DropBehavior::Rollback`, a
+//! backstop for panics/task aborts), but that Drop path calls
+//! `do_rollback().unwrap()`, which **panics** if the rollback fails instead
+//! of returning an error we could act on.
+//!
+//! Even the explicit path isn't fully panic-proof, though: if the ROLLBACK
+//! statement itself errors, `Transaction::rollback` returns that `Err` while
+//! the connection is still non-autocommit, so `Transaction`'s own `Drop`
+//! then retries a rollback — and if *that* also fails, libsql panics before
+//! our `tracing::error!` below ever runs (see vendored libsql 0.10.0-pre.4's
+//! `local::Transaction::commit`/`rollback`). So explicit rollback reliably
+//! handles and logs the common, first-order failure; a *persistently*
+//! failing ROLLBACK (disk gone, etc.) still panics regardless, an upstream
+//! libsql limitation, not something fixable here — do not "simplify" the
+//! explicit arms below away in favor of Drop on the strength of that caveat
+//! (see the partial-failure test below, which pins the first-order-failure
+//! behavior this comment describes).
 
 use std::time::{Duration, Instant};
 
@@ -134,6 +151,11 @@ pub async fn apply_pending_with_progress(
             .map_err(map_libsql_err)?;
 
         if let Err(e) = apply_one(&tx, migration, ctx).await {
+            // Explicit rollback, not Drop — see this module's "Applying
+            // steps" doc comment for the full rationale, including the
+            // caveat that even this explicit path can still panic if the
+            // ROLLBACK itself fails persistently. Do not remove this arm to
+            // "rely on Drop" instead — explicit remains strictly better.
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(
                     migration = migration.name,
@@ -283,6 +305,11 @@ pub async fn seed_for_fresh_create(
         .map_err(map_libsql_err)?;
 
     if let Err(e) = seed_all_and_stamp(&tx, chain, ctx).await {
+        // Explicit rollback, not Drop — see this module's "Applying steps"
+        // doc comment for the full rationale, including the caveat that even
+        // this explicit path can still panic if the ROLLBACK itself fails
+        // persistently. Do not remove this arm to "rely on Drop" instead —
+        // explicit remains strictly better.
         if let Err(rollback_err) = tx.rollback().await {
             tracing::error!(error = %rollback_err, "rollback after failed seed also failed");
         }
@@ -378,11 +405,24 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    fn ctx() -> MigrationContext {
+    /// Both encodings, so every schema-equivalence assertion below covers the
+    /// binary path too. Schema v6 makes `chunks_vec_idx`'s DDL depend on the
+    /// encoding (see `vectors::vector_index_params`), and `Float32` alone
+    /// would exercise only the branch v6 leaves untouched.
+    const ENCODINGS: [VectorEncoding; 2] = [VectorEncoding::Float32, VectorEncoding::Binary];
+
+    fn ctx_for(encoding: VectorEncoding) -> MigrationContext {
         MigrationContext {
-            embedding_dim: 4,
-            encoding: VectorEncoding::Float32,
+            // 1024 dims, not 4: the binary path needs a dimension libsql will
+            // accept for an `F1BIT_BLOB` column, and it's the production
+            // default (`pplx-embed-context-v1-0.6b`).
+            embedding_dim: 1024,
+            encoding,
         }
+    }
+
+    fn ctx() -> MigrationContext {
+        ctx_for(VectorEncoding::Float32)
     }
 
     async fn open_test_db() -> (tempfile::TempDir, Connection) {
@@ -394,12 +434,16 @@ mod tests {
         (dir, conn)
     }
 
-    async fn open_baseline_db() -> (tempfile::TempDir, Connection) {
+    async fn open_baseline_db_with(encoding: VectorEncoding) -> (tempfile::TempDir, Connection) {
         let (dir, conn) = open_test_db().await;
-        baseline::create_baseline_schema(&conn, &ctx())
+        baseline::create_baseline_schema(&conn, &ctx_for(encoding))
             .await
             .unwrap();
         (dir, conn)
+    }
+
+    async fn open_baseline_db() -> (tempfile::TempDir, Connection) {
+        open_baseline_db_with(VectorEncoding::Float32).await
     }
 
     // -- Fixture chain: v5 creates `toys`, v6 adds a column, v7 is
@@ -612,19 +656,20 @@ mod tests {
     // also exactly how a real caller would use `apply_pending` — the
     // already-applied entries are filtered out internally by comparing
     // against `PRAGMA user_version`, so only entry `i` actually runs.
-    async fn assert_up_then_down_restores_schema(chain: &[Migration]) {
+    async fn assert_up_then_down_restores_schema(chain: &[Migration], encoding: VectorEncoding) {
+        let ctx = ctx_for(encoding);
         for i in 0..chain.len() {
             if matches!(&chain[i].down, Down::Unsupported(_)) {
                 continue; // nothing to replay
             }
 
-            let (_dir, conn) = open_baseline_db().await;
+            let (_dir, conn) = open_baseline_db_with(encoding).await;
             if i > 0 {
-                apply_pending(&conn, &chain[..i], &ctx()).await.unwrap();
+                apply_pending(&conn, &chain[..i], &ctx).await.unwrap();
             }
             let before = normalized_master_rows(&conn).await;
 
-            apply_pending(&conn, &chain[..=i], &ctx()).await.unwrap();
+            apply_pending(&conn, &chain[..=i], &ctx).await.unwrap();
 
             let rows = table::list_rows_desc_above(&conn, BASELINE_VERSION + i as i64)
                 .await
@@ -644,7 +689,7 @@ mod tests {
             let after = normalized_master_rows(&conn).await;
             assert_eq!(
                 before, after,
-                "replaying down_sql for '{}' should restore the prior schema",
+                "replaying down_sql for '{}' ({encoding:?}) should restore the prior schema",
                 chain[i].name
             );
         }
@@ -652,14 +697,16 @@ mod tests {
 
     #[tokio::test]
     async fn up_then_down_restores_prior_schema_fixture_chain() {
-        assert_up_then_down_restores_schema(&fixture_chain()).await;
+        assert_up_then_down_restores_schema(&fixture_chain(), VectorEncoding::Float32).await;
     }
 
     #[tokio::test]
     async fn up_then_down_restores_prior_schema_real_registry() {
-        // Currently empty; this loop runs zero times but exercises real
-        // entries the moment consumers append them.
-        assert_up_then_down_restores_schema(&real_migrations()).await;
+        // Both encodings: v6's up/down statements differ between them, and
+        // only the binary branch actually rebuilds `chunks_vec_idx`.
+        for encoding in ENCODINGS {
+            assert_up_then_down_restores_schema(&real_migrations(), encoding).await;
+        }
     }
 
     // 3. Data preservation across an ALTER TABLE (plan test 7).
@@ -980,23 +1027,41 @@ mod tests {
     // `create_schema` without adding a chain entry — this test fails. It
     // supersedes `baseline::baseline_schema_matches_current_create_schema_verbatim`,
     // which only held while the chain was empty.
+    //
+    // SCOPE — this test proves the two paths AGREE, not that either is
+    // CORRECT. Where both sides derive their DDL from one shared helper (as
+    // `chunks_vec_idx` does, from `vectors::vector_index_ddl`), a wrong value
+    // in that helper flows into both sides identically and this test still
+    // passes: it can never catch a bug the two paths share. Verified, not
+    // assumed — deliberately corrupting `vector_index_params`'s Binary arm to
+    // emit `max_neighbors=99` leaves this test green while silently doubling
+    // the per-chunk index cost.
+    //
+    // What catches that class of bug is `tests/vector_index_cost.rs`, which
+    // pins the resulting block size against libsql's own
+    // `libsql_vector_meta_shadow` metadata. Don't read a green drift guard as
+    // "the index tuning is right".
     #[tokio::test]
     async fn drift_guard_create_schema_equals_baseline_plus_chain() {
-        let (_dir_a, conn_a) = open_test_db().await;
-        crate::schema::create_schema(&conn_a, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
+        for encoding in ENCODINGS {
+            let ctx = ctx_for(encoding);
 
-        let (_dir_b, conn_b) = open_baseline_db().await;
-        apply_pending(&conn_b, &real_migrations(), &ctx())
-            .await
-            .unwrap();
+            let (_dir_a, conn_a) = open_test_db().await;
+            crate::schema::create_schema(&conn_a, ctx.embedding_dim, encoding)
+                .await
+                .unwrap();
 
-        assert_eq!(
-            normalized_master_rows(&conn_a).await,
-            normalized_master_rows(&conn_b).await,
-            "schema::create_schema must produce the same DDL as baseline + the real chain \
-             (write-twice rule — see docs/migrations.md)"
-        );
+            let (_dir_b, conn_b) = open_baseline_db_with(encoding).await;
+            apply_pending(&conn_b, &real_migrations(), &ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                normalized_master_rows(&conn_a).await,
+                normalized_master_rows(&conn_b).await,
+                "schema::create_schema must produce the same DDL as baseline + the real chain \
+                 for {encoding:?} (write-twice rule — see docs/migrations.md)"
+            );
+        }
     }
 }

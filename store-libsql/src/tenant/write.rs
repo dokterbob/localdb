@@ -1,11 +1,44 @@
 use std::collections::HashMap;
 
 use libsql::{params, Connection};
-use localdb_core::{ChunkRecord, Error, VectorEncoding};
+use localdb_core::{ChunkRecord, Error, ResourceRecord, VectorEncoding};
 
-use super::TenantStore;
-use crate::connection::map_libsql_err;
+use super::{ensure_store_id, tenant_violation, TenantStore};
+use crate::connection::{map_libsql_err, WriteTx};
 use crate::vectors;
+
+/// Commit `result`'s transaction on `Ok`, roll back explicitly on `Err`
+/// (logging a rollback failure rather than propagating it), returning the
+/// original error either way — that's the failure the caller actually needs
+/// to see and react to.
+///
+/// Explicit rollback here — not `WriteTx`'s `Drop` backstop — is the primary
+/// error path: `commit()`/`rollback()` return a `Result` we can log and
+/// handle, which Drop's own rollback can't (it panics on failure instead).
+/// That said, this isn't fully panic-proof either — see
+/// [`crate::connection::WriteTx`]'s doc comment for the caveat: a
+/// persistently-failing COMMIT/ROLLBACK can still panic inside libsql before
+/// this function's error handling ever runs. Do not "simplify" the arms
+/// below away in favor of Drop on the strength of that caveat — explicit
+/// remains strictly better, handling and logging every failure Drop can't
+/// return at all.
+async fn finish_write_tx<T>(tx: WriteTx<'_>, result: Result<T, Error>) -> Result<T, Error> {
+    match result {
+        Ok(v) => {
+            tx.commit().await?;
+            Ok(v)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::error!(
+                    error = %rollback_err,
+                    "explicit rollback after write failure also failed"
+                );
+            }
+            Err(e)
+        }
+    }
+}
 
 pub(crate) async fn upsert_chunks(
     store: &TenantStore,
@@ -21,39 +54,25 @@ pub(crate) async fn upsert_chunks(
             ));
         }
     }
-    let conn = store.conn().conn().await;
     let count = records.len();
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = upsert_chunks_inner(&conn, &records, store.encoding()).await;
-    match inner {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    let tx = store.conn().write_tx().await?;
+    // The plain (non-`_and_blocks`) path carries no `Resource`, so it has no
+    // `external_last_modified` value to give — see `upsert_chunks_inner`'s
+    // `ON CONFLICT` comment: `None` here nulls the column out if this call
+    // happens to hit an existing resource_id, same as every sibling column.
+    let result = upsert_chunks_inner(&tx, &records, store.encoding(), None)
+        .await
+        .map(|()| count);
+    finish_write_tx(tx, result).await
 }
 
 pub(crate) async fn delete_by_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<usize, Error> {
-    let conn = store.conn().conn().await;
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = delete_document_inner(&conn, store.store_id(), resource_id).await;
-    match inner {
-        Ok(count) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    let tx = store.conn().write_tx().await?;
+    let result = delete_document_inner(&tx, store.store_id(), resource_id).await;
+    finish_write_tx(tx, result).await
 }
 
 /// Connection-level helper: delete all chunks and the resource row for a
@@ -61,12 +80,12 @@ pub(crate) async fn delete_by_resource(
 /// `resources`).
 ///
 /// This is the shared implementation behind both the standalone
-/// `delete_by_resource` (wrapped in its own BEGIN/COMMIT-or-ROLLBACK, used for
-/// source removal / store clearing) and the in-transaction delete performed by
+/// `delete_by_resource` (wrapped in its own `write_tx`, used for source
+/// removal / store clearing) and the in-transaction delete performed by
 /// `upsert_chunks_and_blocks` when replacing a document (issue #79): the
-/// latter runs this against the transaction's own connection, between
-/// `BEGIN` and the replacement insert, so a failure anywhere in that
-/// transaction rolls back the delete along with the insert.
+/// latter runs this against the transaction's own connection, before the
+/// replacement insert, so a failure anywhere in that transaction rolls back
+/// the delete along with the insert.
 async fn delete_document_inner(
     conn: &Connection,
     store_id: &str,
@@ -88,26 +107,48 @@ async fn delete_document_inner(
     Ok(chunk_count as usize)
 }
 
+/// Connection-level helper: delete a document's chunks and blocks only —
+/// the `resources` row is left in place.
+///
+/// Used by `upsert_chunks_and_blocks`'s same-resource-id replace path (a
+/// policy-only re-index, where `replaces_resource_id == Some(resource_id)`):
+/// leaving the `resources` row in place means the INSERT that follows hits
+/// its `ON CONFLICT(store_id, id) DO UPDATE` instead of a fresh insert, and
+/// `added_at` — deliberately absent from that `DO UPDATE SET` list — is
+/// preserved for free. `modified_at`/`index_updated_at`/etc. still refresh
+/// normally, since they're bound from the new scan and ARE in that SET list.
+///
+/// Both `chunks` and `blocks` carry their own `ON DELETE CASCADE` FK to
+/// `resources(store_id, id)` (`schema.rs`), which is why
+/// `delete_document_inner` can get away with deleting `chunks` explicitly and
+/// letting `blocks` cascade off the `resources` row's own delete — but with
+/// `resources` staying put here, both need an explicit delete.
+async fn delete_chunks_and_blocks_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<usize, Error> {
+    let chunk_count = conn
+        .execute(
+            "DELETE FROM chunks WHERE store_id = ? AND resource_id = ?",
+            params![store_id.to_string(), resource_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    conn.execute(
+        "DELETE FROM blocks WHERE store_id = ? AND resource_id = ?",
+        params![store_id.to_string(), resource_id.to_string()],
+    )
+    .await
+    .map_err(map_libsql_err)?;
+    Ok(chunk_count as usize)
+}
+
 pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Result<usize, Error> {
-    if store_id != store.store_id() {
-        return tenant_violation(format!(
-            "delete_by_store requested store_id '{store_id}' but handle owns store_id '{handle}'",
-            handle = store.store_id()
-        ));
-    }
-    let conn = store.conn().conn().await;
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = delete_by_store_inner(&conn, store_id).await;
-    match inner {
-        Ok(chunk_count) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(chunk_count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    ensure_store_id(store, store_id, "delete_by_store")?;
+    let tx = store.conn().write_tx().await?;
+    let result = delete_by_store_inner(&tx, store_id).await;
+    finish_write_tx(tx, result).await
 }
 
 async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usize, Error> {
@@ -127,11 +168,199 @@ async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usiz
     Ok(chunk_count as usize)
 }
 
-fn tenant_violation<T>(message: String) -> Result<T, Error> {
-    Err(Error::Internal {
-        message,
-        correlation_id: "store_handle_tenant_violation".to_string(),
-    })
+/// Rewrite an existing resource row's metadata in place (issue #176's
+/// metadata-only incremental update) — no chunks/blocks/embeddings touched.
+///
+/// Own `write_tx`, mirroring `delete_by_resource`/`upsert_blocks` above
+/// rather than `upsert_chunks_and_blocks`'s inline-`async` composition: this
+/// is a single-statement write with nothing else to compose it with.
+pub(crate) async fn update_resource_metadata(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+    record: &ResourceRecord,
+) -> Result<(), Error> {
+    ensure_store_id(store, store_id, "update_resource_metadata")?;
+    let tx = store.conn().write_tx().await?;
+    let result = update_resource_metadata_inner(&tx, store_id, resource_id, record).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn update_resource_metadata_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+    record: &ResourceRecord,
+) -> Result<(), Error> {
+    let metadata_json = serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
+        message: format!("update_resource_metadata metadata serialize: {e}"),
+        correlation_id: "store_handle_update_metadata".to_string(),
+    })?;
+    let title = record.metadata.title();
+    // One write-time clock reading for this write, mirroring
+    // `upsert_chunks_inner`'s single `now_rfc3339()` call per batch — see
+    // `ResourceRecord`'s doc comment for why `index_updated_at` isn't a
+    // caller-supplied field.
+    let index_updated_at = localdb_core::ingestion::now_rfc3339();
+    let rows_affected = conn
+        .execute(
+            "UPDATE resources SET
+                 metadata_json         = ?,
+                 title                 = ?,
+                 external_id           = ?,
+                 external_etag         = ?,
+                 external_last_modified = ?,
+                 modified_at           = ?,
+                 date_original         = ?,
+                 date_parsed           = ?,
+                 index_updated_at      = ?
+             WHERE store_id = ? AND id = ?",
+            params![
+                metadata_json.as_str(),
+                title,
+                record.external_id.as_deref(),
+                record.external_etag.as_deref(),
+                record.external_last_modified.as_deref(),
+                record.modified_at.as_deref(),
+                record.date_original.as_deref(),
+                record.date_parsed.as_deref(),
+                index_updated_at.as_str(),
+                store_id.to_string(),
+                resource_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    if rows_affected == 0 {
+        // The row vanished — a concurrent delete raced this update. Report
+        // it rather than silently succeeding: the caller's `DocumentIndex`
+        // entry would otherwise be stamped with a metadata_hash for a
+        // resource_id the store no longer has any row for, which the next
+        // run's skip-check would compare against a phantom.
+        return Err(Error::ResourceNotFound {
+            id: resource_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Record a feed liveness probe's outcome for one resource: refresh its
+/// stored conditional-GET validators and `last_checked_at`, nothing else.
+/// Backs `RetrievalStore::touch_resource_liveness`.
+///
+/// The liveness sweep is not the only writer of `last_checked_at`: the entry
+/// recheck gate's own fetches, `url` sources, and single-document feed mode
+/// advance the same column through the single-column `touch_resource_checked`
+/// below, which leaves the validator pair alone because those paths already
+/// wrote it through their own conditional-GET write.
+///
+/// Deliberately does NOT touch `index_updated_at` — see that trait method's
+/// doc comment for why: a liveness probe writes no content and no metadata,
+/// so bumping the "we last wrote this resource's stored state" clock would
+/// misreport it as re-written. `last_checked_at` (schema v8) is its own
+/// column for exactly this reason.
+pub(crate) async fn touch_resource_liveness(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Result<(), Error> {
+    ensure_store_id(store, store_id, "touch_resource_liveness")?;
+    let tx = store.conn().write_tx().await?;
+    let result =
+        touch_resource_liveness_inner(&tx, store_id, resource_id, etag, last_modified).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn touch_resource_liveness_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Result<(), Error> {
+    // One write-time clock reading for this write, mirroring
+    // `update_resource_metadata_inner`'s single `now_rfc3339()` call — but
+    // bound to `last_checked_at`, never `index_updated_at`; see this
+    // function's doc comment.
+    let last_checked_at = localdb_core::ingestion::now_rfc3339();
+    let rows_affected = conn
+        .execute(
+            "UPDATE resources SET
+                 external_etag          = ?,
+                 external_last_modified = ?,
+                 last_checked_at        = ?
+             WHERE store_id = ? AND id = ?",
+            params![
+                etag,
+                last_modified,
+                last_checked_at.as_str(),
+                store_id.to_string(),
+                resource_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    if rows_affected == 0 {
+        // The row vanished — a concurrent delete raced this probe. Report it
+        // rather than silently succeeding, mirroring
+        // `update_resource_metadata_inner`'s same guard.
+        return Err(Error::ResourceNotFound {
+            id: resource_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Advance `resources.last_checked_at` for one resource to now, and write
+/// nothing else — not the validators, not `index_updated_at`. Backs
+/// `RetrievalStore::touch_resource_checked`.
+///
+/// The single-column counterpart to `touch_resource_liveness` above, used
+/// outside the feed liveness sweep (entry recheck gate, `url` sources,
+/// single-document feed mode) — see that trait method's doc comment for why
+/// it writes only this one column.
+pub(crate) async fn touch_resource_checked(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<(), Error> {
+    ensure_store_id(store, store_id, "touch_resource_checked")?;
+    let tx = store.conn().write_tx().await?;
+    let result = touch_resource_checked_inner(&tx, store_id, resource_id).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn touch_resource_checked_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<(), Error> {
+    // One write-time clock reading for this write, mirroring
+    // `touch_resource_liveness_inner`'s single `now_rfc3339()` call — bound
+    // to `last_checked_at` only; see this function's doc comment.
+    let last_checked_at = localdb_core::ingestion::now_rfc3339();
+    let rows_affected = conn
+        .execute(
+            "UPDATE resources SET last_checked_at = ?1 WHERE store_id = ?2 AND id = ?3",
+            params![
+                last_checked_at.as_str(),
+                store_id.to_string(),
+                resource_id.to_string()
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    if rows_affected == 0 {
+        // The row vanished — a concurrent delete raced this check. Report it
+        // rather than silently succeeding, mirroring
+        // `touch_resource_liveness_inner`'s same guard.
+        return Err(Error::ResourceNotFound {
+            id: resource_id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn upsert_blocks(
@@ -139,50 +368,24 @@ pub(crate) async fn upsert_blocks(
     resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
-    let conn = store.conn().conn().await;
-    for block in blocks {
-        let kind_str = block.kind.kind_str();
-        let metadata_json =
-            serde_json::to_string(&block.kind).map_err(|e| localdb_core::Error::Internal {
-                message: format!("block metadata serialize: {e}"),
-                correlation_id: "store_upsert_blocks_meta".to_string(),
-            })?;
-        let location_json = block
-            .location
-            .as_ref()
-            .map(|loc| serde_json::to_string(loc).unwrap_or_default());
-        conn.execute(
-            "INSERT INTO blocks (store_id, resource_id, seq, kind, text, metadata_json, location_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(store_id, resource_id, seq) DO UPDATE SET
-                 kind = excluded.kind,
-                 text = excluded.text,
-                 metadata_json = excluded.metadata_json,
-                 location_json = excluded.location_json",
-            libsql::params![
-                store.store_id(),
-                resource_id,
-                block.seq as i64,
-                kind_str,
-                block.text.as_str(),
-                metadata_json.as_str(),
-                location_json.as_deref(),
-            ],
-        )
-        .await
-        .map_err(crate::connection::map_libsql_err)?;
-    }
-    Ok(())
+    let tx = store.conn().write_tx().await?;
+    let result = upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await;
+    finish_write_tx(tx, result).await
 }
 
 async fn upsert_chunks_inner(
     conn: &Connection,
     records: &[ChunkRecord],
     encoding: VectorEncoding,
+    external_last_modified: Option<&str>,
 ) -> Result<(), Error> {
     // Track which (store_id, resource_id) pairs we've already upserted in this
     // batch so we don't issue duplicate resource upserts.
     let mut seen_resources: HashMap<(String, String), bool> = HashMap::new();
+    // One write-time clock reading for the whole batch: every resource
+    // touched by this call was written "now", by definition of this call
+    // happening now. See specs/02-domain-model.md §2.
+    let index_updated_at = localdb_core::ingestion::now_rfc3339();
 
     for record in records {
         // `record.resource_id` maps to the `id` column on `resources`.
@@ -196,20 +399,50 @@ async fn upsert_chunks_inner(
             let title = record.metadata.title();
             conn.execute(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
-                     uri, title, mime, content_hash, added_at, modified_at, origin_store,
-                     policy_version, metadata_json, extractor_version)
-                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
+                     uri, title, mime, content_hash, added_at, modified_at, index_updated_at,
+                     origin_store, policy_version, metadata_json, extractor_version,
+                     date_original, date_parsed, external_id, external_etag,
+                     external_last_modified)
+                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1', ?, ?, ?, ?, ?)
                  ON CONFLICT(store_id, id) DO UPDATE SET
-                     source_id      = excluded.source_id,
-                     ingestor_kind  = excluded.ingestor_kind,
-                     uri            = excluded.uri,
-                     title          = excluded.title,
-                     mime           = excluded.mime,
-                     content_hash   = excluded.content_hash,
-                     modified_at    = excluded.modified_at,
-                     origin_store   = excluded.origin_store,
-                     policy_version = excluded.policy_version,
-                     metadata_json  = excluded.metadata_json",
+                     source_id        = excluded.source_id,
+                     ingestor_kind    = excluded.ingestor_kind,
+                     uri              = excluded.uri,
+                     title            = excluded.title,
+                     mime             = excluded.mime,
+                     content_hash     = excluded.content_hash,
+                     modified_at      = excluded.modified_at,
+                     index_updated_at = excluded.index_updated_at,
+                     origin_store     = excluded.origin_store,
+                     policy_version   = excluded.policy_version,
+                     metadata_json    = excluded.metadata_json,
+                     date_original    = excluded.date_original,
+                     date_parsed      = excluded.date_parsed,
+                     external_id      = excluded.external_id,
+                     external_etag    = excluded.external_etag,
+                     external_last_modified = excluded.external_last_modified",
+                // `external_last_modified` IS included in `ON CONFLICT`,
+                // same as every other column here: a same-resource-id
+                // replace (a policy-only reindex — see
+                // `delete_chunks_and_blocks_inner`'s doc comment for why
+                // that case keeps the `resources` row in place rather than
+                // deleting it first) hits this conflict branch, not a fresh
+                // `INSERT`, and must still land the freshly-fetched
+                // validator `upsert_chunks_and_blocks` was just given.
+                //
+                // The cost: the plain (non-`_and_blocks`) `upsert_chunks`
+                // below has no per-call value for this column (it isn't a
+                // `ChunkRecord` field — see this function's trailing
+                // parameter and `RetrievalStore::upsert_chunks_and_blocks`'s
+                // doc comment) and always passes `None`, so a bare
+                // `upsert_chunks` call that happens to hit an existing
+                // resource_id nulls this column out — exactly the same
+                // contract `external_etag`/`modified_at`/the date columns
+                // above already have for that same caller (each is fully
+                // overwritten by whatever the `ChunkRecord` says, with no
+                // "leave unchanged" option). `upsert_chunks` is not used by
+                // any production ingestion path today; only
+                // `upsert_chunks_and_blocks` is.
                 params![
                     record.store_id.as_str(),
                     record.resource_id.as_str(), // id column
@@ -220,10 +453,16 @@ async fn upsert_chunks_inner(
                     record.mime.as_deref(),
                     record.content_hash.as_str(),
                     record.fetched_at.as_str(), // added_at column
-                    record.fetched_at.as_str(), // modified_at column
+                    record.modified_at.as_deref(),
+                    index_updated_at.as_str(),
                     record.origin_store.as_str(),
                     record.policy_version.as_str(),
                     metadata_json.as_str(),
+                    record.date_original.as_deref(),
+                    record.date_parsed.as_deref(),
+                    record.external_id.as_deref(),
+                    record.external_etag.as_deref(),
+                    external_last_modified,
                 ],
             )
             .await
@@ -240,15 +479,21 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
-        // location_json shape: `{"start": N, "end": N, "window_block_seqs": [..]}`.
-        // `window_block_seqs` is included only for message-window chunks (#129) —
-        // plain chunks keep the original `{start, end}` shape.
+        // location_json shape:
+        // `{"start": N, "end": N, "window_block_seqs": [..], "page": N}`.
+        // `window_block_seqs` is included only for message-window chunks (#129)
+        // and `page` only for paginated formats (#103); a plain chunk keeps the
+        // original `{start, end}` shape. Missing keys read back as their
+        // defaults (empty / None) — no schema/DDL change (#103).
         let mut location_value = serde_json::json!({
             "start": record.span.start,
             "end": record.span.end,
         });
         if !record.window_block_seqs.is_empty() {
             location_value["window_block_seqs"] = serde_json::json!(record.window_block_seqs);
+        }
+        if let Some(page) = record.page {
+            location_value["page"] = serde_json::json!(page);
         }
         let location_json =
             serde_json::to_string(&location_value).map_err(|e| Error::Internal {
@@ -298,64 +543,70 @@ async fn upsert_chunks_inner(
 /// replacing an existing document first.
 ///
 /// Unlike calling `upsert_chunks` and `upsert_blocks` separately (two
-/// transactions), this wraps both writes in one BEGIN/COMMIT so the resource
+/// transactions), this wraps both writes in one `write_tx` so the resource
 /// can never appear indexed (chunks present) but un-blocked.
 ///
-/// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks,
-/// blocks, and resource row are deleted **inside this same transaction**,
-/// before the new records are inserted (issue #79). This closes the residual
-/// same-run window from the A6 design decision (`docs/design-decisions.md`):
-/// previously the replace delete ran in its own transaction, so a write
-/// failure in the upsert that followed left the old chunks gone for the rest
-/// of the run. Folding the delete into this transaction means a failure
-/// anywhere below (including the delete-then-reinsert of the very same
-/// `resource_id`, for a policy-only re-index) rolls back everything and
-/// leaves the old resource intact and searchable.
+/// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks
+/// and blocks are deleted **inside this same transaction**, before the new
+/// records are inserted. A replace delete in its own separate transaction
+/// would leave the old chunks gone for the rest of the run if the upsert
+/// that followed then failed. Folding the delete into this transaction
+/// means a failure anywhere below rolls back everything and leaves the old
+/// resource intact and searchable.
+///
+/// Whether the old `resources` row itself is deleted depends on whether
+/// `old_id` names the *same* resource being written here (a policy-only
+/// re-index — chunk boundaries can change under a new chunking policy even
+/// though the content and its identity haven't) or a genuinely different one
+/// (content changed enough to mint a new content-addressed ID): see
+/// `delete_chunks_and_blocks_inner`'s doc comment for why the same-ID case
+/// keeps the row in place.
 pub(crate) async fn upsert_chunks_and_blocks(
     store: &TenantStore,
     resource_id: &str,
     records: Vec<ChunkRecord>,
     blocks: &[localdb_core::block::Block],
     replaces_resource_id: Option<&str>,
+    external_last_modified: Option<&str>,
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
-            return Err(localdb_core::Error::Internal {
-                message: format!(
-                    "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
-                    id = record.id,
-                    rec = record.store_id,
-                    handle = store.store_id()
-                ),
-                correlation_id: "store_handle_tenant_violation".to_string(),
-            });
+            return tenant_violation(format!(
+                "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
+                id = record.id,
+                rec = record.store_id,
+                handle = store.store_id()
+            ));
         }
     }
-    let conn = store.conn().conn().await;
     let count = records.len();
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = async {
+    let tx = store.conn().write_tx().await?;
+    // Inline `async` block, not a separate closure/helper: it only borrows
+    // `&tx` (and the still-owned `store`/`records`/`resource_id`/`blocks`/
+    // `replaces_resource_id` locals) for the duration of this single
+    // `.await` right below — an ordinary borrow the compiler checks against
+    // this function's own scope, no `'static` bound or boxing required.
+    let result: Result<usize, localdb_core::Error> = async {
         if let Some(old_id) = replaces_resource_id {
-            delete_document_inner(&conn, store.store_id(), old_id).await?;
+            if old_id == resource_id {
+                delete_chunks_and_blocks_inner(&tx, store.store_id(), old_id).await?;
+            } else {
+                delete_document_inner(&tx, store.store_id(), old_id).await?;
+            }
         }
-        upsert_chunks_inner(&conn, &records, store.encoding()).await?;
-        upsert_blocks_inner(&conn, store.store_id(), resource_id, blocks).await?;
-        Ok::<(), localdb_core::Error>(())
+        upsert_chunks_inner(&tx, &records, store.encoding(), external_last_modified).await?;
+        upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await?;
+        Ok(count)
     }
     .await;
-    match inner {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    finish_write_tx(tx, result).await
 }
 
-/// Inner (connection-level) helper for upserting blocks within an existing transaction.
+/// Inner (connection-level) helper for upserting blocks within an existing
+/// `write_tx`. The sole implementation shared by both the standalone
+/// `upsert_blocks` (its own single-purpose `write_tx`) and
+/// `upsert_chunks_and_blocks` (blocks upserted as one step of a larger
+/// transaction).
 async fn upsert_blocks_inner(
     conn: &Connection,
     store_id: &str,
@@ -395,110 +646,4 @@ async fn upsert_blocks_inner(
         .map_err(map_libsql_err)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use localdb_core::metadata::Metadata;
-    use localdb_core::types::{SourceKind, Span, StoreVisibility};
-    use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
-    use tempfile::tempdir;
-
-    use crate::SqliteBackend;
-
-    /// Regression test for issue C4 on the tenant read path
-    /// (`tenant::rows::row_to_chunk_record_strict`, via
-    /// `connection::parse_metadata_json_lenient`): a resource row with
-    /// syntactically invalid `metadata_json` must still be readable through
-    /// `get_chunk` — falling back to `Metadata::default()` — rather than
-    /// erroring the whole read. This exercises the same shared helper that
-    /// `registry::documents::find_document` covers on the registry side
-    /// (`registry::tests::find_document_tolerates_invalid_metadata_json`).
-    #[tokio::test]
-    async fn get_chunk_tolerates_invalid_metadata_json() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-        let backend = SqliteBackend::open(StoreBackendConfig::local_path(
-            path,
-            4,
-            VectorEncoding::Float32,
-        ))
-        .await
-        .unwrap();
-
-        backend
-            .upsert_store(&StoreRow {
-                id: "store-1".to_string(),
-                name: "notes".to_string(),
-                visibility: StoreVisibility::Private,
-                backend: "libsql".to_string(),
-                indexing_policy: "{}".to_string(),
-                policy_version: "v1".to_string(),
-                created_at: "2026-07-01T00:00:00Z".to_string(),
-            })
-            .await
-            .unwrap();
-        backend
-            .upsert_source(&SourceRow {
-                id: "src-1".to_string(),
-                store_id: "store-1".to_string(),
-                kind: SourceKind::Path,
-                root: Some("/docs".to_string()),
-                url: None,
-                include: vec![],
-                exclude: vec![],
-                preset: "prose".to_string(),
-                refresh: None,
-                created_at: "2026-07-01T00:00:00Z".to_string(),
-            })
-            .await
-            .unwrap();
-
-        let handle = backend.retrieval_store("store-1").await.unwrap();
-        let record = localdb_core::ChunkRecord {
-            id: "chunk-1".to_string(),
-            resource_id: "doc-1".to_string(),
-            store_id: "store-1".to_string(),
-            text: "some chunk text".to_string(),
-            span: Span::new(0, 15),
-            heading_path: vec![],
-            embedding: vec![0.1, 0.2, 0.3, 0.4],
-            policy_version: "v1".to_string(),
-            fetched_at: "2026-07-01T00:00:00Z".to_string(),
-            content_hash: "abc123".to_string(),
-            origin_store: "store-1".to_string(),
-            source_id: "src-1".to_string(),
-            ingestor_kind: "path".to_string(),
-            mime: Some("text/markdown".to_string()),
-            uri: "file:///docs/doc.md".to_string(),
-            metadata: Metadata::default(),
-            block_seq: 0,
-            seq_in_block: 0,
-            block_kind: None,
-            window_block_seqs: vec![],
-        };
-        handle.upsert_chunks(vec![record]).await.unwrap();
-
-        // Corrupt the persisted metadata_json directly with syntactically
-        // invalid JSON.
-        let conn = backend.conn.conn().await;
-        conn.execute(
-            "UPDATE resources SET metadata_json = ? WHERE id = ?",
-            libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
-        )
-        .await
-        .unwrap();
-        drop(conn);
-
-        let chunk = handle
-            .get_chunk("chunk-1")
-            .await
-            .unwrap()
-            .expect("chunk must still be found despite invalid metadata_json");
-        assert_eq!(
-            chunk.metadata,
-            Metadata::default(),
-            "invalid metadata_json must fall back to default metadata, not error the read"
-        );
-    }
 }

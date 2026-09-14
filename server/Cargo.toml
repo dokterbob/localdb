@@ -1,19 +1,44 @@
 [package]
-name = "server"
+name = "localdb-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "HTTP API daemon: axum REST API, file watching, job queue, unix socket"
 
+[lib]
+# Keep the short crate name in code (`use server::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "server"
+
 [dependencies]
-localdb-core = { path = "../core" }
-store-libsql = { path = "../store-libsql" }
-embed = { path = "../embed" }
-mcp = { path = "../mcp" }
+localdb-core = { path = "../core", version = "0.2.0" }
+localdb-store-libsql = { path = "../store-libsql", version = "0.2.0" }
+localdb-embed = { path = "../embed", version = "0.2.0" }
+localdb-extract = { path = "../extract", version = "0.2.0" }
+localdb-fetch = { path = "../fetch", version = "0.2.0" }
+localdb-ingest = { path = "../ingest", version = "0.2.0" }
+localdb-mcp = { path = "../mcp", version = "0.2.0" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+# `axum_extra::extract::Query` (issue #187 review, finding F7): unlike
+# `axum::extract::Query`, it deserializes repeated query keys into a
+# `Vec<T>` field via `serde_html_form` — needed for `GET /status`'s
+# repeatable `?store=` scoping param (`server/src/handlers/status.rs`),
+# mirroring the CLI's repeatable `--store` flag.
+axum-extra = { version = "0.12", default-features = false, features = ["query"] }
+# `futures::stream::unfold` builds the `GET /v1/jobs/{id}/events` SSE stream
+# (issue #83) — `axum::response::sse::Sse` requires its payload to implement
+# `futures_util::stream::Stream`, which `futures` re-exports. Already a
+# pinned workspace dependency (`futures = "0.3"` in the root `Cargo.toml`,
+# already resolved in `Cargo.lock` as a transitive dependency of `axum`
+# itself) — this only newly *directly* depends on it for `server`, it does
+# not add a new crate to the dependency graph.
+futures = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,6 +52,23 @@ notify-debouncer-mini = "0.4"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
+
+# `test-support` feature on our own already-normal dependency: unlocks
+# `SqliteBackend::set_last_checked_at_for_test` for
+# `job_exec/tests/feed_liveness_sweep.rs` (and any sibling that needs to
+# backdate `resources.last_checked_at` past the recheck floor). Mirrors
+# `ingest/Cargo.toml`'s identical pattern for `localdb-core`'s own
+# `test-support` feature.
+localdb-store-libsql = { path = "../store-libsql", features = ["test-support"] }
+
+# Local HTTP server for `run_job`'s real-ingestion tests over a feed source
+# (job_exec/tests/feed_validator_persistence.rs) — `run_job`'s fetchers are
+# concrete `HttpUrlFetcher`s, not a trait object, so exercising conditional
+# GET end to end needs a real (if local) HTTP origin rather than a scripted
+# fake. Already resolved in the workspace lockfile as `fetch`'s own dev
+# dependency; this only newly depends on it directly.
+wiremock = "0.6"
 
 # `FakeAuthStore` for oauth.rs's unit tests (T7) — exercises
 # `validate_authorize_params` against an in-memory `AuthService` instead of a

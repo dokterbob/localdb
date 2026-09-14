@@ -7,8 +7,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
 /// Prefix on every minted opaque secret — access/refresh tokens, API keys,

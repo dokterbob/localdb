@@ -6,7 +6,7 @@ use super::sql::{row_to_store, visibility_to_sql};
 use crate::connection::{map_libsql_err, LibsqlDb};
 
 pub(crate) async fn upsert_store(db: &LibsqlDb, store: &StoreRow) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "INSERT INTO stores (id, name, visibility, backend, indexing_policy,
                 policy_version, created_at)
@@ -33,7 +33,7 @@ pub(crate) async fn upsert_store(db: &LibsqlDb, store: &StoreRow) -> Result<(), 
 }
 
 pub(crate) async fn delete_store(db: &LibsqlDb, id: &str) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "DELETE FROM stores WHERE id = ?",
@@ -45,7 +45,7 @@ pub(crate) async fn delete_store(db: &LibsqlDb, id: &str) -> Result<bool, Error>
 }
 
 pub(crate) async fn get_store(db: &LibsqlDb, id: &str) -> Result<Option<StoreRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT id, name, visibility, backend, indexing_policy,
@@ -65,7 +65,7 @@ pub(crate) async fn get_store_by_name(
     db: &LibsqlDb,
     name: &str,
 ) -> Result<Option<StoreRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT id, name, visibility, backend, indexing_policy,
@@ -82,7 +82,7 @@ pub(crate) async fn get_store_by_name(
 }
 
 pub(crate) async fn list_stores(db: &LibsqlDb) -> Result<Vec<StoreRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT id, name, visibility, backend, indexing_policy,

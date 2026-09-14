@@ -5,8 +5,8 @@
 //! table. Each `#[tool]` method here resolves the caller's `Principal`
 //! (see below), resolves the current store list via `self.provider`
 //! (realtime — see `store_provider.rs`), and then forwards to a `tools::*`
-//! fn — all validation and business logic lives in `tools.rs`, which keeps
-//! its pure `&[AvailableStore]` signatures unchanged.
+//! fn — tool validation and retrieval live in `tools`, with document-registry
+//! access restricted to the resolved visible stores.
 //!
 //! ## Principal resolution (specs/05-surfaces.md §4, T3)
 //!
@@ -42,15 +42,16 @@
 use std::sync::Arc;
 
 use rmcp::{
+    RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Extensions, Implementation, ServerCapabilities, ServerInfo},
     service::RequestContext,
-    tool, tool_handler, tool_router, RoleServer, ServerHandler,
+    tool, tool_handler, tool_router,
 };
 
-use localdb_core::{auth::Principal, types::StoreVisibility, Embedder, Error};
+use localdb_core::{Embedder, Error, StoreBackend, auth::Principal, types::StoreVisibility};
 
-use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
+use crate::args::{GetChunksArgs, GetDocumentArgs, ListDocumentsArgs, SearchArgs};
 use crate::store_provider::StoreProvider;
 use crate::tools::{self, AvailableStore};
 
@@ -70,6 +71,7 @@ fn provider_error(e: &Error) -> CallToolResult {
 /// transports that carry no per-request identity (see the module doc).
 #[derive(Clone)]
 pub struct McpHandler {
+    pub backend: Arc<dyn StoreBackend>,
     pub provider: Arc<dyn StoreProvider>,
     pub embedder: Arc<dyn Embedder>,
     pub allow_write: bool,
@@ -86,12 +88,14 @@ impl McpHandler {
     /// enforces auth so a missing principal fails closed.
     pub fn new(
         provider: Arc<dyn StoreProvider>,
+        backend: Arc<dyn StoreBackend>,
         embedder: Arc<dyn Embedder>,
         allow_write: bool,
         default_principal: Option<Principal>,
     ) -> Self {
         Self {
             provider,
+            backend,
             embedder,
             allow_write,
             default_principal,
@@ -119,6 +123,7 @@ impl McpHandler {
     ///    enforced-auth daemon a missing extension means the auth layer was
     ///    bypassed, and answering with full access would be privilege
     ///    escalation.
+    #[allow(clippy::result_large_err)] // CallToolResult follows the tool layer’s unboxed error convention.
     fn principal_for(&self, extensions: &Extensions) -> Result<Principal, CallToolResult> {
         if let Some(parts) = extensions.get::<http::request::Parts>() {
             if let Some(principal) = parts.extensions.get::<Principal>() {
@@ -140,6 +145,7 @@ impl McpHandler {
 
     /// Resolve the current store list, or `None` (having already produced
     /// the tool-error result) on provider failure.
+    #[allow(clippy::result_large_err)] // CallToolResult follows the tool layer’s unboxed error convention.
     async fn resolve_stores(&self) -> Result<Vec<AvailableStore>, CallToolResult> {
         self.provider
             .available_stores()
@@ -174,6 +180,7 @@ impl McpHandler {
     /// nothing named to be "forbidden" from. `search`'s `stores` filter is
     /// the one call site with an explicit name, so it uses
     /// `authorize_and_resolve_with_full` instead (see below).
+    #[allow(clippy::result_large_err)] // CallToolResult follows the tool layer’s unboxed error convention.
     async fn authorize_and_resolve(
         &self,
         extensions: &Extensions,
@@ -188,6 +195,7 @@ impl McpHandler {
     /// distinguish a named store that's unreadable (present in `full`,
     /// dropped from the visible set) from one that's genuinely unknown
     /// (absent from `full` too); see `forbidden_for_named_unreadable_store`.
+    #[allow(clippy::result_large_err)] // CallToolResult follows the tool layer’s unboxed error convention.
     async fn authorize_and_resolve_with_full(
         &self,
         extensions: &Extensions,
@@ -198,28 +206,26 @@ impl McpHandler {
         Ok((stores, visible))
     }
 
-    /// specs/05-surfaces.md §3.1: a store name in `requested` that exists in
-    /// `full` (the unfiltered store list) but was dropped from `visible` by
-    /// D7 filtering is `forbidden`, not `store_not_found` — the caller named
-    /// a real store and was refused, mirroring the HTTP surface's
-    /// `server::search_service::SearchService::query` (`store_filter` naming
-    /// an ungranted store -> 403). A name absent from `full` returns `None`
-    /// here and falls through unchanged to the tool's own `store_not_found`
-    /// handling (it only ever sees `visible`, so it's not found there
-    /// either). Returns the *first* unreadable name found, matching the HTTP
-    /// surface's fail-fast-on-first-bad-name behavior.
+    /// Resolve names and IDs against the full registry before checking access.
+    /// Reusing the tool resolver preserves ID precedence when a visible store's
+    /// name collides with an unreadable store's ID.
     fn forbidden_for_named_unreadable_store(
         full: &[AvailableStore],
         visible: &[AvailableStore],
         requested: &[String],
     ) -> Option<CallToolResult> {
-        for name in requested {
-            let exists = full.iter().any(|s| &s.descriptor.name == name);
-            let is_visible = visible.iter().any(|s| &s.descriptor.name == name);
-            if exists && !is_visible {
+        if requested.is_empty() {
+            return None;
+        }
+        let selected = match tools::select_mcp_stores(full, requested) {
+            Ok(stores) => stores,
+            Err(error) => return Some(error),
+        };
+        for store in selected {
+            if !visible.iter().any(|s| s.descriptor.id == store.id) {
                 return Some(tools::typed_error(
                     "forbidden",
-                    format!("you do not have access to store '{name}'"),
+                    format!("you do not have access to store '{}'", store.name),
                 ));
             }
         }
@@ -252,11 +258,20 @@ impl McpHandler {
         args: GetDocumentArgs,
         extensions: &Extensions,
     ) -> CallToolResult {
-        let stores = match self.authorize_and_resolve(extensions).await {
+        let (full, stores) = match self.authorize_and_resolve_with_full(extensions).await {
             Ok(s) => s,
             Err(result) => return result,
         };
-        tools::tool_get_document(&stores, args).await
+        if let Some(name) = &args.store {
+            if let Some(error) = Self::forbidden_for_named_unreadable_store(
+                &full,
+                &stores,
+                std::slice::from_ref(name),
+            ) {
+                return error;
+            }
+        }
+        tools::tool_get_document(&stores, self.backend.as_ref(), args).await
     }
 
     async fn get_chunks_inner(
@@ -264,11 +279,39 @@ impl McpHandler {
         args: GetChunksArgs,
         extensions: &Extensions,
     ) -> CallToolResult {
-        let stores = match self.authorize_and_resolve(extensions).await {
+        let (full, stores) = match self.authorize_and_resolve_with_full(extensions).await {
             Ok(s) => s,
             Err(result) => return result,
         };
+        if let Some(name) = &args.store {
+            if let Some(error) = Self::forbidden_for_named_unreadable_store(
+                &full,
+                &stores,
+                std::slice::from_ref(name),
+            ) {
+                return error;
+            }
+        }
         tools::tool_get_chunks(&stores, args).await
+    }
+
+    async fn list_documents_inner(
+        &self,
+        args: ListDocumentsArgs,
+        extensions: &Extensions,
+    ) -> CallToolResult {
+        let (full, stores) = match self.authorize_and_resolve_with_full(extensions).await {
+            Ok(s) => s,
+            Err(result) => return result,
+        };
+        if let Some(error) = Self::forbidden_for_named_unreadable_store(
+            &full,
+            &stores,
+            std::slice::from_ref(&args.store),
+        ) {
+            return error;
+        }
+        tools::tool_list_documents(&stores, self.backend.as_ref(), args).await
     }
 
     async fn list_stores_inner(&self, extensions: &Extensions) -> CallToolResult {
@@ -296,7 +339,9 @@ impl McpHandler {
     }
 
     /// Fetch the normalized text and metadata for a document by its ID.
-    #[tool(description = "Fetch the normalized text and metadata for a document by its ID or URI.")]
+    #[tool(
+        description = "Fetch the normalized text and metadata for a document by its ID or URI. Pass 'store' (id or name, e.g. from a search citation) to disambiguate when the same document id exists in multiple stores."
+    )]
     async fn get_document(
         &self,
         Parameters(args): Parameters<GetDocumentArgs>,
@@ -308,7 +353,7 @@ impl McpHandler {
     /// Fetch a document's chunks in order, paginated by offset/limit or by
     /// an anchor (anchor_chunk_id / anchor_block_seq) centered window.
     #[tool(
-        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit, or by an anchor_chunk_id/anchor_block_seq centered window (mutually exclusive with offset and with each other)."
+        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit, or by an anchor_chunk_id/anchor_block_seq centered window (mutually exclusive with offset and with each other). Pass 'store' (id or name, e.g. from a search citation) to disambiguate when the same document id exists in multiple stores."
     )]
     async fn get_chunks(
         &self,
@@ -325,6 +370,16 @@ impl McpHandler {
     )]
     async fn list_stores(&self, ctx: RequestContext<RoleServer>) -> CallToolResult {
         self.list_stores_inner(&ctx.extensions).await
+    }
+    #[tool(
+        description = "List every document registered in a store (required 'store': id or name), optionally filtered by 'source' id, paginated by offset/limit (default 50, max 200)."
+    )]
+    async fn list_documents(
+        &self,
+        Parameters(args): Parameters<ListDocumentsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.list_documents_inner(args, &ctx.extensions).await
     }
 }
 
@@ -404,6 +459,7 @@ mod tests {
     async fn list_stores_returns_tool_error_when_provider_fails() {
         let handler = McpHandler::new(
             Arc::new(ErrorStoreProvider),
+            Arc::new(crate::tools::StoresBackend::new(&[])),
             embedder(),
             false,
             Some(Principal::local_trust()),
@@ -413,16 +469,19 @@ mod tests {
         let text = result.content[0].as_text().unwrap().text.clone();
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "internal");
-        assert!(parsed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("backend unavailable"));
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("backend unavailable")
+        );
     }
 
     #[tokio::test]
     async fn handler_stays_usable_after_a_provider_error() {
         let handler = McpHandler::new(
             Arc::new(ErrorStoreProvider),
+            Arc::new(crate::tools::StoresBackend::new(&[])),
             embedder(),
             false,
             Some(Principal::local_trust()),
@@ -443,7 +502,13 @@ mod tests {
         // Same handler *shape* as the static case — proves a working
         // provider still round-trips normally through `resolve_stores`.
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
-        let handler = McpHandler::new(provider, embedder(), false, Some(Principal::local_trust()));
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            Some(Principal::local_trust()),
+        );
         let result = handler.list_stores_inner(&no_extensions()).await;
         assert_ne!(result.is_error, Some(true));
     }
@@ -456,7 +521,13 @@ mod tests {
         // with no injected Principal must produce an unauthorized tool
         // error — never full access.
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let result = handler.list_stores_inner(&no_extensions()).await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(error_code(&result), "unauthorized");
@@ -467,7 +538,13 @@ mod tests {
         // Even with no default (enforced mode), a Principal delivered via
         // http::request::Parts extensions authorizes the call.
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let result = handler
             .list_stores_inner(&http_extensions_with_principal(Principal::local_trust()))
             .await;
@@ -480,7 +557,13 @@ mod tests {
         // (against an empty store set the call trivially succeeds with no
         // stores, rather than erroring).
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let result = handler
             .list_stores_inner(&http_extensions_with_principal(member("bob")))
             .await;
@@ -491,7 +574,13 @@ mod tests {
     async fn default_local_trust_authorizes_embedded_calls() {
         // Embedded stdio: no HTTP Parts at all; default local_trust applies.
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
-        let handler = McpHandler::new(provider, embedder(), false, Some(Principal::local_trust()));
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            Some(Principal::local_trust()),
+        );
         let result = handler.list_stores_inner(&no_extensions()).await;
         assert_ne!(result.is_error, Some(true));
     }
@@ -501,7 +590,13 @@ mod tests {
         // Nothing constructs this today, but the lifted gate must hold no
         // matter how the principal arrived.
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
-        let handler = McpHandler::new(provider, embedder(), false, Some(member("carol")));
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            Some(member("carol")),
+        );
         let result = handler.list_stores_inner(&no_extensions()).await;
         assert_ne!(result.is_error, Some(true));
     }
@@ -538,7 +633,13 @@ mod tests {
             store_with_visibility("shared-docs", "shared"),
             store_with_visibility("secret-docs", "private"),
         ]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let result = handler
             .list_stores_inner(&http_extensions_with_principal(Principal::local_trust()))
             .await;
@@ -555,7 +656,13 @@ mod tests {
             store_with_visibility("ungranted-shared", "shared"),
             store_with_visibility("secret-private", "private"),
         ]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let principal = Principal {
             user_id: "u1".into(),
             name: "member-with-grant".into(),
@@ -581,12 +688,19 @@ mod tests {
             "ungranted",
             "shared",
         )]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let args = SearchArgs {
             query: "hello".to_string(),
             stores: Some(vec!["ungranted".to_string()]),
             limit: None,
             content_length: None,
+            filters: Default::default(),
         };
         let result = handler
             .search_inner(args, &http_extensions_with_principal(member("dana")))
@@ -604,7 +718,13 @@ mod tests {
             "granted-shared",
             "shared",
         )]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let principal = Principal {
             user_id: "u1".into(),
             name: "member-with-grant".into(),
@@ -616,6 +736,7 @@ mod tests {
             stores: Some(vec!["does-not-exist".to_string()]),
             limit: None,
             content_length: None,
+            filters: Default::default(),
         };
         let result = handler
             .search_inner(args, &http_extensions_with_principal(principal))
@@ -632,12 +753,19 @@ mod tests {
             store_with_visibility("shared-docs", "shared"),
             store_with_visibility("secret-docs", "private"),
         ]));
-        let handler = McpHandler::new(provider, embedder(), false, None);
+        let handler = McpHandler::new(
+            provider,
+            Arc::new(crate::tools::StoresBackend::new(&[])),
+            embedder(),
+            false,
+            None,
+        );
         let args = SearchArgs {
             query: "hello".to_string(),
             stores: Some(vec!["secret-docs".to_string()]),
             limit: None,
             content_length: None,
+            filters: Default::default(),
         };
         let result = handler
             .search_inner(
@@ -646,5 +774,18 @@ mod tests {
             )
             .await;
         assert_ne!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn named_store_authorization_preserves_id_precedence() {
+        let mut allowed = store_with_visibility("shadow", "shared");
+        allowed.descriptor.id = "allowed-id".into();
+        let mut denied = store_with_visibility("secret", "shared");
+        denied.descriptor.id = "shadow".into();
+        let full = vec![allowed.clone(), denied];
+        let error =
+            McpHandler::forbidden_for_named_unreadable_store(&full, &[allowed], &["shadow".into()])
+                .unwrap();
+        assert_eq!(error_code(&error), "forbidden");
     }
 }

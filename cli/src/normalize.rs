@@ -1,6 +1,6 @@
 use localdb_core::{
-    types::{SourceKind, StoreVisibility},
     Error, SourceRow,
+    types::{SourceKind, StoreVisibility},
 };
 use serde_json::json;
 
@@ -55,18 +55,51 @@ pub(crate) fn format_snippet(snippet: &str, max_chars: usize) -> String {
 }
 
 /// Print an error and exit with the correct exit code.
+///
+/// In `--json` mode the error envelope goes to **stdout**, not stderr —
+/// stdout is the only channel a `--json` caller is ever guaranteed to be
+/// pure JSON, success or failure (specs/05-surfaces.md §2, issue #260).
+/// stderr in `--json` mode carries diagnostics only (progress, warnings) and
+/// is never meant to be parsed, so nothing that lands there — including a
+/// local-model download's progress output — can corrupt a machine-readable
+/// result.
 pub fn exit_err(err: &Error, json_mode: bool) -> ! {
     let code = err.exit_code();
     if json_mode {
-        let v = json!({
+        print_json(&json!({
             "error": err.code(),
             "message": err.to_string(),
-        });
-        eprintln!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }));
     } else {
         eprintln!("error: {}", err);
     }
     std::process::exit(code);
+}
+
+/// Exit with a partial-batch `--json` result document, preserving whatever
+/// per-item results were already buffered.
+///
+/// A multi-`--store` `--json` loop (`source add`/`add`'s local and
+/// daemon-routed branches alike) that fails partway through — after at least
+/// one earlier item already succeeded — must not silently discard the
+/// buffered results. (The fuller validate-then-persist restructuring across
+/// the multi-argument axis is tracked separately as #174.) Mirrors
+/// `cmds::index::report_index_outcomes`'s existing pattern: print a
+/// `"status"`-tagged JSON document to stdout, then exit explicitly. Both this
+/// and plain `exit_err` write to stdout; this helper exists because `results`
+/// is additional output data a caller may need to preserve, and `exit_err`'s
+/// bare `{"error", "message"}` shape has no field for it.
+///
+/// Only meaningful in `--json` mode: non-JSON output already prints each
+/// success as it happens, so callers should keep using `exit_err` directly
+/// when `!ctx.json` — there is nothing buffered to lose.
+pub(crate) fn exit_err_with_partial_results(err: &Error, results: Vec<serde_json::Value>) -> ! {
+    print_json(&json!({
+        "status": "error",
+        "error": { "code": err.code(), "message": err.to_string() },
+        "results": results,
+    }));
+    std::process::exit(err.exit_code());
 }
 
 pub(crate) fn visibility_to_string(visibility: &StoreVisibility) -> &'static str {
@@ -80,6 +113,7 @@ pub(crate) fn kind_to_string(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::Path => "path",
         SourceKind::Url => "url",
+        SourceKind::Feed => "feed",
     }
 }
 
@@ -122,28 +156,12 @@ pub(crate) fn looks_like_id(s: &str) -> bool {
     false
 }
 
+/// Thin delegation to `core::source::source_row_to_source` — kept under its
+/// original name so no CLI call site needs to change. The conversion itself
+/// is pure (zero I/O) and needs nothing CLI-specific, so it now lives in
+/// `core` where `server` can share it too (issue #187).
 pub fn source_row_to_core_source(src: &SourceRow) -> localdb_core::types::Source {
-    use localdb_core::types::{Source, SourceSpec};
-
-    let spec = match src.kind {
-        SourceKind::Url => SourceSpec::Url {
-            url: src.url.clone().unwrap_or_default(),
-            refresh_interval_secs: None,
-        },
-        SourceKind::Path => SourceSpec::Path {
-            root: src.root.clone().unwrap_or_default(),
-            include: src.include.clone(),
-            exclude: src.exclude.clone(),
-        },
-    };
-
-    Source {
-        id: src.id.clone(),
-        store_id: src.store_id.clone(),
-        kind: src.kind.clone(),
-        spec,
-        source_preset: src.preset.clone(),
-    }
+    localdb_core::source::source_row_to_source(src)
 }
 
 /// Prompt the user for confirmation of a destructive action.
@@ -255,6 +273,10 @@ mod tests {
             preset: "prose".into(),
             refresh: None,
             created_at: now_rfc3339(),
+            config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         assert_eq!(core.id, "src-1");
@@ -281,12 +303,192 @@ mod tests {
             preset: "prose".into(),
             refresh: None,
             created_at: now_rfc3339(),
+            config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
             SourceSpec::Url { url, .. } => assert_eq!(url, "https://example.com"),
             _ => panic!("expected url spec"),
         }
+    }
+
+    #[test]
+    fn convert_url_source_parses_refresh_column_into_interval_secs() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-2b".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Url,
+            root: None,
+            url: Some("https://example.com".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: Some("24h".into()),
+            created_at: now_rfc3339(),
+            config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Url {
+                refresh_interval_secs,
+                ..
+            } => assert_eq!(*refresh_interval_secs, Some(86400)),
+            _ => panic!("expected url spec"),
+        }
+    }
+
+    #[test]
+    fn convert_url_source_tolerates_invalid_refresh_string() {
+        // Defensive: a row that somehow holds an invalid refresh string
+        // (should never happen post-validation) must not panic on read —
+        // it falls back to `None` rather than erroring reconstruction.
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-2c".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Url,
+            root: None,
+            url: Some("https://example.com".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: Some("not-a-duration".into()),
+            created_at: now_rfc3339(),
+            config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Url {
+                refresh_interval_secs,
+                ..
+            } => assert_eq!(*refresh_interval_secs, None),
+            _ => panic!("expected url spec"),
+        }
+    }
+
+    #[test]
+    fn convert_feed_source_reconstructs_spec_from_config_json_and_refresh() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-3".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some("https://example.com/feed.xml".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: Some("1h".into()),
+            created_at: now_rfc3339(),
+            config_json: Some(r#"{"max_entries":25,"fetch_full_content":false}"#.into()),
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
+        };
+        let core = source_row_to_core_source(&src);
+        assert_eq!(core.kind, SourceKind::Feed);
+        match &core.spec {
+            SourceSpec::Feed {
+                url,
+                max_entries,
+                fetch_full_content,
+                refresh_interval_secs,
+            } => {
+                assert_eq!(url, "https://example.com/feed.xml");
+                assert_eq!(*max_entries, Some(25));
+                assert!(!fetch_full_content);
+                assert_eq!(*refresh_interval_secs, Some(3600));
+            }
+            _ => panic!("expected feed spec"),
+        }
+    }
+
+    #[test]
+    fn convert_feed_source_tolerates_null_config_json() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-4".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some("https://example.com/feed.xml".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: None,
+            created_at: now_rfc3339(),
+            config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Feed {
+                max_entries,
+                fetch_full_content,
+                refresh_interval_secs,
+                ..
+            } => {
+                assert_eq!(*max_entries, None);
+                assert!(fetch_full_content, "must default to true");
+                assert_eq!(*refresh_interval_secs, None);
+            }
+            _ => panic!("expected feed spec"),
+        }
+    }
+
+    #[test]
+    fn convert_feed_source_tolerates_malformed_config_json() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-5".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some("https://example.com/feed.xml".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: None,
+            created_at: now_rfc3339(),
+            config_json: Some("{not valid json".into()),
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Feed {
+                max_entries,
+                fetch_full_content,
+                ..
+            } => {
+                assert_eq!(*max_entries, None);
+                assert!(
+                    fetch_full_content,
+                    "malformed config_json must fall back to true"
+                );
+            }
+            _ => panic!("expected feed spec"),
+        }
+    }
+
+    #[test]
+    fn kind_to_string_maps_all_kinds() {
+        assert_eq!(kind_to_string(&SourceKind::Path), "path");
+        assert_eq!(kind_to_string(&SourceKind::Url), "url");
+        assert_eq!(kind_to_string(&SourceKind::Feed), "feed");
     }
 
     #[test]

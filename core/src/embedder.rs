@@ -78,7 +78,10 @@ pub trait Embedder: Send + Sync {
     ///
     /// # Errors
     /// - `Error::ModelMissing` — local model not in cache and download disabled
-    /// - `Error::ProviderUnavailable` — hosted provider unreachable/rate-limited after retries
+    /// - `Error::ProviderUnavailable` — hosted provider unreachable after retries
+    /// - `Error::RateLimited` — hosted provider was still returning 429 when the
+    ///   retry budget ran out; the same code the document-fetch path reports for
+    ///   the same condition (issue #207)
     async fn embed_documents(
         &self,
         docs: Vec<DocumentChunks>,

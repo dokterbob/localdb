@@ -11,8 +11,8 @@ use axum::{Extension, Json};
 use serde::Serialize;
 
 use localdb_core::{
-    auth::{Principal, Role, StoreAccess},
     Error as CoreError,
+    auth::{Principal, Role, StoreAccess},
 };
 
 use crate::error::ApiError;

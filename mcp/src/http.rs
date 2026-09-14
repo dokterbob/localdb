@@ -12,26 +12,16 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-use localdb_core::{auth::Principal, Embedder};
+use crate::StoreProvider;
+use localdb_core::{auth::Principal, Embedder, StoreBackend};
 
 use crate::handler::McpHandler;
-use crate::store_provider::StoreProvider;
 
 /// Build the Streamable HTTP tower service serving `McpHandler`.
 ///
-/// `provider` and `embedder` are shared (`Arc`-cloned) across every HTTP
-/// session the factory below constructs — cheap, since cloning an `Arc`
-/// satisfies rmcp's synchronous service-factory signature (`Fn() -> Result<S,
-/// io::Error>`) without a `block_on` bridge. That synchronous boundary only
-/// ever constrained *construction-time* store resolution (building the
-/// `McpHandler` itself); it says nothing about what an individual tool
-/// method does once the handler exists. Because `provider` is an `Arc<dyn
-/// StoreProvider>` rather than a pre-resolved `Vec<AvailableStore>`,
-/// `McpHandler`'s tool methods (`handler.rs`) call
-/// `provider.available_stores().await` fresh on every call — so a store
-/// added later via `POST /v1/stores` is visible on the very next MCP tool
-/// call, no daemon restart needed. See `store_provider.rs` for the full
-/// design rationale (D12).
+/// Sessions share the provider, backend, and embedder. The handler resolves
+/// stores asynchronously on every tool call, so registry changes take effect
+/// without restarting the daemon or reconnecting the client.
 ///
 /// HTTP MCP sessions always run with `allow_write = false`: there is no
 /// CLI-flag equivalent for an HTTP caller, and v1 registers no mutating
@@ -61,14 +51,9 @@ use crate::store_provider::StoreProvider;
 /// case would silently keep rmcp's localhost-only default and this whole
 /// fix would be a no-op for the one case (non-loopback bind) it exists for.
 /// Do not "simplify" this back to always using `::default()`.
-///
-/// `default_principal` is the fallback identity when a tool call's request
-/// extensions carry no `Principal` (see `handler::McpHandler::principal_for`):
-/// the daemon passes `Some(Principal::local_trust())` in open (unauthenticated)
-/// mode and `None` when auth is enforced, so a request that somehow bypassed
-/// the auth middleware fails closed instead of running with full access.
 pub fn build_streamable_http_service(
     provider: Arc<dyn StoreProvider>,
+    backend: Arc<dyn StoreBackend>,
     embedder: Arc<dyn Embedder>,
     allowed_hosts: Vec<String>,
     default_principal: Option<Principal>,
@@ -82,6 +67,7 @@ pub fn build_streamable_http_service(
         move || {
             Ok(McpHandler::new(
                 provider.clone(),
+                backend.clone(),
                 embedder.clone(),
                 false,
                 default_principal.clone(),

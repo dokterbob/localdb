@@ -12,14 +12,15 @@
 //! force past a running daemon.
 
 use localdb_core::{
-    auth::{AuthStore as _, InviteMode},
     Error,
+    auth::{AuthStore as _, InviteMode},
 };
 use serde_json::json;
 
 use crate::{
-    app_db::load_app_db,
-    daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
+    daemon_client::{
+        CliContext, DaemonState, daemon_request_async, encode_path_segment, probe_daemon,
+    },
     normalize::{exit_err, print_json},
 };
 
@@ -150,7 +151,7 @@ pub(crate) async fn run_invite_create_async(
         None => None,
     };
 
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -169,6 +170,7 @@ pub(crate) async fn run_invite_create_async(
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let mut store_grants = Vec::with_capacity(stores.len());
     for name in stores {
@@ -229,7 +231,7 @@ pub fn run_invite_list(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_invite_list_async(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -242,6 +244,7 @@ pub(crate) async fn run_invite_list_async(ctx: &CliContext) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let invites = match db.auth_store().list_invites().await {
         Ok(i) => i,
@@ -280,11 +283,11 @@ pub fn run_invite_revoke(ctx: &CliContext, id: &str) {
 }
 
 pub(crate) async fn run_invite_revoke_async(ctx: &CliContext, id: &str) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        let url = format!("{base_url}/v1/invites/{id}");
+        let url = format!("{base_url}/v1/invites/{id}", id = encode_path_segment(id));
         match daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await {
             Ok(_) => {
                 if ctx.json {
@@ -297,6 +300,7 @@ pub(crate) async fn run_invite_revoke_async(ctx: &CliContext, id: &str) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     match db.auth_store().revoke_invite(id).await {
         Ok(true) => {}
@@ -323,7 +327,7 @@ pub fn run_invite_requests(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_invite_requests_async(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -336,6 +340,7 @@ pub(crate) async fn run_invite_requests_async(ctx: &CliContext) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let requests = match db.auth_store().list_access_requests().await {
         Ok(r) => r,
@@ -368,11 +373,14 @@ pub fn run_invite_approve(ctx: &CliContext, request_id: &str) {
 }
 
 pub(crate) async fn run_invite_approve_async(ctx: &CliContext, request_id: &str) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        let url = format!("{base_url}/v1/invites/requests/{request_id}/approve");
+        let url = format!(
+            "{base_url}/v1/invites/requests/{request_id}/approve",
+            request_id = encode_path_segment(request_id)
+        );
         match daemon_request_async(ctx, reqwest::Method::POST, &url, None).await {
             Ok(v) => {
                 if ctx.json {
@@ -388,6 +396,7 @@ pub(crate) async fn run_invite_approve_async(ctx: &CliContext, request_id: &str)
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let user = match db.auth_service().approve_request(request_id).await {
         Ok(u) => u,
@@ -411,11 +420,14 @@ pub fn run_invite_deny(ctx: &CliContext, request_id: &str) {
 }
 
 pub(crate) async fn run_invite_deny_async(ctx: &CliContext, request_id: &str) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        let url = format!("{base_url}/v1/invites/requests/{request_id}/deny");
+        let url = format!(
+            "{base_url}/v1/invites/requests/{request_id}/deny",
+            request_id = encode_path_segment(request_id)
+        );
         match daemon_request_async(ctx, reqwest::Method::POST, &url, None).await {
             Ok(_) => {
                 if ctx.json {
@@ -428,6 +440,7 @@ pub(crate) async fn run_invite_deny_async(ctx: &CliContext, request_id: &str) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     if let Err(e) = db.auth_service().deny_request(request_id).await {
         exit_err(&e, ctx.json);

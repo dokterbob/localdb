@@ -56,6 +56,14 @@ pub struct ChunkRecord {
     /// Acquisition time (RFC 3339 string). Used for metadata filters.
     pub fetched_at: String,
 
+    /// The resource's claimed content modification time (RFC 3339 string) —
+    /// the origin's own notion of "last changed" (e.g. a feed entry's
+    /// `<updated>`), distinct from `fetched_at` (when *our store* acquired
+    /// it). `None` when the source makes no such claim. Written to the
+    /// nullable `resources.modified_at` column. See specs/02-domain-model.md
+    /// §2.
+    pub modified_at: Option<String>,
+
     /// blake3 content hash of normalized text (hex string).
     pub content_hash: String,
 
@@ -99,12 +107,46 @@ pub struct ChunkRecord {
     #[serde(default)]
     pub block_kind: Option<String>,
 
+    /// 1-indexed page number of the originating block, for paginated source
+    /// formats (#103). Copied from the block's `location.page`; `None` for
+    /// non-paginated formats and rows written before page plumbing existed.
+    /// Persisted inside `location_json` as an optional `"page"` key.
+    #[serde(default)]
+    pub page: Option<u32>,
+
     /// For message-window chunks (#129): all block seqs participating in the
     /// window. Empty for ordinary single-block chunks. Persisted inside
     /// `location_json` as `{"start", "end", "window_block_seqs"?}`, present
     /// only when non-empty.
     #[serde(default)]
     pub window_block_seqs: Vec<u32>,
+
+    /// The resource's own claimed date, exactly as the source expressed it
+    /// (a PDF `D:` string's date portion, an EPUB OPF `dc:date`, a feed
+    /// entry's `published`/`updated`). Write-only: persisted to
+    /// `resources.date_original` on every upsert but never read back onto a
+    /// `ChunkRecord` (not part of `CHUNK_COLS`) — nothing currently consumes
+    /// it from a chunk read. See specs/02-domain-model.md §2.
+    #[serde(default)]
+    pub date_original: Option<String>,
+
+    /// `date_original` normalized to a sortable ISO 8601 string via
+    /// `crate::dates::parse_partial_iso8601`, or `None` when `date_original`
+    /// was absent or unparseable. Write-only, same posture as
+    /// `date_original`.
+    #[serde(default)]
+    pub date_parsed: Option<String>,
+
+    /// The source's own identifier for this resource (e.g. a feed entry's
+    /// `<id>`), distinct from localdb's content-addressed `resource_id`.
+    /// Write-only, same posture as `date_original`.
+    #[serde(default)]
+    pub external_id: Option<String>,
+
+    /// The source's own change-detection token for this resource (e.g. an
+    /// HTTP `ETag`). Write-only, same posture as `date_original`.
+    #[serde(default)]
+    pub external_etag: Option<String>,
 }
 
 impl ChunkRecord {
@@ -126,6 +168,12 @@ impl ChunkRecord {
             embedding,
             policy_version: chunk.policy_version.clone(),
             fetched_at: chunk.provenance.fetched_at.clone(),
+            // `Chunk`/`Provenance` carry no modified_at of their own (see
+            // `Provenance`'s doc comment — acquisition time only); default to
+            // `None` (no claim) here for callers that never touch this field.
+            // `index_resource` overrides this with the real
+            // `resource.modified_at` right after constructing the record.
+            modified_at: None,
             content_hash: chunk.provenance.content_hash.clone(),
             origin_store: chunk.provenance.origin_store.clone(),
             source_id: chunk.provenance.source_ref.id.clone(),
@@ -136,9 +184,88 @@ impl ChunkRecord {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: chunk.window_block_seqs.clone(),
+            // Not derivable from `Chunk`/`Provenance` — `index_resource`
+            // stamps these onto each record after construction, same as
+            // `modified_at` above.
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ResourceRecord — metadata-only update payload
+// ---------------------------------------------------------------------------
+
+/// The fields a metadata-only update (issue #176) writes to an existing
+/// resource row, without touching its chunks, blocks, or embeddings.
+///
+/// `store_id`/`resource_id` are passed as `update_resource_metadata`
+/// parameters rather than struct fields, matching the trait's other
+/// per-call methods (`delete_by_resource`, `get_chunks_for_resource`, ...).
+/// `title` is deliberately omitted: it is always derived from
+/// `metadata.title()` (Dublin Core), the same convention
+/// `upsert_chunks_inner` follows for the full-write path — a separate
+/// `title` field here would let the two disagree. `index_updated_at` is
+/// likewise omitted: the store stamps it itself with its own write-time
+/// clock reading, mirroring `upsert_chunks_inner`'s single
+/// `now_rfc3339()` call for a batch.
+///
+/// Named ahead of the broader per-resource CRUD surface issue #189 previews
+/// (extractor_version, etc.) — kept to plain fields deliberately so a future
+/// field there is a small addition, not a redesign.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceRecord {
+    /// Resource metadata, tagged by resource kind — already post-backfill
+    /// (see `core::ids::compute_metadata_hash`'s doc comment): the caller
+    /// must have already folded `resource.title` into
+    /// `metadata.dublin_core_mut().title` when the metadata itself carried
+    /// none, exactly as `index_resource` does for the full-write path.
+    pub metadata: Metadata,
+    /// The source's own identifier for this resource. See `ChunkRecord::external_id`.
+    pub external_id: Option<String>,
+    /// The source's own change-detection token. See `ChunkRecord::external_etag`.
+    pub external_etag: Option<String>,
+    /// Raw HTTP `Last-Modified` conditional-GET validator, beside
+    /// `external_etag`. See `Resource::external_last_modified` — not an
+    /// input to `core::ids::compute_metadata_hash`.
+    pub external_last_modified: Option<String>,
+    /// The resource's own claimed modification time (RFC 3339). `None` when
+    /// the source makes no such claim — see `ChunkRecord::modified_at`.
+    pub modified_at: Option<String>,
+    /// The resource's own claimed date, exactly as the source expressed it.
+    /// See `ChunkRecord::date_original`.
+    pub date_original: Option<String>,
+    /// `date_original` normalized via `crate::dates::parse_partial_iso8601`.
+    /// See `ChunkRecord::date_parsed`.
+    pub date_parsed: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// StaleFeedResource — feed liveness sweep candidate
+// ---------------------------------------------------------------------------
+
+/// A feed-discovered resource eligible for a liveness probe: this run did
+/// not observe it, so — from the store's point of view alone — it may have
+/// aged out of the feed's window. See
+/// `RetrievalStore::list_stale_feed_resources` and
+/// specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+/// sweep".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleFeedResource {
+    /// The resource's id (`resources.id`) — the key `delete_by_resource` and
+    /// `touch_resource_liveness` both take.
+    pub resource_id: String,
+    /// The resource's own URI — the entry link the sweep probes.
+    pub uri: String,
+    /// Stored `ETag` validator, replayed as `If-None-Match`.
+    pub external_etag: Option<String>,
+    /// Stored `Last-Modified` validator, replayed as `If-Modified-Since`.
+    pub external_last_modified: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +316,100 @@ pub struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// DateAxis — which of the four date signals a date filter bounds
+// ---------------------------------------------------------------------------
+
+/// Which of the four date axes (specs/02-domain-model.md §"Date axes
+/// (normative)") a [`MetadataFilter::DateAfter`]/[`MetadataFilter::DateBefore`]
+/// bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateAxis {
+    /// `resources.added_at` — when we first indexed this resource version.
+    Added,
+    /// `resources.index_updated_at` — when we last wrote its stored state.
+    Updated,
+    /// `resources.modified_at` — the source's own claim about last change.
+    Modified,
+    /// `resources.date_parsed` — the document's own Dublin Core `dc:date`.
+    Document,
+}
+
+impl DateAxis {
+    /// All four axes, in the order §"Date axes (normative)" lists them.
+    pub const ALL: [DateAxis; 4] = [
+        DateAxis::Added,
+        DateAxis::Updated,
+        DateAxis::Modified,
+        DateAxis::Document,
+    ];
+
+    /// The public name shared by every surface (CLI flags, MCP tool params,
+    /// HTTP query params). Deliberately "document", not "date_parsed" or
+    /// "date" — it must never leak the storage column name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DateAxis::Added => "added",
+            DateAxis::Updated => "updated",
+            DateAxis::Modified => "modified",
+            DateAxis::Document => "document",
+        }
+    }
+
+    /// The `resources` column this axis reads/filters on.
+    pub fn column(&self) -> &'static str {
+        match self {
+            DateAxis::Added => "added_at",
+            DateAxis::Updated => "index_updated_at",
+            DateAxis::Modified => "modified_at",
+            DateAxis::Document => "date_parsed",
+        }
+    }
+
+    /// One-line human description of this axis, shared verbatim by every
+    /// surface's `--help`/schema text. `#[arg(long = ...)]` and
+    /// `#[schemars(description = ...)]` are derive-macro attributes parsed as
+    /// literal tokens at macro-expansion time — a runtime `&'static str`
+    /// cannot appear inside them — so the CLI flag help (`localdb/src/main.rs`)
+    /// and the MCP tool schema (`SearchFilters` field docs) each hand-write
+    /// their own copy of this text rather than calling this function
+    /// directly. This function exists so a single consistency test can
+    /// assert those hand-written copies actually contain it, rather than
+    /// trusting 24 independently-edited literals to stay in sync.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            DateAxis::Added => "when this resource was first indexed",
+            DateAxis::Updated => "when the store last wrote this resource's stored state",
+            DateAxis::Modified => "the source's own claim of when this resource was last changed",
+            DateAxis::Document => "the document's own claimed date (Dublin Core dc:date)",
+        }
+    }
+
+    /// The Rust-side value for this axis on a `ChunkRecord`. Backs the
+    /// in-process (`FakeStore`/test-support) matching path in
+    /// [`MetadataFilter::matches`] only — the real (libsql) backend filters
+    /// entirely in SQL via [`DateAxis::column`] and never calls this.
+    ///
+    /// `DateAxis::Updated` always returns `None`: `index_updated_at` is
+    /// stamped by the store itself at write time — both
+    /// `upsert_chunks_inner` and `update_resource_metadata_inner` in
+    /// `store-libsql/src/tenant/write.rs` compute it fresh from
+    /// `now_rfc3339()` and never read a record-supplied value — so no
+    /// `ChunkRecord` field could ever agree with what actually lands in the
+    /// column. Returning `None` here (which `matches` treats as "fails every
+    /// bound") is the honest answer: a populated field would silently
+    /// diverge between `FakeStore` (authoritative) and the real backend
+    /// (write-ignored).
+    fn value_of<'a>(&self, record: &'a ChunkRecord) -> Option<&'a str> {
+        match self {
+            DateAxis::Added => Some(record.fetched_at.as_str()),
+            DateAxis::Updated => None,
+            DateAxis::Modified => record.modified_at.as_deref(),
+            DateAxis::Document => record.date_parsed.as_deref(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MetadataFilter — pushed down to the backend
 // ---------------------------------------------------------------------------
 
@@ -201,10 +422,10 @@ pub enum MetadataFilter {
     Mime(String),
     /// Filter by URI prefix.
     UriPrefix(String),
-    /// Filter: fetched_at >= value (RFC 3339 string).
-    FetchedAfter(String),
-    /// Filter: fetched_at <= value (RFC 3339 string).
-    FetchedBefore(String),
+    /// Inclusive lower bound on `axis`.
+    DateAfter { axis: DateAxis, value: String },
+    /// Inclusive upper bound on `axis`.
+    DateBefore { axis: DateAxis, value: String },
     /// Filter by source ID.
     SourceId(UlidId),
     /// Filter by document ID.
@@ -218,8 +439,40 @@ impl MetadataFilter {
         match self {
             MetadataFilter::Mime(mime) => record.mime.as_deref() == Some(mime.as_str()),
             MetadataFilter::UriPrefix(prefix) => record.uri.starts_with(prefix.as_str()),
-            MetadataFilter::FetchedAfter(ts) => record.fetched_at.as_str() >= ts.as_str(),
-            MetadataFilter::FetchedBefore(ts) => record.fetched_at.as_str() <= ts.as_str(),
+            // NULL fails every bound (no `Some(v)` to compare), matching
+            // SQL's `NULL >= 'x'` falsy behavior for the nullable
+            // `modified_at`/`date_parsed` axes — see this type's doc comment
+            // and specs/02-domain-model.md §"Date axes (normative)".
+            MetadataFilter::DateAfter { axis, value } => {
+                axis.value_of(record).is_some_and(|v| v >= value.as_str())
+            }
+            MetadataFilter::DateBefore { axis, value } => axis.value_of(record).is_some_and(|v| {
+                // The two operands widen under DIFFERENT rules, because they
+                // become partial-width for different reasons:
+                //
+                // - The BOUND is whatever a caller supplied, so it can be
+                //   partial on ANY axis. It is always widened. Without this,
+                //   an inclusive `added_before: "2026"` excludes every
+                //   resource added during 2026: a longer string sorts after
+                //   its own prefix, so `"2026-06-10T12:00:00Z" <= "2026"` is
+                //   false.
+                // - The STORED value is only partial-width on `Document`
+                //   (`date_parsed` is normalized to exactly 4, 7, or 10 chars
+                //   by `crate::dates::parse_partial_iso8601`);
+                //   `Added`/`Updated`/`Modified` are always full RFC 3339.
+                //   Widening those would be a no-op, so it is skipped —
+                //   matching the SQL side, which pays for a `CASE` over the
+                //   column only on `Document`.
+                //
+                // This arm MUST stay in lockstep with `build_filter_clauses`
+                // in `store-libsql/src/tenant/sql.rs`, which mirrors exactly
+                // this split.
+                let bound = crate::dates::widen_date_upper_bound(value);
+                match axis {
+                    DateAxis::Document => crate::dates::widen_date_upper_bound(v) <= bound,
+                    _ => v <= bound.as_str(),
+                }
+            }),
             MetadataFilter::SourceId(id) => &record.source_id == id,
             MetadataFilter::ResourceId(id) => &record.resource_id == id,
             MetadataFilter::PolicyVersion(v) => &record.policy_version == v,
@@ -320,6 +573,191 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// return the embedding column to avoid loading vectors for the entire store.
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error>;
 
+    /// List feed-discovered resources eligible for a liveness probe: rows
+    /// owned by `(store_id, source_id)` with `ingestor_kind = "feed"` whose
+    /// `last_checked_at` is either unset (never probed) or older than
+    /// `checked_before`, ordered oldest first with never-checked rows
+    /// leading, capped at `limit`.
+    ///
+    /// `limit` is the caller's *query* budget, deliberately larger than the
+    /// number of candidates it will actually probe: this query cannot see
+    /// the run's in-memory seen-set, so the caller over-fetches and
+    /// subtracts that set itself. Returning fewer rows than `limit` when
+    /// more match is therefore not an allowed optimization — it would
+    /// silently reintroduce the starvation the over-fetch exists to avoid.
+    ///
+    /// Backs the feed liveness sweep
+    /// (specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+    /// sweep"); the sweep itself, including its own guards and the
+    /// distinction between "aged out of the window" and "still in it," lives
+    /// in `crate::ingestion::run_source_ingestion` — this method is a plain
+    /// candidate lookup, not the sweep.
+    ///
+    /// A plain `ORDER BY last_checked_at ASC` already sorts SQLite `NULL`
+    /// before every non-`NULL` value, which is exactly "never-checked
+    /// leading" — implementations should rely on that rather than adding a
+    /// `CASE`/`COALESCE` to spell it out.
+    ///
+    /// **Must exclude every URI carrying a fragment.** A link-less feed
+    /// entry is stored under a synthetic `{feed_url}#entry:{id}` URI
+    /// (specs/02-domain-model.md's "General connector pattern"); HTTP never
+    /// sends a fragment on the wire, so probing that URI verbatim would
+    /// actually request the feed root, and a 404/410 there would delete the
+    /// entry's resource on a signal that has nothing to do with it. This
+    /// must be enforced here, not as a post-filter over the returned list —
+    /// filtering downstream would leave those rows permanently eligible
+    /// (nothing ever advances their `last_checked_at`) and they would keep
+    /// occupying `limit` slots forever. The accepted cost — a real entry
+    /// link that legitimately carries a fragment is also excluded, and can
+    /// never be pruned by this mechanism — is deliberate: deletion here is
+    /// asymmetric, so retention bias is the safe failure. See
+    /// `store-libsql`'s implementation for the exact SQL.
+    ///
+    /// The default implementation returns an empty list, mirroring
+    /// `upsert_blocks`'s no-op default below: `FakeStore` and any store that
+    /// predates the liveness sweep report no candidates, and the sweep
+    /// simply has nothing to do for them.
+    async fn list_stale_feed_resources(
+        &self,
+        store_id: &str,
+        source_id: &str,
+        checked_before: &str,
+        limit: usize,
+    ) -> Result<Vec<StaleFeedResource>, Error> {
+        let _ = (store_id, source_id, checked_before, limit);
+        Ok(Vec::new())
+    }
+
+    /// Record a liveness probe's outcome for one resource: refresh its
+    /// stored conditional-GET validators and `last_checked_at`, and nothing
+    /// else.
+    ///
+    /// The sweep is not the only writer of `last_checked_at`: the entry
+    /// recheck gate's own fetches, `url` sources, and single-document feed
+    /// mode advance the same column through [`Self::touch_resource_checked`]
+    /// below, which writes only that one column since their own write path
+    /// already persisted the validators. This method's own write is also the
+    /// column's one disclosed exception — it advances on `Blocked` and
+    /// transport-error outcomes too, not only on successful origin contact,
+    /// so the sweep's oldest-first candidate rotation stays fair rather than
+    /// getting stuck re-probing the same unreachable entries forever. See
+    /// specs/04-search-pipeline.md §1 "What a probe writes" and
+    /// specs/02-domain-model.md §2's `last_checked_at` row.
+    ///
+    /// **Must never write `index_updated_at`.** That column normatively
+    /// means "we last wrote this resource's stored state" and is publicly
+    /// exposed as `DocumentInfo::index_updated_at` (`localdb document get`,
+    /// `GET /v1/documents/{id}`, MCP `get_document`/`list_documents`). A
+    /// liveness probe writes no content and no metadata, so bumping that
+    /// column would misreport a merely-pinged resource as re-written — which
+    /// is exactly why schema v8 gave this clock its own column
+    /// (`last_checked_at`) instead of reusing this one.
+    ///
+    /// The default implementation is a no-op, mirroring
+    /// `list_stale_feed_resources` above.
+    async fn touch_resource_liveness(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<(), Error> {
+        let _ = (store_id, resource_id, etag, last_modified);
+        Ok(())
+    }
+
+    /// Advance `resources.last_checked_at` for one resource to now, and
+    /// write nothing else — not the validators, not `index_updated_at`.
+    ///
+    /// This is the single-column counterpart to [`Self::touch_resource_liveness`]
+    /// used *outside* the feed liveness sweep: the entry recheck gate's own
+    /// conditional-GET path, `url` sources, and single-document feed mode all
+    /// reach a `200` or `304` through their own ordinary write path (a full
+    /// reindex, a metadata-only update, or `on_validators_refreshed`'s
+    /// validator rotation) that already persists whatever validators moved —
+    /// so this call exists only to record that the origin was successfully
+    /// contacted, not to duplicate that write. See
+    /// specs/04-search-pipeline.md §1 "What a probe writes" for the split
+    /// between this method and the sweep's three-column
+    /// `touch_resource_liveness`, and specs/02-domain-model.md §2's
+    /// `last_checked_at` row for what the column means.
+    ///
+    /// **Must never write `index_updated_at`**, for the same reason
+    /// `touch_resource_liveness` must not: that column means "we last wrote
+    /// this resource's stored state" and is publicly exposed as
+    /// `DocumentInfo::index_updated_at`. A successful check that leaves
+    /// content and metadata unchanged writes nothing there — bumping it here
+    /// would report a merely-confirmed-live resource as re-written.
+    ///
+    /// Returns `Err(Error::ResourceNotFound)` when no row matches
+    /// `(store_id, resource_id)` — e.g. a concurrent delete raced the check.
+    /// Callers (the entry recheck gate, `url`-source and single-document-feed
+    /// write paths) log this at debug and swallow it: a vanished resource has
+    /// nothing left for the clock to throttle, and the row already having no
+    /// `doc_index` entry is what would make it re-checked anyway on the next
+    /// run.
+    ///
+    /// The default implementation is a no-op, mirroring
+    /// `touch_resource_liveness` above: `FakeStore` and any store predating
+    /// this write path report success and do nothing, which is correct for a
+    /// store with no `last_checked_at` column to advance.
+    async fn touch_resource_checked(&self, store_id: &str, resource_id: &str) -> Result<(), Error> {
+        let _ = (store_id, resource_id);
+        Ok(())
+    }
+
+    /// Update an existing resource's metadata in place, without touching its
+    /// chunks, blocks, or embeddings (issue #176's metadata-only incremental
+    /// update — specs/04-search-pipeline.md).
+    ///
+    /// Callers reach this only when `content_hash`/`policy_version` are
+    /// unchanged but `core::ids::compute_metadata_hash` differs — a full
+    /// reindex (`upsert_chunks_and_blocks`) is the path for everything else.
+    /// No default implementation: unlike `upsert_blocks`/
+    /// `get_blocks_for_resource`'s no-op defaults (which are legitimately
+    /// optional for early/legacy stores), a store that silently accepted
+    /// this call and did nothing would report success while the metadata
+    /// staleness it was asked to fix persists forever — every implementor
+    /// must have an opinion.
+    ///
+    /// Returns `Err(Error::ResourceNotFound)` if no row matches
+    /// `(store_id, resource_id)` — e.g. a concurrent delete raced this
+    /// update. Never silently succeeds on zero rows affected: the caller's
+    /// `DocumentIndex` entry would otherwise be stamped with a metadata_hash
+    /// for a resource_id the store no longer has any row for.
+    async fn update_resource_metadata(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        record: &ResourceRecord,
+    ) -> Result<(), Error>;
+
+    /// Single-row read of a resource's persisted metadata state — the read
+    /// counterpart to [`Self::update_resource_metadata`], returning exactly
+    /// the record that method writes.
+    ///
+    /// This exists because [`Self::get_chunks_for_resource`] cannot stand in
+    /// for it. A caller rebuilding a `ResourceRecord` in order to rewrite one
+    /// field needs the row's current value for every *other* field, and three
+    /// of them — `external_id`, `date_original`, `date_parsed` — are
+    /// write-only on `ChunkRecord` by design (see their doc comments): a
+    /// chunk read reports `None` for each regardless of what the row holds.
+    /// Building a record from a chunk and writing it back therefore nulls
+    /// those columns. Widening the chunk projection is not the fix — it also
+    /// backs `dense_search`/`bm25_search`, so every search result would carry
+    /// and parse fields nothing reads.
+    ///
+    /// Returns `Ok(None)` when no row matches `(store_id, resource_id)` — a
+    /// concurrent delete, or a resource this store never held. No default
+    /// implementation, for the same reason `update_resource_metadata` has
+    /// none: a store answering `None` unconditionally would silently turn
+    /// every caller into a no-op.
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error>;
+
     /// Upsert a set of blocks for a document.
     ///
     /// The resource row identified by `resource_id` must already exist (written
@@ -382,6 +820,15 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// (libsql) override wraps the delete and both upserts in a single
     /// database transaction, guaranteeing that a write failure rolls back
     /// the delete along with the insert.
+    ///
+    /// `external_last_modified` is the resource's raw HTTP `Last-Modified`
+    /// conditional-GET validator (`Resource::external_last_modified`), a
+    /// trailing parameter rather than a `ChunkRecord` field: unlike
+    /// `external_etag`, it is deliberately not denormalized onto every chunk
+    /// row (see `ChunkRecord`'s doc comment), since only the owning
+    /// resource row needs it. The default implementation below has nowhere
+    /// to persist it (no `ChunkRecord`/`upsert_blocks` column carries it) and
+    /// ignores it; only `TenantStore` writes it.
     async fn upsert_chunks_and_blocks(
         &self,
         store_id: &str,
@@ -389,7 +836,9 @@ pub trait RetrievalStore: Send + Sync + 'static {
         records: Vec<ChunkRecord>,
         blocks: &[crate::block::Block],
         replaces_resource_id: Option<&str>,
+        external_last_modified: Option<&str>,
     ) -> Result<usize, Error> {
+        let _ = external_last_modified;
         if let Some(old_id) = replaces_resource_id {
             self.delete_by_resource(old_id).await?;
         }
@@ -414,6 +863,28 @@ pub struct FakeStore {
     /// `store_id`-agnostic lookup below — `FakeStore` is used single-store-at-
     /// a-time in tests, so `store_id` is accepted but not partitioned on).
     blocks: tokio::sync::RwLock<HashMap<String, Vec<crate::block::Block>>>,
+    /// Every `ResourceRecord` handed to `update_resource_metadata`, in call
+    /// order, paired with its `resource_id`.
+    ///
+    /// `FakeStore` otherwise models a resource's persisted state as the
+    /// denormalized fields on its `ChunkRecord`s, which is faithful for every
+    /// column `ChunkRecord` carries — but `external_last_modified` is
+    /// deliberately not one of them (it is routed through `ResourceRecord`
+    /// instead of becoming another per-chunk denormalized copy). Without this
+    /// log, a caller's choice of `external_last_modified` would be invisible
+    /// to any test using this store, so the preserve-vs-overwrite behavior on
+    /// a partially-populated update could not be pinned at all.
+    metadata_updates: tokio::sync::RwLock<Vec<(String, ResourceRecord)>>,
+    /// `last_checked_at` values written by `touch_resource_checked`, keyed by
+    /// `resource_id`.
+    ///
+    /// `ChunkRecord` carries no `last_checked_at` column of its own (like
+    /// `external_last_modified`, it is deliberately not denormalized onto
+    /// every chunk row — see `store-libsql`'s `resources` table, the single
+    /// row a whole document's chunks share it from), so `FakeStore` keeps it
+    /// here instead and folds it onto `list_indexed_documents`'s
+    /// `DocumentRecord` output by `resource_id`.
+    last_checked: tokio::sync::RwLock<HashMap<String, String>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -423,7 +894,23 @@ impl FakeStore {
         Self {
             chunks: tokio::sync::RwLock::new(Vec::new()),
             blocks: tokio::sync::RwLock::new(HashMap::new()),
+            metadata_updates: tokio::sync::RwLock::new(Vec::new()),
+            last_checked: tokio::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The `ResourceRecord`s passed to `update_resource_metadata`, in call
+    /// order. See the field's own comment for why this log exists.
+    pub async fn metadata_updates(&self) -> Vec<(String, ResourceRecord)> {
+        self.metadata_updates.read().await.clone()
+    }
+
+    /// The `last_checked_at` value `touch_resource_checked` recorded for
+    /// `resource_id`, or `None` if it was never touched. Test-support
+    /// accessor so callers can assert a touch happened without going through
+    /// `list_indexed_documents`.
+    pub async fn last_checked_at(&self, resource_id: &str) -> Option<String> {
+        self.last_checked.read().await.get(resource_id).cloned()
     }
 }
 
@@ -590,16 +1077,123 @@ impl RetrievalStore for FakeStore {
 
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
         let chunks = self.chunks.read().await;
+        let last_checked = self.last_checked.read().await;
         let mut seen: HashMap<String, DocumentRecord> = HashMap::new();
         for chunk in chunks.iter() {
             seen.entry(chunk.uri.clone()).or_insert(DocumentRecord {
                 uri: chunk.uri.clone(),
                 resource_id: chunk.resource_id.clone(),
+                source_id: chunk.source_id.clone(),
                 content_hash: chunk.content_hash.clone(),
                 policy_version: chunk.policy_version.clone(),
+                // Rehydrated the same way `TenantStore::list_indexed_documents`
+                // does: from this chunk's own already-persisted (denormalized)
+                // metadata state, not recomputed from some other source of
+                // truth — `FakeStore` has no separate `resources` table, so
+                // each chunk's fields already *are* that state.
+                metadata_hash: crate::ids::compute_metadata_hash(
+                    &chunk.metadata,
+                    chunk.external_id.as_deref(),
+                    chunk.external_etag.as_deref(),
+                    chunk.modified_at.as_deref(),
+                ),
+                external_etag: chunk.external_etag.clone(),
+                // `ChunkRecord` deliberately carries no
+                // `external_last_modified` (see `upsert_chunks_and_blocks`'s
+                // doc comment) — `FakeStore` has nowhere to keep it.
+                external_last_modified: None,
+                last_checked_at: last_checked.get(&chunk.resource_id).cloned(),
             });
         }
         Ok(seen.into_values().collect())
+    }
+
+    async fn touch_resource_checked(&self, store_id: &str, resource_id: &str) -> Result<(), Error> {
+        let exists = self
+            .chunks
+            .read()
+            .await
+            .iter()
+            .any(|c| c.store_id == store_id && c.resource_id == resource_id);
+        if !exists {
+            return Err(Error::ResourceNotFound {
+                id: resource_id.to_string(),
+            });
+        }
+        self.last_checked
+            .write()
+            .await
+            .insert(resource_id.to_string(), crate::ingestion::now_rfc3339());
+        Ok(())
+    }
+
+    async fn update_resource_metadata(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        record: &ResourceRecord,
+    ) -> Result<(), Error> {
+        self.metadata_updates
+            .write()
+            .await
+            .push((resource_id.to_string(), record.clone()));
+        let mut chunks = self.chunks.write().await;
+        let mut touched = false;
+        for chunk in chunks
+            .iter_mut()
+            .filter(|c| c.store_id == store_id && c.resource_id == resource_id)
+        {
+            // Mirror the real backend's denormalization: every chunk row for
+            // this resource carries its own copy of these fields, so a
+            // metadata-only update must touch all of them, exactly as
+            // `update_resource_metadata`'s single-row `UPDATE resources ...`
+            // does for the real (non-denormalized) `TenantStore`.
+            chunk.metadata = record.metadata.clone();
+            chunk.external_id = record.external_id.clone();
+            chunk.external_etag = record.external_etag.clone();
+            chunk.modified_at = record.modified_at.clone();
+            chunk.date_original = record.date_original.clone();
+            chunk.date_parsed = record.date_parsed.clone();
+            touched = true;
+        }
+        if touched {
+            Ok(())
+        } else {
+            Err(Error::ResourceNotFound {
+                id: resource_id.to_string(),
+            })
+        }
+    }
+
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error> {
+        let chunks = self.chunks.read().await;
+        // `FakeStore` has no separate `resources` table: it denormalizes
+        // every resource-level field onto each chunk row, so the first
+        // matching chunk *is* the resource's persisted state. That is also
+        // why this double cannot reproduce the projection bug the real
+        // backend has — see `RetrievalStore::get_resource_record`.
+        let Some(chunk) = chunks
+            .iter()
+            .find(|c| c.store_id == store_id && c.resource_id == resource_id)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ResourceRecord {
+            metadata: chunk.metadata.clone(),
+            external_id: chunk.external_id.clone(),
+            external_etag: chunk.external_etag.clone(),
+            // `ChunkRecord` carries no `external_last_modified` (same
+            // limitation `list_indexed_documents` above records) — `FakeStore`
+            // has nowhere to keep it.
+            external_last_modified: None,
+            modified_at: chunk.modified_at.clone(),
+            date_original: chunk.date_original.clone(),
+            date_parsed: chunk.date_parsed.clone(),
+        }))
     }
 
     async fn upsert_blocks(
@@ -651,6 +1245,7 @@ pub mod conformance {
             embedding,
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            modified_at: Some("2026-06-10T12:00:00Z".to_string()),
             content_hash: "abc123".to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
@@ -661,7 +1256,12 @@ pub mod conformance {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 
@@ -781,7 +1381,7 @@ pub mod conformance {
             vec![0.0, 1.0],
         )];
         let written = store
-            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"))
+            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"), None)
             .await
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk for doc-b");
@@ -825,7 +1425,7 @@ pub mod conformance {
             vec![0.0, 1.0],
         )];
         let written = store
-            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"))
+            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"), None)
             .await
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk");
@@ -953,6 +1553,109 @@ pub mod conformance {
         let results = store.dense_search(&[1.0, 0.0], 10, &filter).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "chunk-1");
+
+        // The BM25 leg is a genuine, separate code path from dense_search
+        // (its own SQL query in `store-libsql`, its own filter-clause splice
+        // point in `FakeStore`) — exercise it too rather than trusting the
+        // dense leg's coverage to stand in for it.
+        let bm25_results = store.bm25_search("file", 10, &filter).await.unwrap();
+        assert_eq!(
+            bm25_results.len(),
+            1,
+            "BM25 should also filter by URI prefix"
+        );
+        assert_eq!(bm25_results[0].chunk.id, "chunk-1");
+    }
+
+    /// Test: metadata filter values are bound as SQL parameters, never
+    /// interpolated into query text (issue #255). Table-driven over four
+    /// adversarial payloads: a bare single quote (the exact character the
+    /// old `'`-doubling escaping handled — direct regression signal), a SQL
+    /// line-comment payload, the documented `LIKE`-wildcard character for
+    /// `UriPrefix` (specs/04-search-pipeline.md §5), and a non-ASCII
+    /// multi-byte string. Each value is embedded in a real resource's
+    /// `mime`/`uri` and must be matched (or not) as literal data — the
+    /// query must never error, which is the failure mode a reintroduced
+    /// interpolation bug would produce.
+    pub async fn test_metadata_filter_values_are_bound_not_interpolated(
+        store: &dyn RetrievalStore,
+    ) {
+        let adversarial_values = ["'", "--", "%", "café-日本"];
+
+        for (i, value) in adversarial_values.iter().enumerate() {
+            let chunk_id = format!("chunk-adv-{i}");
+            let resource_id = format!("doc-adv-{i}");
+            let mut matching = make_record(
+                &chunk_id,
+                &resource_id,
+                "store-1",
+                "adversarial payload content",
+                vec![1.0, 0.0],
+            );
+            matching.mime = Some(value.to_string());
+            matching.uri = format!("file:///adv/{value}/doc.md");
+
+            let other_chunk_id = format!("chunk-adv-other-{i}");
+            let other_resource_id = format!("doc-adv-other-{i}");
+            let mut other = make_record(
+                &other_chunk_id,
+                &other_resource_id,
+                "store-1",
+                "unrelated content",
+                vec![0.0, 1.0],
+            );
+            other.mime = Some("text/plain".to_string());
+            other.uri = "file:///unrelated/doc.md".to_string();
+
+            store
+                .upsert_chunks(vec![matching, other])
+                .await
+                .unwrap_or_else(|e| panic!("upsert must not error on {value:?}: {e}"));
+
+            // Mime equality filter: exact match on the adversarial value itself.
+            let mime_filter = vec![MetadataFilter::Mime(value.to_string())];
+            let dense = store
+                .dense_search(&[1.0, 0.0], 10, &mime_filter)
+                .await
+                .unwrap_or_else(|e| panic!("dense_search must not error on Mime {value:?}: {e}"));
+            assert_eq!(
+                dense.len(),
+                1,
+                "Mime filter {value:?} should match exactly the tagged chunk, got {dense:?}"
+            );
+            assert_eq!(dense[0].chunk.id, chunk_id);
+
+            let bm25 = store
+                .bm25_search("adversarial payload content", 10, &mime_filter)
+                .await
+                .unwrap_or_else(|e| panic!("bm25_search must not error on Mime {value:?}: {e}"));
+            assert_eq!(
+                bm25.len(),
+                1,
+                "BM25 with Mime filter {value:?} should match exactly the tagged chunk"
+            );
+            assert_eq!(bm25[0].chunk.id, chunk_id);
+
+            // UriPrefix filter: the adversarial value sits inside the bound
+            // prefix value itself. `%` is the one value expected to behave as
+            // a LIKE wildcard here (documented, not a bug); every value must
+            // still avoid a SQL error and must still match its own tagged
+            // chunk.
+            let uri_prefix_filter = vec![MetadataFilter::UriPrefix(format!("file:///adv/{value}"))];
+            let uri_results = store
+                .dense_search(&[1.0, 0.0], 10, &uri_prefix_filter)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("dense_search must not error on UriPrefix {value:?}: {e}")
+                });
+            assert!(
+                uri_results.iter().any(|r| r.chunk.id == chunk_id),
+                "UriPrefix filter embedding {value:?} should still match its own tagged chunk"
+            );
+
+            store.delete_by_resource(&resource_id).await.unwrap();
+            store.delete_by_resource(&other_resource_id).await.unwrap();
+        }
     }
 
     /// Test: get_chunk by ID.
@@ -1104,6 +1807,44 @@ pub mod conformance {
         );
     }
 
+    /// #103: a chunk's `page` survives the store round trip via the optional
+    /// `"page"` key in `location_json`; a chunk without a page reads back
+    /// `None` (missing-key compatibility — same pattern as window_block_seqs).
+    pub async fn test_page_round_trip(store: &dyn RetrievalStore) {
+        let mut paged = make_record(
+            "chunk-paged",
+            "doc-1",
+            "store-1",
+            "paged chunk text",
+            vec![1.0, 0.0],
+        );
+        paged.page = Some(7);
+
+        let unpaged = make_record(
+            "chunk-unpaged",
+            "doc-1",
+            "store-1",
+            "unpaged chunk text",
+            vec![0.0, 1.0],
+        );
+        assert!(unpaged.page.is_none());
+
+        store.upsert_chunks(vec![paged, unpaged]).await.unwrap();
+
+        let got_paged = store.get_chunk("chunk-paged").await.unwrap().unwrap();
+        assert_eq!(
+            got_paged.page,
+            Some(7),
+            "paged chunk's page must survive round trip"
+        );
+
+        let got_unpaged = store.get_chunk("chunk-unpaged").await.unwrap().unwrap();
+        assert_eq!(
+            got_unpaged.page, None,
+            "a chunk without a page reads back None (missing-key compat)"
+        );
+    }
+
     /// Test: `upsert_blocks` then `get_blocks_for_resource` round-trips
     /// blocks ordered by `seq`, regardless of insertion order — proving
     /// reconstruction can't accidentally depend on physical/insertion order.
@@ -1154,6 +1895,310 @@ pub mod conformance {
         );
     }
 
+    /// Test: multiple filters of different kinds combine with AND — a chunk
+    /// matching only one of `Mime` and `DateAfter{Added}` must be excluded,
+    /// not returned on a partial match.
+    pub async fn test_metadata_filter_and_combination(store: &dyn RetrievalStore) {
+        let mut both = make_record(
+            "chunk-both",
+            "doc-both",
+            "store-1",
+            "matches both filters",
+            vec![1.0, 0.0],
+        );
+        both.mime = Some("text/markdown".to_string());
+        both.fetched_at = "2026-06-10T00:00:00Z".to_string();
+
+        let mut mime_only = make_record(
+            "chunk-mime-only",
+            "doc-mime-only",
+            "store-1",
+            "right mime, wrong date",
+            vec![0.9, 0.1],
+        );
+        mime_only.mime = Some("text/markdown".to_string());
+        mime_only.fetched_at = "2026-01-01T00:00:00Z".to_string();
+
+        let mut date_only = make_record(
+            "chunk-date-only",
+            "doc-date-only",
+            "store-1",
+            "right date, wrong mime",
+            vec![0.1, 0.9],
+        );
+        date_only.mime = Some("text/html".to_string());
+        date_only.fetched_at = "2026-06-10T00:00:00Z".to_string();
+
+        store
+            .upsert_chunks(vec![both, mime_only, date_only])
+            .await
+            .unwrap();
+
+        let filters = vec![
+            MetadataFilter::Mime("text/markdown".to_string()),
+            MetadataFilter::DateAfter {
+                axis: DateAxis::Added,
+                value: "2026-03-01T00:00:00Z".to_string(),
+            },
+        ];
+        let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the chunk matching BOTH filters should be returned, got {results:?}"
+        );
+        assert_eq!(results[0].chunk.id, "chunk-both");
+    }
+
+    /// Test: a chunk with `None` for a nullable date axis (`modified_at`,
+    /// `date_parsed`) is excluded by BOTH bound directions, even under a
+    /// maximally permissive bound (`"0000"` for `DateAfter`, `"9999"` for
+    /// `DateBefore`) that would otherwise trivially satisfy almost any
+    /// comparison. Run against the real backend, this is also the test that
+    /// proves the SQL `CASE`/`length(NULL)` fall-through in
+    /// `DateBefore{Document}` preserves NULL-exclusion rather than
+    /// accidentally matching everything.
+    ///
+    /// `DateAxis::Updated` is deliberately excluded — see `DateAxis::
+    /// value_of`'s doc comment: no code path ever produces a NULL there, so
+    /// it isn't a reachable state to test.
+    pub async fn test_date_filter_null_axis_value_excluded(store: &dyn RetrievalStore) {
+        for axis in [DateAxis::Modified, DateAxis::Document] {
+            let axis_name = axis.name();
+            let id = format!("chunk-{axis_name}-null");
+            let resource_id = format!("doc-{axis_name}-null");
+            let mut record = make_record(
+                &id,
+                &resource_id,
+                "store-1",
+                "no axis value",
+                vec![1.0, 0.0],
+            );
+            match axis {
+                DateAxis::Modified => record.modified_at = None,
+                DateAxis::Document => record.date_parsed = None,
+                DateAxis::Added | DateAxis::Updated => unreachable!("not in this loop's set"),
+            }
+            store.upsert_chunks(vec![record]).await.unwrap();
+
+            let after = vec![MetadataFilter::DateAfter {
+                axis,
+                value: "0000".to_string(),
+            }];
+            let after_results = store.dense_search(&[1.0, 0.0], 10, &after).await.unwrap();
+            assert!(
+                after_results.is_empty(),
+                "{axis_name}: a NULL value must be excluded by DateAfter(\"0000\"), got \
+                 {after_results:?}"
+            );
+
+            let before = vec![MetadataFilter::DateBefore {
+                axis,
+                value: "9999".to_string(),
+            }];
+            let before_results = store.dense_search(&[1.0, 0.0], 10, &before).await.unwrap();
+            assert!(
+                before_results.is_empty(),
+                "{axis_name}: a NULL value must be excluded by DateBefore(\"9999\"), got \
+                 {before_results:?}"
+            );
+
+            store.delete_by_resource(&resource_id).await.unwrap();
+        }
+    }
+
+    /// Regression test for the `DateBefore{Document}` widening rule: a chunk
+    /// with a bare-year `date_parsed = "2024"` must be
+    /// EXCLUDED by `DateBefore{Document, "2024-06-01"}` (its widened latest
+    /// instant, December 31st, is later than the bound's widened latest
+    /// instant, June 1st), INCLUDED by `DateBefore{Document, "2024-12-31"}`
+    /// (both widen to the same day), and INCLUDED by
+    /// `DateAfter{Document, "2023-12-31"}` (`DateAfter` needs no widening —
+    /// see `core::dates::widen_date_upper_bound`'s doc comment — and `"2024"`
+    /// already sorts after `"2023-12-31"` as a plain string).
+    /// Test: a partial `DateBefore` bound on a full-timestamp axis must
+    /// include the whole period it names, not exclude it.
+    ///
+    /// The bound is caller-supplied, so it can be partial on any axis, while
+    /// `added_at` always holds a full RFC 3339 timestamp. Comparing the two
+    /// raw would exclude everything: a longer string sorts after its own
+    /// prefix, so `"2026-06-10T12:00:00Z" <= "2026"` is false. Widening the
+    /// bound to the latest instant its precision allows is what makes an
+    /// inclusive upper bound actually inclusive.
+    pub async fn test_date_filter_partial_bound_on_timestamp_axis(store: &dyn RetrievalStore) {
+        let mut record = make_record(
+            "chunk-added-2026",
+            "doc-added-2026",
+            "store-1",
+            "added mid 2026",
+            vec![1.0, 0.0],
+        );
+        record.fetched_at = "2026-06-10T12:00:00Z".to_string();
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        // Every bound below names a period that CONTAINS the stored instant,
+        // so each must match. Before the bound was widened, all three
+        // returned nothing.
+        for bound in ["2026", "2026-06", "2026-06-10"] {
+            let filters = vec![MetadataFilter::DateBefore {
+                axis: DateAxis::Added,
+                value: bound.to_string(),
+            }];
+            let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "DateBefore{{Added, {bound:?}}} must include a resource added \
+                 2026-06-10T12:00:00Z — the bound names a period containing it"
+            );
+        }
+
+        // A bound naming an earlier period must still exclude it, so the
+        // widening cannot be over-broad.
+        for bound in ["2025", "2026-05", "2026-06-09"] {
+            let filters = vec![MetadataFilter::DateBefore {
+                axis: DateAxis::Added,
+                value: bound.to_string(),
+            }];
+            let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+            assert!(
+                results.is_empty(),
+                "DateBefore{{Added, {bound:?}}} must exclude a resource added later"
+            );
+        }
+    }
+
+    pub async fn test_date_filter_document_axis_partial_precision_widening(
+        store: &dyn RetrievalStore,
+    ) {
+        let mut record = make_record(
+            "chunk-partial-2024",
+            "doc-partial-2024",
+            "store-1",
+            "bare year dc:date",
+            vec![1.0, 0.0],
+        );
+        record.date_parsed = Some("2024".to_string());
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        let excluding = vec![MetadataFilter::DateBefore {
+            axis: DateAxis::Document,
+            value: "2024-06-01".to_string(),
+        }];
+        let excluded = store
+            .dense_search(&[1.0, 0.0], 10, &excluding)
+            .await
+            .unwrap();
+        assert!(
+            excluded.is_empty(),
+            "bare-year 2024 must be EXCLUDED by DateBefore(Document, 2024-06-01), got {excluded:?}"
+        );
+
+        let including_before = vec![MetadataFilter::DateBefore {
+            axis: DateAxis::Document,
+            value: "2024-12-31".to_string(),
+        }];
+        let included_before = store
+            .dense_search(&[1.0, 0.0], 10, &including_before)
+            .await
+            .unwrap();
+        assert_eq!(
+            included_before.len(),
+            1,
+            "bare-year 2024 must be INCLUDED by DateBefore(Document, 2024-12-31), got \
+             {included_before:?}"
+        );
+
+        let including_after = vec![MetadataFilter::DateAfter {
+            axis: DateAxis::Document,
+            value: "2023-12-31".to_string(),
+        }];
+        let included_after = store
+            .dense_search(&[1.0, 0.0], 10, &including_after)
+            .await
+            .unwrap();
+        assert_eq!(
+            included_after.len(),
+            1,
+            "bare-year 2024 must be INCLUDED by DateAfter(Document, 2023-12-31), got \
+             {included_after:?}"
+        );
+    }
+
+    /// Table-driven round trip over the three axes that carry a
+    /// caller-supplied literal (`Added`, `Modified`, `Document`). Each axis
+    /// gets an "old" and a "new" chunk; `DateAfter` on a midpoint bound must
+    /// match only the new chunk, `DateBefore` on the same bound only the old
+    /// one.
+    ///
+    /// `DateAxis::Updated` is deliberately excluded from this table — see
+    /// `DateAxis::value_of`'s doc comment: the store always stamps its own
+    /// write-time clock for that axis, so no fixed literal a test supplies
+    /// ever reaches the persisted value, and a uniform fixed-literal
+    /// round-trip can't exercise it. See
+    /// `test_date_filter_updated_axis_now_relative` (store-libsql-only, using
+    /// now-relative bounds) for that axis's own dedicated coverage.
+    pub async fn test_date_filter_per_axis_round_trip(store: &dyn RetrievalStore) {
+        for axis in [DateAxis::Added, DateAxis::Modified, DateAxis::Document] {
+            let axis_name = axis.name();
+            let old_id = format!("chunk-{axis_name}-old");
+            let new_id = format!("chunk-{axis_name}-new");
+            let old_doc = format!("doc-{axis_name}-old");
+            let new_doc = format!("doc-{axis_name}-new");
+
+            let mut old = make_record(&old_id, &old_doc, "store-1", "old", vec![1.0, 0.0]);
+            let mut new = make_record(&new_id, &new_doc, "store-1", "new", vec![0.5, 0.5]);
+            match axis {
+                DateAxis::Added => {
+                    old.fetched_at = "2026-01-01T00:00:00Z".to_string();
+                    new.fetched_at = "2026-06-10T00:00:00Z".to_string();
+                }
+                DateAxis::Modified => {
+                    old.modified_at = Some("2026-01-01T00:00:00Z".to_string());
+                    new.modified_at = Some("2026-06-10T00:00:00Z".to_string());
+                }
+                DateAxis::Document => {
+                    old.date_parsed = Some("2026-01-01".to_string());
+                    new.date_parsed = Some("2026-06-10".to_string());
+                }
+                DateAxis::Updated => unreachable!("not in this loop's set"),
+            }
+            store.upsert_chunks(vec![old, new]).await.unwrap();
+
+            let after = vec![MetadataFilter::DateAfter {
+                axis,
+                value: "2026-03-01T00:00:00Z".to_string(),
+            }];
+            let after_results = store.dense_search(&[1.0, 0.0], 10, &after).await.unwrap();
+            let after_ids: Vec<&str> = after_results.iter().map(|r| r.chunk.id.as_str()).collect();
+            assert_eq!(
+                after_ids,
+                vec![new_id.as_str()],
+                "{axis_name}: DateAfter should match only the new chunk"
+            );
+
+            let before = vec![MetadataFilter::DateBefore {
+                axis,
+                value: "2026-03-01T00:00:00Z".to_string(),
+            }];
+            let before_results = store.dense_search(&[1.0, 0.0], 10, &before).await.unwrap();
+            let before_ids: Vec<&str> =
+                before_results.iter().map(|r| r.chunk.id.as_str()).collect();
+            assert_eq!(
+                before_ids,
+                vec![old_id.as_str()],
+                "{axis_name}: DateBefore should match only the old chunk"
+            );
+
+            // Clean up before the next axis's iteration: `make_record`'s
+            // defaults populate every axis's field (e.g. a fixed
+            // `modified_at`), so a record left over from this axis could
+            // otherwise spuriously match a later axis's filter.
+            store.delete_by_resource(&old_doc).await.unwrap();
+            store.delete_by_resource(&new_doc).await.unwrap();
+        }
+    }
+
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
@@ -1187,6 +2232,7 @@ mod tests {
             embedding,
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            modified_at: Some("2026-06-10T12:00:00Z".to_string()),
             content_hash: "abc123".to_string(),
             origin_store: "test-store".to_string(),
             source_id: "src-1".to_string(),
@@ -1197,7 +2243,12 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 
@@ -1262,6 +2313,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_store_metadata_filter_and_combination() {
+        let store = FakeStore::new();
+        test_metadata_filter_and_combination(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_null_axis_value_excluded() {
+        let store = FakeStore::new();
+        test_date_filter_null_axis_value_excluded(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_partial_bound_on_timestamp_axis() {
+        let store = FakeStore::new();
+        test_date_filter_partial_bound_on_timestamp_axis(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_document_axis_partial_precision_widening() {
+        let store = FakeStore::new();
+        test_date_filter_document_axis_partial_precision_widening(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_per_axis_round_trip() {
+        let store = FakeStore::new();
+        test_date_filter_per_axis_round_trip(&store).await;
+    }
+
+    #[tokio::test]
     async fn fake_store_get_chunk() {
         let store = FakeStore::new();
         test_get_chunk(&store).await;
@@ -1295,6 +2376,12 @@ mod tests {
     async fn fake_store_window_block_seqs_round_trip() {
         let store = FakeStore::new();
         test_window_block_seqs_round_trip(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_page_round_trip() {
+        let store = FakeStore::new();
+        test_page_round_trip(&store).await;
     }
 
     #[tokio::test]
@@ -1409,9 +2496,10 @@ mod tests {
 
         store.upsert_chunks(vec![r1, r2]).await.unwrap();
 
-        let filter = vec![MetadataFilter::FetchedAfter(
-            "2026-03-01T00:00:00Z".to_string(),
-        )];
+        let filter = vec![MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-03-01T00:00:00Z".to_string(),
+        }];
         let results = store.dense_search(&[1.0, 0.0], 10, &filter).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "new");
@@ -1459,13 +2547,27 @@ mod tests {
         assert!(MetadataFilter::UriPrefix("file:///".to_string()).matches(&record));
         assert!(!MetadataFilter::UriPrefix("https://".to_string()).matches(&record));
 
-        assert!(MetadataFilter::FetchedAfter("2026-06-01T00:00:00Z".to_string()).matches(&record));
-        assert!(!MetadataFilter::FetchedAfter("2026-06-11T00:00:00Z".to_string()).matches(&record));
+        assert!(MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-06-01T00:00:00Z".to_string(),
+        }
+        .matches(&record));
+        assert!(!MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-06-11T00:00:00Z".to_string(),
+        }
+        .matches(&record));
 
-        assert!(MetadataFilter::FetchedBefore("2026-07-01T00:00:00Z".to_string()).matches(&record));
-        assert!(
-            !MetadataFilter::FetchedBefore("2026-06-01T00:00:00Z".to_string()).matches(&record)
-        );
+        assert!(MetadataFilter::DateBefore {
+            axis: DateAxis::Added,
+            value: "2026-07-01T00:00:00Z".to_string(),
+        }
+        .matches(&record));
+        assert!(!MetadataFilter::DateBefore {
+            axis: DateAxis::Added,
+            value: "2026-06-01T00:00:00Z".to_string(),
+        }
+        .matches(&record));
 
         assert!(MetadataFilter::SourceId("src-1".to_string()).matches(&record));
         assert!(!MetadataFilter::SourceId("src-2".to_string()).matches(&record));
@@ -1475,5 +2577,51 @@ mod tests {
 
         assert!(MetadataFilter::PolicyVersion("v1".to_string()).matches(&record));
         assert!(!MetadataFilter::PolicyVersion("v2".to_string()).matches(&record));
+    }
+
+    #[tokio::test]
+    async fn fake_store_touch_resource_checked_surfaces_in_list_indexed_documents() {
+        let store = FakeStore::new();
+        let record = make_test_record("chunk-1", "doc-1", "some text", vec![1.0, 0.0]);
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        let before = store.list_indexed_documents().await.unwrap();
+        assert_eq!(
+            before[0].last_checked_at, None,
+            "a resource that was never touched must report last_checked_at: None"
+        );
+        assert_eq!(store.last_checked_at("doc-1").await, None);
+
+        store
+            .touch_resource_checked("test-store", "doc-1")
+            .await
+            .unwrap();
+
+        assert!(
+            store.last_checked_at("doc-1").await.is_some(),
+            "the test-support accessor must surface the touch"
+        );
+        let after = store.list_indexed_documents().await.unwrap();
+        assert_eq!(
+            after[0].last_checked_at,
+            store.last_checked_at("doc-1").await,
+            "list_indexed_documents must surface the same value the accessor reports"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_store_touch_resource_checked_errors_for_missing_resource() {
+        let store = FakeStore::new();
+
+        let err = store
+            .touch_resource_checked("test-store", "does-not-exist")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::ResourceNotFound {
+                id: "does-not-exist".to_string()
+            }
+        );
     }
 }

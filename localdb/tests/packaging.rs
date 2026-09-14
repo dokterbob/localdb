@@ -75,11 +75,39 @@ fn version_matches_cargo_toml() {
         .stdout(predicate::str::contains(cargo_version));
 }
 
+/// `--version` (long form) must identify the exact build: either a git SHA
+/// (7+ hex chars, from vergen) or the literal `unknown` when built outside a
+/// git checkout (e.g. from a source tarball).
+#[test]
+fn long_version_contains_commit_sha_or_unknown() {
+    let out = cmd().arg("--version").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_lowercase();
+
+    let has_sha = stdout
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok.len() >= 7 && tok.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        has_sha || stdout.contains("unknown"),
+        "--version must contain a commit SHA (or 'unknown' for git-less builds); got: {stdout}",
+    );
+}
+
+/// The workspace license must match what LICENSE/README/docs declare.
+#[test]
+fn workspace_license_is_agpl() {
+    assert_eq!(
+        env!("CARGO_PKG_LICENSE"),
+        "AGPL-3.0-or-later",
+        "workspace [workspace.package].license must match the LICENSE file (AGPL-3.0-or-later)",
+    );
+}
+
 // ---------------------------------------------------------------------------
-// T12-AC2: release workflow exists and covers three targets
+// T12-AC2: release pipeline shape — dist config + custom workflows
 // ---------------------------------------------------------------------------
 
-/// The release workflow YAML must exist at `.github/workflows/release.yml`.
+/// The dist-generated release workflow must exist at
+/// `.github/workflows/release.yml`.
 #[test]
 fn release_workflow_file_exists() {
     // Walk up from the test binary location to find the workspace root.
@@ -92,12 +120,13 @@ fn release_workflow_file_exists() {
     );
 }
 
-/// The release workflow must declare all three required platform targets.
+/// release.yml is generated from dist-workspace.toml; the three required
+/// platform targets are declared there.
 #[test]
-fn release_workflow_has_required_targets() {
-    let workflow_path = workspace_root().join(".github/workflows/release.yml");
-    let content = std::fs::read_to_string(&workflow_path)
-        .unwrap_or_else(|_| panic!("cannot read {}", workflow_path.display()));
+fn dist_config_has_required_targets() {
+    let config_path = workspace_root().join("dist-workspace.toml");
+    let content = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|_| panic!("cannot read {}", config_path.display()));
 
     for required_target in &[
         "aarch64-apple-darwin",
@@ -106,12 +135,28 @@ fn release_workflow_has_required_targets() {
     ] {
         assert!(
             content.contains(required_target),
-            "release workflow missing target '{required_target}'",
+            "dist-workspace.toml missing target '{required_target}'",
         );
     }
 }
 
-/// The release workflow must be triggered on tag pushes.
+/// dist config must keep the Homebrew channel: both installers plus our tap.
+#[test]
+fn dist_config_has_homebrew_installer_and_tap() {
+    let content = std::fs::read_to_string(workspace_root().join("dist-workspace.toml"))
+        .expect("dist-workspace.toml must exist");
+    assert!(
+        content.contains("\"homebrew\"") && content.contains("\"shell\""),
+        "dist-workspace.toml must keep the homebrew + shell installers",
+    );
+    assert!(
+        content.contains("dokterbob/homebrew-localdb"),
+        "dist-workspace.toml must name the tap",
+    );
+}
+
+/// The release workflow must be triggered on tag pushes (dist's version-tag
+/// pattern, which matches release-plz's bare vX.Y.Z tags).
 #[test]
 fn release_workflow_triggers_on_tags() {
     let workflow_path = workspace_root().join(".github/workflows/release.yml");
@@ -121,6 +166,10 @@ fn release_workflow_triggers_on_tags() {
     assert!(
         content.contains("tags:"),
         "release workflow must trigger on tag pushes",
+    );
+    assert!(
+        content.contains("[0-9]+.[0-9]+.[0-9]+"),
+        "release workflow tag pattern must match vX.Y.Z",
     );
 }
 
@@ -137,6 +186,109 @@ fn release_workflow_uploads_artifacts() {
         || content.contains("gh release upload")
         || content.contains("release_assets");
     assert!(has_upload, "release workflow must upload release artifacts",);
+}
+
+/// Every custom job the dist config references must exist as a reusable
+/// (`workflow_call`) workflow, and release.yml must actually call it —
+/// otherwise `dist generate` was run without the companion files.
+#[test]
+fn custom_workflows_exist_and_are_wired() {
+    let root = workspace_root();
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("release.yml must exist");
+
+    for (file, job) in &[
+        ("release-checks.yml", "custom-release-checks"),
+        ("homebrew-tap-publish.yml", "custom-homebrew-tap-publish"),
+        ("smoke-test.yml", "custom-smoke-test"),
+    ] {
+        let path = root.join(".github/workflows").join(file);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("cannot read {}", path.display()));
+        assert!(
+            content.contains("workflow_call"),
+            "{file} must be a reusable workflow (workflow_call)",
+        );
+        assert!(
+            release.contains(job),
+            "release.yml must wire the {job} job (regenerate with `dist generate`)",
+        );
+    }
+}
+
+/// The release-plz workflow (rolling bump+changelog PR; tag on merge) must
+/// exist — it is what feeds tags to the dist pipeline.
+#[test]
+fn release_plz_workflow_exists() {
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/release-plz.yml"))
+            .expect("release-plz.yml must exist");
+    assert!(
+        content.contains("release-pr"),
+        "release-plz workflow must maintain the release PR",
+    );
+    assert!(
+        content.contains("command: release"),
+        "release-plz workflow must tag on merge",
+    );
+}
+
+/// The tap formula template must keep the brew-services and completions
+/// integrations that justify hand-maintaining it over dist's generated one.
+#[test]
+fn homebrew_template_has_service_and_completions() {
+    let root = workspace_root();
+    let template = std::fs::read_to_string(root.join("homebrew/localdb.rb.erb"))
+        .expect("homebrew/localdb.rb.erb must exist");
+    assert!(
+        template.contains("service do"),
+        "formula template must declare a brew-services `service do` block",
+    );
+    assert!(
+        template.contains("generate_completions_from_executable"),
+        "formula template must install shell completions",
+    );
+    assert!(
+        template.contains("AGPL-3.0-or-later"),
+        "formula template must carry the license",
+    );
+    assert!(
+        root.join("homebrew/render.rb").exists(),
+        "formula render script must exist",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shell completions: `localdb completions <shell>` (specs/05-surfaces.md §2)
+// ---------------------------------------------------------------------------
+
+/// Every supported shell generates a non-empty completion script mentioning
+/// the binary name, exit 0. Pure codegen: must work without config or store.
+#[test]
+fn completions_generate_for_all_shells() {
+    for shell in &["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = cmd()
+            .args(["completions", shell])
+            .output()
+            .expect("completions must run");
+        assert!(
+            out.status.success(),
+            "completions {shell} must exit 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("localdb"),
+            "completions {shell} output must mention 'localdb'; got {} bytes",
+            stdout.len(),
+        );
+    }
+}
+
+/// An unknown shell is a usage error (clap rejects it, exit 2).
+#[test]
+fn completions_unknown_shell_is_usage_error() {
+    cmd().args(["completions", "tcsh"]).assert().code(2);
 }
 
 // ---------------------------------------------------------------------------

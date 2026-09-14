@@ -1,0 +1,11 @@
+{
+  "file": "damaged-content-stream.pdf",
+  "expect": "any",
+  "pages": 1,
+  "page_phrases": {
+    "1": ["Potato"]
+  },
+  "forbid_substrings": ["�"],
+  "title_contains": null,
+  "notes": "Content stream deliberately corrupted. Rendered page 1 shows only a single word, 'Potato', in plain black text near the top-left; the rest of the page is blank white, consistent with the content stream being truncated/damaged after the first text-show operator. Test only needs to confirm extraction does not panic and produces no mojibake ('�')."
+}

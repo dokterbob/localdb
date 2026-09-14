@@ -1,11 +1,11 @@
-use localdb_core::{
-    config::loader::{load_config, LoadOptions},
-    Error,
-};
+use localdb_core::Error;
 use serde_json::json;
 
 use crate::{
-    app_db::load_app_db,
+    app_db::{
+        load_config_scaffolded, load_config_scaffolded_local, open_app_db_or_exit,
+        reject_store_flag, resolve_store_scope, StoreScopePolicy, SERVE_REJECT_MESSAGE,
+    },
     daemon_client::{probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, print_json},
 };
@@ -17,14 +17,33 @@ pub fn run_serve(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_serve_async(ctx: &CliContext) {
-    let options = LoadOptions {
-        config_path: ctx.config.clone(),
-        ..Default::default()
-    };
-    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
-        Ok(c) => c,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // specs/05-surfaces.md §2.2: the daemon serves every store in the
+    // database — `/v1` and `/mcp` alike — so there is nothing for `-s` to
+    // narrow. First statement in the function so a misused flag exits before
+    // `create_dir_all`/`start_daemon` bind a port or take the write lock.
+    reject_store_flag(ctx, SERVE_REJECT_MESSAGE);
+
+    // Issue #119/#120: `serve` is itself a legitimate first-run entry point
+    // (nothing requires `localdb init` before `localdb serve`), so it now
+    // scaffolds config + a `default` store on a genuine first run, the same
+    // way the strict `command_table::dispatch` call sites do — see
+    // `app_db::load_config_scaffolded`'s doc comment. The `_local` variant
+    // because `serve` never routes to `LOCALDB_DAEMON_URL` — it always
+    // starts a local daemon — so the env var must not suppress the local
+    // `default`-store seeding the way it does for routable commands (see
+    // `load_config_scaffolded_local`'s doc comment). Its scaffolding errors
+    // (e.g. the F11 guard on an explicit `--config` with a missing parent)
+    // map to the same exit codes the old bare `load_config` hard-fail below
+    // did: `Error::InvalidConfig` -> exit 2, via the same `exit_err`.
+    let config_loader = load_config_scaffolded_local(ctx).await;
+
+    // Still required even after scaffolding: `ensure_config_scaffolded` only
+    // creates `paths.data`/`models`/`logs` on a genuine first run (no config
+    // file at the resolved path at all) — when a config file already exists
+    // but names a data dir that hasn't been created yet (e.g. a hand-edited
+    // `paths.data`), scaffolding is a no-op and this is still the only thing
+    // that creates it. Right after a fresh scaffold, `data_dir` already
+    // exists, so this is a no-op `create_dir_all` in that case.
     if let Err(e) = std::fs::create_dir_all(&config_loader.paths.data_dir) {
         exit_err(
             &Error::Internal {
@@ -68,58 +87,90 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 }
 
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
-    use mcp::{proxy::ProxyHandler, McpHandler};
+    use mcp::{
+        proxy::{ProxyConnectError, ProxyHandler},
+        McpHandler,
+    };
 
-    // `load_app_db` is unconditional here — same sequencing as
-    // `search.rs`'s `run_search_async` — since `probe_daemon` needs
-    // `config_loader.paths.data_dir` regardless of which mode we end up in.
-    // SQLite WAL mode makes opening it harmless even when a daemon is
-    // already running (see `app_db::load_app_db`'s doc comment); in the
-    // `Proxied` branch below, `db`/`config_loader` simply go unused beyond
-    // this point, exactly as `search.rs`'s `SearchMode::Daemon` branch
-    // leaves its own `db` unused.
-    let (config_loader, db) = load_app_db(ctx).await;
+    // specs/05-surfaces.md §4: v1 registers no mutating tool on any
+    // transport, so `--allow-write` currently changes nothing — the tool set
+    // is identical with and without it. Warn rather than exit 2 (which is
+    // what a misapplied `-s` gets): this flag fails *safe*. It can only
+    // withhold a capability the caller would notice immediately as a missing
+    // tool, whereas `-s` failing open would silently widen access. Refusing
+    // to start an MCP server over it would be disproportionate.
+    if allow_write {
+        eprintln!(
+            "warning: no mutating MCP tools exist in v1; `--allow-write` currently has no effect"
+        );
+    }
+
+    // Config only, up front: `probe_daemon` only needs
+    // `config_loader.paths.data_dir`, and `mcp` is hand-rolled rather than a
+    // `command_table::dispatch` call site, so it adopts the same lazy-open
+    // helpers dispatch's call sites use (issue #187 review, finding G4) by
+    // hand. The local `AppDb` is opened below, via `open_app_db_or_exit`,
+    // only in the embedded branch — never in the `Proxied` branch, which
+    // never touches it. Before this, `load_app_db` opened the local db
+    // unconditionally, so a broken local store (unwritable, locked,
+    // schema-too-new) would `exit_err` before `probe_daemon` ever ran,
+    // preempting a healthy daemon that never needed the local db at all.
+    let config_loader = load_config_scaffolded(ctx).await;
 
     if let DaemonState::Running { base_url } =
         probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
     {
-        // The daemon's `/mcp` route has no notion of a stdio caller's
-        // `--store` scope (specs/05-surfaces.md §4) — re-filtering
-        // client-side would mean re-deriving store visibility rules the
-        // daemon already applied, for a flag combination narrow enough not
-        // to be worth it in v1. Warn instead of silently ignoring it.
-        if !ctx.stores.is_empty() {
-            eprintln!(
-                "warning: --store is not honored when a daemon is running; \
-                 the daemon's full store set will be used instead"
-            );
-        }
-        // Attach the caller's bearer credential (LOCALDB_API_KEY, else
-        // credentials.json keyed by the daemon base URL — specs/03-config.md
-        // §6) so proxied stdio MCP works against an auth-enforcing daemon.
-        // `None` (no credential available) is fine against an open-mode
-        // daemon; an enforcing daemon answers 401 and the handshake fails.
-        //
-        // Unlike `daemon_request_async`, this is a long-lived stdio<->HTTP
-        // proxy handshake with no cheap way to retry mid-stream on a 401, so
-        // the bearer is resolved through `ensure_fresh_bearer` instead of
-        // `resolve_bearer`/`bearer_for_request`: if the cached access token
-        // is already expired and a refresh token is on hand, it proactively
-        // redeems it (persisting the rotated pair to credentials.json)
-        // *before* connecting, rather than handing the daemon a token that's
-        // certain to be rejected.
-        let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, &base_url).await;
-        // Connect and serve are separate calls (`ProxyHandler::connect_with_auth`
-        // then `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
+        // Connect and serve are separate calls (`ProxyHandler::connect` then
+        // `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
         // failure to reach the daemon at all — it went away between
         // `probe_daemon` and here, or `LOCALDB_DAEMON_URL` points at a stale
         // endpoint — maps to the same `daemon_unreachable`/exit-5 outcome as
         // every other daemon-backed CLI path, instead of `internal`/exit-1.
         // Only a failure in the stdio loop *after* a successful proxy
         // connection (a much rarer case) still falls back to `internal`.
-        let handler = match ProxyHandler::connect_with_auth(&base_url, bearer).await {
+        //
+        // `ctx.stores` is passed through rather than warned about: proxied
+        // mode now genuinely enforces `--store` (specs/05-surfaces.md
+        // §4.2.1). `connect` validates each name against the store set the
+        // daemon actually exposes over MCP, so an unknown name is
+        // `store_not_found`/exit 3 here — the same answer embedded mode
+        // gives — instead of the old behavior of warning and then serving
+        // the daemon's *full* store set, which silently widened access
+        // exactly when the caller had asked to narrow it (#201).
+        //
+        // Syntax-validate first, though (Codex review, P2). `connect` can
+        // only ever answer "the daemon doesn't have that name", so a
+        // malformed one like `../evil` would surface as
+        // `store_not_found`/exit 3 — while embedded mode and every other
+        // store-scoped command reject it as `invalid_request`/exit 2 before
+        // resolving anything. Same ordering, and the same reason, as
+        // `resolve_daemon_store_scope_inner` and `source remove`'s daemon
+        // branch: a malformed name never reaches the wire.
+        for name in &ctx.stores {
+            if let Err(e) = crate::normalize::validate_store_name(name) {
+                exit_err(&e, ctx.json);
+            }
+        }
+
+        let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, &base_url).await;
+        let handler = match ProxyHandler::connect_with_auth(&base_url, &ctx.stores, bearer).await {
             Ok(handler) => handler,
-            Err(_) => {
+            Err(ProxyConnectError::StoreNotFound(name)) => {
+                exit_err(&Error::StoreNotFound { id: name }, ctx.json);
+            }
+            Err(ProxyConnectError::Unreachable(e)) => {
+                // The underlying transport/handshake error (`e`) is otherwise
+                // discarded — `exit_err` below only ever prints the generic
+                // "daemon is unreachable" message, giving no clue *why* the
+                // proxy hop failed (issue #147: the daemon/MCP connection
+                // path gives no diagnostic signal on rejection). `warn!` so
+                // it surfaces under the default `warn,pdf_oxide=off` filter
+                // (`localdb/src/main.rs`) without needing `RUST_LOG=debug`.
+                tracing::warn!(
+                    daemon_url = %base_url,
+                    error = %e,
+                    "mcp proxy: failed to connect to daemon"
+                );
                 exit_err(&Error::DaemonUnreachable, ctx.json);
             }
         };
@@ -135,33 +186,39 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         return;
     }
 
+    // Same store resolution as `localdb search`, through the one shared
+    // resolver (specs/05-surfaces.md §2.2/§4.2.1). This replaced a
+    // hand-rolled `runtime_stores.iter().find(...)` loop that *skipped*
+    // unmatched `--store` names: `localdb -s typo mcp` used to start a server
+    // exposing zero stores, which reads to an agent as "this index is empty"
+    // rather than "you typo'd" (#201). It is now `store_not_found`, exit 3.
+    //
+    // `AllStoresAllowEmpty`, not `AllStores`: a genuinely storeless database
+    // must still *start* — an MCP server that exits non-zero at startup reads
+    // to its client as broken, not as empty.
+    let db = open_app_db_or_exit(ctx, &config_loader).await;
+    let _scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
+
     let embed_policy = &config_loader.config.defaults.indexing.embedding;
     let models_dir = config_loader.paths.models_dir.clone();
     let embedder = match embed::create_embedder(
         embed_policy,
         &config_loader.config.providers,
         Some(&models_dir),
+        &(&config_loader.config.http).into(),
     ) {
         Ok(e) => e,
         Err(e) => exit_err(&Error::from(e), ctx.json),
     };
 
-    // Realtime store resolution (T2): rather than snapshotting the runtime
-    // store list once here, `AppDbStoreProvider` re-derives it from the DB
-    // on every tool call, narrowed by `--store` flags when given (empty
-    // means "all runtime stores, whatever they are at call time"). A store
-    // added later (e.g. by a concurrent `localdb store add`, or another
-    // process sharing the same WAL-mode database) is therefore visible
-    // without restarting this stdio process.
-    let provider: std::sync::Arc<dyn mcp::StoreProvider> = std::sync::Arc::new(
-        crate::app_db::AppDbStoreProvider::new(std::sync::Arc::new(db), ctx.stores.clone()),
-    );
-
-    // Embedded stdio MCP stays unauthenticated (D8, specs/05-surfaces.md §4):
-    // the caller is already trusted as local-files-equivalent, so every tool
-    // call runs as the local-trust principal.
+    let db = std::sync::Arc::new(db);
+    let provider = std::sync::Arc::new(crate::app_db::AppDbStoreProvider::new(
+        db.clone(),
+        ctx.stores.clone(),
+    ));
     let handler = McpHandler::new(
         provider,
+        db.backend_arc(),
         std::sync::Arc::from(embedder),
         allow_write,
         Some(localdb_core::auth::Principal::local_trust()),

@@ -14,10 +14,12 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-license = "MIT"
-rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/dokterbob/localdb"
+homepage = "https://github.com/dokterbob/localdb"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Async runtime
@@ -29,7 +31,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
 # CLI argument parsing
-clap = { version = "4", features = ["derive", "color", "env"] }
+clap = { version = "4", features = ["derive", "color", "env", "string"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -57,6 +59,11 @@ rand = "0.8"
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
+# `tokio_util::sync::CancellationToken` (issue #218) — per-job cooperative
+# cancellation signal the job queue races a running job's future against.
+# Already resolved transitively (a dependency of `axum`/`tokio` itself); this
+# adds a direct dependency for `server`, not a new crate to the graph.
+tokio-util = "0.7"
 
 # Platform paths
 directories = "6"
@@ -67,9 +74,21 @@ libsql = "=0.10.0-pre.4"
 
 # URL parsing
 url = "2"
+percent-encoding = "2"
 
 # Hashing for policy_version
 hex = "0.4"
+
+# Date/time: canonical RFC 3339 timestamp formatting and parsing. Every stored
+# timestamp is produced here, so the formatter is a shared dependency rather
+# than each crate reaching for its own.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# Relative-duration search filter values, e.g. `--modified-after 7d` (issue
+# #247). NOT zero-cost on Linux: its only existing lockfile dependent reaches
+# it through `embed`'s macOS-gated `local-coreml` feature, so on the two
+# Linux release targets this is one genuinely new (small) compiled crate.
+humantime = "2"
 
 # Progress bars and spinners
 indicatif = "0.17"
@@ -79,22 +98,38 @@ tempfile = "3"
 
 # MCP (Model Context Protocol) SDK
 rmcp = "1.8"
-schemars = "1.0"
+schemars = { version = "1.0", features = ["preserve_order"] }
+
+# Retry / rate limiting / HTTP date parsing
+backon = { version = "1.6", default-features = false, features = ["std", "tokio-sleep"] }
+governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
+httpdate = "1.0"
+# `http`'s types only — `core` uses `HeaderValue` to validate operator-supplied
+# header values at config-load time rather than at first request. Already in
+# the graph transitively via reqwest/axum, so this adds no new dependency.
+http = "1"
 
 # Internal crates
-localdb-core = { path = "core" }
-extract = { path = "extract" }
-fetch = { path = "fetch" }
-ingest = { path = "ingest" }
-store-libsql = { path = "store-libsql" }
-embed = { path = "embed" }
-server = { path = "server" }
-mcp = { path = "mcp" }
-cli = { path = "cli" }
+localdb-core = { path = "core", version = "0.2.0" }
+localdb-extract = { path = "extract", version = "0.2.0" }
+localdb-fetch = { path = "fetch", version = "0.2.0" }
+localdb-ingest = { path = "ingest", version = "0.2.0" }
+localdb-store-libsql = { path = "store-libsql", version = "0.2.0" }
+localdb-embed = { path = "embed", version = "0.2.0" }
+localdb-server = { path = "server", version = "0.2.0" }
+localdb-mcp = { path = "mcp", version = "0.2.0" }
+localdb-cli = { path = "cli", version = "0.2.0" }
 
 [profile.dev]
 opt-level = 0
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# The profile cargo-dist builds release artifacts with; stripping here
+# replaces the release pipeline's manual `strip` step.
+[profile.dist]
+inherits = "release"
+strip = true

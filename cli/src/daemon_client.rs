@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use localdb_core::Error;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 /// Parsed global CLI flags, forwarded to every command handler.
 #[derive(Debug, Clone)]
@@ -387,602 +389,153 @@ pub(crate) async fn daemon_request_async(
 /// Map a daemon HTTP error body's stable `code` string (see
 /// `server/src/error.rs` and specs/05-surfaces.md §5) to a `core::Error`.
 ///
-/// Extracted as a pure function so the code -> variant mapping (including
-/// the legacy-code fallback below) can be unit-tested without an HTTP round
-/// trip.
+/// Delegates the code -> variant mapping to [`Error::from_code`] — the same
+/// mapping `cli::job_attach::finish_job` uses to reconstruct a failed daemon
+/// job's typed error from its `error_code`/`error` fields, so the two
+/// boundaries (HTTP error bodies, job terminal state) never drift apart. Only
+/// the fallback for a code `from_code` doesn't recognize (an unknown/newer
+/// code, or `internal`/`unsupported_format`/`extraction_failed`, none of
+/// which round-trip through a single message string) is specific to this
+/// call site: it folds the HTTP status into the message, which `from_code`
+/// has no access to.
 fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> Error {
-    match code {
-        "store_not_found" => Error::StoreNotFound { id: msg },
-        "source_not_found" => Error::SourceNotFound { id: msg },
-        "resource_not_found" => Error::ResourceNotFound { id: msg },
-        // Legacy code string from a stale daemon predating the
-        // resource_not_found rename (specs/05-surfaces.md §5); a v5+
-        // CLI may still talk to an older daemon binary, so keep
-        // decoding it to the same variant.
-        "document_not_found" => Error::ResourceNotFound { id: msg },
-        "job_not_found" => Error::JobNotFound { id: msg },
-        "runtime_state_locked" => Error::RuntimeStateLocked,
-        "daemon_running" => Error::DaemonRunning,
-        "daemon_unreachable" => Error::DaemonUnreachable,
-        "invalid_config" => Error::InvalidConfig { message: msg },
-        "invalid_request" => Error::InvalidRequest { message: msg },
-        "index_in_progress" => Error::IndexInProgress,
-        "provider_unavailable" => Error::ProviderUnavailable { message: msg },
-        "model_missing" => Error::ModelMissing { message: msg },
-        "unauthorized" => Error::Unauthorized { message: msg },
-        "forbidden" => Error::Forbidden { message: msg },
-        _ => Error::Internal {
-            message: format!("daemon returned {}: {}", status.as_u16(), msg),
-            correlation_id: "daemon_http".to_string(),
-        },
-    }
+    Error::from_code(code, msg.clone()).unwrap_or_else(|| Error::Internal {
+        message: format!("daemon returned {}: {}", status.as_u16(), msg),
+        correlation_id: "daemon_http".to_string(),
+    })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
+/// RFC 3986 "unreserved" characters (`ALPHA / DIGIT / "-" / "." / "_" /
+/// "~"`) are left unencoded; everything else is percent-encoded.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
-    #[test]
-    fn base_url_of_extracts_origin_with_port() {
-        assert_eq!(
-            base_url_of("http://127.0.0.1:7700/v1/stores").as_deref(),
-            Some("http://127.0.0.1:7700")
-        );
-    }
+/// Percent-encode a single user- or daemon-controlled value for safe
+/// inclusion in a daemon request URL — whether as a path segment (a store
+/// name, a source id) or a query value (a pagination cursor).
+///
+/// Without this, a store name containing a URL-structural character (`#`,
+/// `?`, `/`) interpolated raw via `format!` silently retargets the request:
+/// `"a#b"` in `format!("{base_url}/v1/stores/{name}/sources")` parses as
+/// path `/v1/stores/a` with fragment `b/sources` — the fragment is never
+/// sent to the server at all, so the request hits `GET /v1/stores/a`
+/// instead. The unreserved-only encoding here is safe in both the
+/// path-segment and query-value position: percent-encoding round-trips
+/// through `axum`'s `Path`/`Query` extractors regardless of which delimiter
+/// the raw value happened to contain, so a value can never be split across a
+/// URL structural boundary it didn't ask to cross. Over-encoding a character
+/// that didn't strictly need it is harmless; under-encoding one that did is
+/// this bug.
+pub(crate) fn encode_path_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
+}
 
-    #[test]
-    fn base_url_of_preserves_bracketed_ipv6() {
-        assert_eq!(
-            base_url_of("http://[::1]:7700/v1/status").as_deref(),
-            Some("http://[::1]:7700")
-        );
-    }
+/// Upper bound on pages walked by [`walk_daemon_pages`] — defense in depth
+/// beyond the cursor-repeat guard below: even a daemon that never repeats a
+/// cursor value cannot make the CLI paginate forever.
+const MAX_DAEMON_PAGES: usize = 10_000;
 
-    #[test]
-    fn base_url_of_without_port() {
-        assert_eq!(
-            base_url_of("https://daemon.example.com/v1/search").as_deref(),
-            Some("https://daemon.example.com")
-        );
-    }
+/// Walk a paginated daemon list endpoint (`GET {base_url}{path}`, optionally
+/// suffixed with `?cursor=<encoded>` or, when `path` already carries a query
+/// string of its own, `&cursor=<encoded>`) to exhaustion, invoking `on_page` with
+/// each page's raw `items` array. `on_page` returns `true` to stop walking
+/// early (e.g. once a sought item has been found) or `false` to continue to
+/// the next page. `path` must already be fully formed (any dynamic segment,
+/// e.g. a store name or an existing `?filter=value` query string, pre-encoded
+/// via [`encode_path_segment`]) — this function only ever appends the
+/// cursor's query value itself, joined with `?` when `path` carries no query
+/// string yet or `&` when it already does (e.g. `path` already ending in
+/// `?source=<id>`), so the cursor is never merged into the same key as an
+/// existing query parameter.
+///
+/// Shared by every daemon-routed command that paginates a list endpoint
+/// (`resolve_daemon_store_scope`'s `GET /v1/stores` walk, `index`'s
+/// `GET /v1/stores/{name}/sources` owner walk) so the two guards below can't
+/// drift out of sync between call sites.
+///
+/// Guards against two failure modes a hostile or broken daemon response can
+/// trigger:
+/// - **Malformed page shape**: a response with a missing or non-array
+///   `items` field is `Error::Internal`, not a silently-empty page. Without
+///   this, a request that lands on the wrong endpoint (e.g. the
+///   fragment-truncation bug `encode_path_segment` fixes) gets back a
+///   differently-shaped body — a single resource object, say — and the old
+///   `.unwrap_or_default()` swallowed that into an empty item list, which
+///   `daemon_store_has_source` then read as a legitimate "not found in this
+///   store" rather than an error.
+/// - **Cursor cycles**: every `next_cursor` value returned is recorded in a
+///   `HashSet`; a repeat of *any* previously-seen value — not just the
+///   immediately-preceding one — is `Error::Internal` rather than an
+///   infinite loop. A single "does this equal the previous cursor" check
+///   only catches an immediate repeat; a daemon alternating between two (or
+///   more) cursors never triggers it and loops forever. `MAX_DAEMON_PAGES`
+///   additionally bounds the walk even against a daemon that never repeats a
+///   cursor value at all.
+pub(crate) async fn walk_daemon_pages(
+    ctx: &CliContext,
+    base_url: &str,
+    path: &str,
+    mut on_page: impl FnMut(&[serde_json::Value]) -> bool,
+) -> Result<(), Error> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors: HashSet<String> = HashSet::new();
 
-    /// Regression test for a reviewer claim that an IPv6 daemon origin key
-    /// might be written one way (e.g. by `login`, from the raw base URL
-    /// `probe_daemon`/`daemon.url` hand out) and looked up another way (via
-    /// `base_url_of` on the constructed request URL), causing a bracket
-    /// mismatch and a spurious 401. Both sides in fact go through the same
-    /// canonical `scheme://[host]:port` shape — `daemon.url` is written from
-    /// `std::net::SocketAddr`'s `Display` impl, which already brackets IPv6
-    /// (`[::1]:7700`), and `base_url_of` reserializes via `url::Url`, which
-    /// also brackets IPv6 host_str. This test writes a credential keyed by
-    /// the raw bracketed base URL (as `login` would) and confirms
-    /// `bearer_for_request` on a URL built from that same base URL finds it.
-    #[test]
-    fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-
-        let base_url = "http://[::1]:7700";
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        crate::credentials::write_entry(
-            &credentials_file,
-            base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("ldb_ipv6_access".to_string()),
-                refresh_token: None,
-                access_expires_at: None,
-            },
-        )
-        .unwrap();
-
-        let ctx = ctx_with_config(&config_file);
-        let request_url = format!("{base_url}/v1/status");
-        assert_eq!(
-            bearer_for_request(&ctx, &request_url).as_deref(),
-            Some("ldb_ipv6_access"),
-            "the credential written for the bracketed IPv6 base URL must be \
-             found again when looked up via the same base URL derivation"
-        );
-    }
-
-    #[test]
-    fn probe_not_running_without_socket() {
-        let dir = TempDir::new().unwrap();
-        assert!(matches!(
-            probe_daemon(dir.path(), None),
-            DaemonState::NotRunning
-        ));
-    }
-
-    #[test]
-    fn probe_running_with_socket_file_removes_stale_socket() {
-        let dir = TempDir::new().unwrap();
-        let sock_path = dir.path().join("daemon.sock");
-        std::fs::write(&sock_path, b"").unwrap();
-        assert!(matches!(
-            probe_daemon(dir.path(), None),
-            DaemonState::NotRunning
-        ));
-        assert!(!sock_path.exists());
-    }
-
-    #[test]
-    fn probe_daemon_health_inner_ipv6_no_port() {
-        let _ = probe_daemon_health_inner("http://[::1]/v1/status");
-    }
-
-    #[test]
-    fn probe_daemon_env_var_bypasses_socket_check() {
-        let dir = TempDir::new().unwrap();
-        let state = probe_daemon(dir.path(), Some("http://127.0.0.1:9999"));
-        assert!(
-            matches!(state, DaemonState::Running { base_url } if base_url == "http://127.0.0.1:9999")
-        );
-    }
-
-    #[test]
-    fn probe_running_reads_base_url_from_discovery_file() {
-        // Simulate a daemon bound to a non-default port: `daemon.sock` marks a
-        // daemon as present, and `daemon.url` (server::socket::UrlFileGuard)
-        // records the real client-reachable base URL to probe.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base_url = format!("http://{}", addr);
-
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("daemon.sock"), b"").unwrap();
-        std::fs::write(dir.path().join("daemon.url"), &base_url).unwrap();
-
-        let state = probe_daemon(dir.path(), None);
-        assert!(
-            matches!(state, DaemonState::Running { base_url: found } if found == base_url),
-            "expected Running with base_url from daemon.url"
-        );
-    }
-
-    #[test]
-    fn probe_stale_removes_both_socket_and_url_file() {
-        // Port 0 is never a listening address, so this deterministically fails
-        // the reachability check without depending on port availability in CI.
-        let dir = TempDir::new().unwrap();
-        let sock_path = dir.path().join("daemon.sock");
-        let url_path = dir.path().join("daemon.url");
-        std::fs::write(&sock_path, b"").unwrap();
-        std::fs::write(&url_path, b"http://127.0.0.1:0").unwrap();
-
-        assert!(matches!(
-            probe_daemon(dir.path(), None),
-            DaemonState::NotRunning
-        ));
-        assert!(!sock_path.exists(), "stale socket should be removed");
-        assert!(
-            !url_path.exists(),
-            "stale discovery URL file should be removed"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // T4: 401-retry-with-refresh
-    // -----------------------------------------------------------------
-
-    /// A minimal stateful mock daemon (hand-rolled raw TCP, mirroring
-    /// `localdb/tests/auth_cli.rs`'s style): any non-`/token` route answers
-    /// 401 unless `Authorization: Bearer new_access` is presented; `POST
-    /// /token` with `grant_type=refresh_token&refresh_token=old_refresh`
-    /// answers a fresh `new_access`/`new_refresh` pair, anything else
-    /// `invalid_grant`.
-    fn start_refresh_mock_daemon() -> u16 {
-        use std::io::{BufRead, BufReader, Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock daemon");
-        let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-
-                let mut request_line = String::new();
-                let _ = reader.read_line(&mut request_line);
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
-
-                let mut auth: Option<String> = None;
-                let mut content_length: usize = 0;
-                loop {
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line);
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    let lower = line.to_ascii_lowercase();
-                    if lower.starts_with("authorization:") {
-                        auth = Some(line["authorization:".len()..].trim().to_string());
-                    }
-                    if let Some(rest) = lower.strip_prefix("content-length:") {
-                        content_length = rest.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; content_length];
-                if content_length > 0 {
-                    let _ = reader.read_exact(&mut body);
-                }
-                let body = String::from_utf8_lossy(&body).to_string();
-
-                let response = if path.starts_with("/token") {
-                    if body.contains("grant_type=refresh_token")
-                        && body.contains("refresh_token=old_refresh")
-                    {
-                        let json = r#"{"access_token":"new_access","refresh_token":"new_refresh","expires_in":3600,"token_type":"Bearer"}"#;
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                            json.len(),
-                            json
-                        )
-                    } else {
-                        let json = r#"{"error":"invalid_grant"}"#;
-                        format!(
-                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                            json.len(),
-                            json
-                        )
-                    }
-                } else if auth.as_deref() == Some("Bearer new_access") {
-                    let json = r#"{"status":"ok"}"#;
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                        json.len(),
-                        json
-                    )
-                } else {
-                    let json =
-                        r#"{"code":"unauthorized","message":"missing or expired bearer token"}"#;
-                    format!(
-                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: Bearer\r\nContent-Length: {}\r\n\r\n{}",
-                        json.len(),
-                        json
-                    )
-                };
-                let _ = stream.write_all(response.as_bytes());
+    for _ in 0..MAX_DAEMON_PAGES {
+        let url = match &cursor {
+            Some(c) => {
+                let sep = if path.contains('?') { '&' } else { '?' };
+                format!("{base_url}{path}{sep}cursor={}", encode_path_segment(c))
             }
-        });
+            None => format!("{base_url}{path}"),
+        };
+        let resp = daemon_request_async(ctx, reqwest::Method::GET, &url, None).await?;
+        let items = resp
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "unexpected response shape from GET {path} (missing or non-array 'items' \
+                     field)"
+                ),
+                correlation_id: "daemon_pagination_shape".to_string(),
+            })?;
 
-        port
-    }
+        if on_page(items) {
+            return Ok(());
+        }
 
-    fn ctx_with_config(config_file: &std::path::Path) -> CliContext {
-        CliContext {
-            config: Some(config_file.to_path_buf()),
-            json: false,
-            stores: vec![],
-            yes: false,
-            daemon_url: None,
-            config_env: None,
-            api_key: None,
+        let next_cursor = resp
+            .get("next_cursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        match next_cursor {
+            None => return Ok(()),
+            Some(next) => {
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "daemon returned a repeating pagination cursor '{next}' for GET \
+                             {path} — a cursor value was seen twice, which a well-behaved daemon \
+                             never produces"
+                        ),
+                        correlation_id: "daemon_pagination_cycle".to_string(),
+                    });
+                }
+                cursor = Some(next);
+            }
         }
     }
 
-    #[tokio::test]
-    async fn expired_access_token_is_retried_once_with_refreshed_token() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let port = start_refresh_mock_daemon();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        crate::credentials::write_entry(
-            &credentials_file,
-            &base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("old_access".to_string()),
-                refresh_token: Some("old_refresh".to_string()),
-                access_expires_at: None,
-            },
-        )
-        .unwrap();
-
-        let ctx = ctx_with_config(&config_file);
-        let result = daemon_request_async(
-            &ctx,
-            reqwest::Method::GET,
-            &format!("{base_url}/v1/status"),
-            None,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "expired-token retry should succeed: {:?}",
-            result.err()
-        );
-
-        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
-        assert_eq!(entry.access_token.as_deref(), Some("new_access"));
-        assert_eq!(entry.refresh_token.as_deref(), Some("new_refresh"));
-    }
-
-    #[tokio::test]
-    async fn no_refresh_token_available_surfaces_unauthorized_with_login_guidance() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let port = start_refresh_mock_daemon();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        // No credentials.json entry at all: nothing to refresh.
-        let ctx = ctx_with_config(&config_file);
-        let result = daemon_request_async(
-            &ctx,
-            reqwest::Method::GET,
-            &format!("{base_url}/v1/status"),
-            None,
-        )
-        .await;
-
-        let err = result.unwrap_err();
-        assert!(matches!(err, Error::Unauthorized { .. }));
-        assert!(
-            err.to_string().contains("login") || format!("{err:?}").contains("login"),
-            "guidance should point at `localdb login`: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_refresh_token_that_the_daemon_rejects_surfaces_unauthorized() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let port = start_refresh_mock_daemon();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        crate::credentials::write_entry(
-            &credentials_file,
-            &base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("old_access".to_string()),
-                refresh_token: Some("no-longer-valid".to_string()),
-                access_expires_at: None,
-            },
-        )
-        .unwrap();
-
-        let ctx = ctx_with_config(&config_file);
-        let result = daemon_request_async(
-            &ctx,
-            reqwest::Method::GET,
-            &format!("{base_url}/v1/status"),
-            None,
-        )
-        .await;
-
-        assert!(matches!(result.unwrap_err(), Error::Unauthorized { .. }));
-    }
-
-    #[tokio::test]
-    async fn env_api_key_skips_refresh_attempt_entirely() {
-        // LOCALDB_API_KEY is a static bearer, not part of the token-pair
-        // rotation model — a 401 with it set must not attempt a refresh
-        // grant at all (there is nothing to refresh it with).
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let port = start_refresh_mock_daemon();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        // Even with a valid refresh token cached, the env override must win
-        // and no refresh attempt should be made.
-        crate::credentials::write_entry(
-            &credentials_file,
-            &base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("old_access".to_string()),
-                refresh_token: Some("old_refresh".to_string()),
-                access_expires_at: None,
-            },
-        )
-        .unwrap();
-
-        let mut ctx = ctx_with_config(&config_file);
-        ctx.api_key = Some("ldb_env_override_that_is_wrong".to_string());
-
-        let result = daemon_request_async(
-            &ctx,
-            reqwest::Method::GET,
-            &format!("{base_url}/v1/status"),
-            None,
-        )
-        .await;
-
-        assert!(matches!(result.unwrap_err(), Error::Unauthorized { .. }));
-        // The cached refresh token must be untouched — no refresh attempt happened.
-        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
-        assert_eq!(entry.access_token.as_deref(), Some("old_access"));
-    }
-
-    // -----------------------------------------------------------------
-    // ensure_fresh_bearer: proactive pre-connect refresh for the MCP
-    // daemon-proxy handshake (`cmds::surface::run_mcp_async`), which has no
-    // cheap way to retry mid-stream on a 401 the way `daemon_request_async`
-    // does.
-    // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn ensure_fresh_bearer_refreshes_an_expired_access_token() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let port = start_refresh_mock_daemon();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        crate::credentials::write_entry(
-            &credentials_file,
-            &base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("old_access".to_string()),
-                refresh_token: Some("old_refresh".to_string()),
-                access_expires_at: Some(localdb_core::auth::rfc3339_from_now(-10)),
-            },
-        )
-        .unwrap();
-
-        let ctx = ctx_with_config(&config_file);
-        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
-
-        assert_eq!(
-            bearer.as_deref(),
-            Some("new_access"),
-            "an expired access token with a live refresh token must be redeemed proactively"
-        );
-        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
-        assert_eq!(entry.access_token.as_deref(), Some("new_access"));
-        assert_eq!(
-            entry.refresh_token.as_deref(),
-            Some("new_refresh"),
-            "the rotated refresh token must be persisted, not just the access token"
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_fresh_bearer_returns_unexpired_token_without_refreshing() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        // No mock daemon needed: a fresh token must never trigger a network
-        // call, so any unreachable base URL will do — if the code tried to
-        // refresh, the test would still pass by accident (redeem failure
-        // falls back to the current token), so we additionally assert the
-        // credentials file is untouched to catch a spurious refresh attempt.
-        let base_url = "http://127.0.0.1:1".to_string();
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        crate::credentials::write_entry(
-            &credentials_file,
-            &base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("still_good".to_string()),
-                refresh_token: Some("unused_refresh".to_string()),
-                access_expires_at: Some(localdb_core::auth::rfc3339_from_now(3600)),
-            },
-        )
-        .unwrap();
-
-        let ctx = ctx_with_config(&config_file);
-        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
-
-        assert_eq!(bearer.as_deref(), Some("still_good"));
-        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
-        assert_eq!(
-            entry.refresh_token.as_deref(),
-            Some("unused_refresh"),
-            "the refresh token must be untouched — no refresh attempt should happen"
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_fresh_bearer_env_override_wins_without_touching_credentials() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let base_url = "http://127.0.0.1:1".to_string();
-
-        // No credentials.json entry at all — if the env override is not
-        // returned verbatim first, this would fall through to `None`
-        // instead, or (if the code were buggy) attempt a file read.
-        let ctx = {
-            let mut ctx = ctx_with_config(&config_file);
-            ctx.api_key = Some("ldb_env_key".to_string());
-            ctx
-        };
-
-        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
-        assert_eq!(bearer.as_deref(), Some("ldb_env_key"));
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        assert!(
-            !credentials_file.exists(),
-            "the env override must be returned without ever creating/touching credentials.json"
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_fresh_bearer_falls_back_to_stale_token_when_refresh_fails() {
-        let dir = TempDir::new().unwrap();
-        let config_file = dir.path().join("config.yaml");
-        std::fs::write(&config_file, "version: 1\n").unwrap();
-        let port = start_refresh_mock_daemon();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let credentials_file = crate::credentials::credentials_path(&config_file);
-        crate::credentials::write_entry(
-            &credentials_file,
-            &base_url,
-            crate::credentials::CredentialEntry {
-                secret: None,
-                access_token: Some("old_access".to_string()),
-                // The mock daemon only accepts `old_refresh`; this one is
-                // rejected, exercising the best-effort fallback.
-                refresh_token: Some("no-longer-valid".to_string()),
-                access_expires_at: Some(localdb_core::auth::rfc3339_from_now(-10)),
-            },
-        )
-        .unwrap();
-
-        let ctx = ctx_with_config(&config_file);
-        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
-
-        assert_eq!(
-            bearer.as_deref(),
-            Some("old_access"),
-            "a failed refresh should still hand back the stale cached token \
-             (best effort) rather than nothing at all"
-        );
-    }
-
-    #[test]
-    fn decode_daemon_error_maps_resource_not_found() {
-        let err = decode_daemon_error(
-            "resource_not_found",
-            "doc-1".to_string(),
-            reqwest::StatusCode::NOT_FOUND,
-        );
-        assert_eq!(
-            err,
-            Error::ResourceNotFound {
-                id: "doc-1".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn decode_daemon_error_accepts_legacy_document_not_found_code() {
-        // A stale daemon (pre-rename) may still emit the legacy
-        // "document_not_found" code string; the CLI must decode it to the
-        // same `ResourceNotFound` variant a current daemon would produce.
-        let err = decode_daemon_error(
-            "document_not_found",
-            "doc-1".to_string(),
-            reqwest::StatusCode::NOT_FOUND,
-        );
-        assert_eq!(
-            err,
-            Error::ResourceNotFound {
-                id: "doc-1".to_string()
-            }
-        );
-    }
+    Err(Error::Internal {
+        message: format!(
+            "daemon pagination for GET {path} did not terminate within {MAX_DAEMON_PAGES} pages"
+        ),
+        correlation_id: "daemon_pagination_page_cap".to_string(),
+    })
 }
+
+#[cfg(test)]
+mod tests;

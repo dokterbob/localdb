@@ -1,0 +1,965 @@
+use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
+use localdb_core::store::ChunkRecord;
+use localdb_core::types::{SourceKind, Span, StoreVisibility};
+use localdb_core::{Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+use tempfile::tempdir;
+
+use crate::SqliteBackend;
+
+async fn make_api() -> (tempfile::TempDir, SqliteBackend) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = SqliteBackend::open(StoreBackendConfig::local_path(
+        path,
+        4,
+        VectorEncoding::Float32,
+    ))
+    .await
+    .unwrap();
+    (dir, backend)
+}
+
+fn make_store(id: &str, name: &str) -> StoreRow {
+    StoreRow {
+        id: id.to_string(),
+        name: name.to_string(),
+        visibility: StoreVisibility::Private,
+        backend: "libsql".to_string(),
+        indexing_policy: "{}".to_string(),
+        policy_version: "v1".to_string(),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+    }
+}
+
+fn make_path_source(id: &str, store_id: &str, root: &str) -> SourceRow {
+    SourceRow {
+        id: id.to_string(),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Path,
+        root: Some(root.to_string()),
+        url: None,
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: None,
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
+    }
+}
+
+fn make_url_source(id: &str, store_id: &str, url: &str) -> SourceRow {
+    SourceRow {
+        id: id.to_string(),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Url,
+        root: None,
+        url: Some(url.to_string()),
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: Some("24h".to_string()),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
+    }
+}
+
+fn make_feed_source(id: &str, store_id: &str, url: &str, config_json: Option<&str>) -> SourceRow {
+    SourceRow {
+        id: id.to_string(),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Feed,
+        root: None,
+        url: Some(url.to_string()),
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: Some("24h".to_string()),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: config_json.map(|s| s.to_string()),
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
+    }
+}
+
+#[tokio::test]
+async fn list_stores_empty_on_fresh_db() {
+    let (_dir, api) = make_api().await;
+    assert!(api.list_stores().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn upsert_and_get_store_round_trips() {
+    let (_dir, api) = make_api().await;
+    let s = make_store("store-1", "notes");
+    api.upsert_store(&s).await.unwrap();
+    let got = api.get_store("store-1").await.unwrap().unwrap();
+    assert_eq!(got, s);
+}
+
+#[tokio::test]
+async fn get_nonexistent_store_returns_none() {
+    let (_dir, api) = make_api().await;
+    assert!(api.get_store("nope").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn get_store_by_name_finds_it() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let got = api.get_store_by_name("notes").await.unwrap().unwrap();
+    assert_eq!(got.id, "store-1");
+}
+
+#[tokio::test]
+async fn upsert_store_overwrites_existing() {
+    let (_dir, api) = make_api().await;
+    let mut s = make_store("store-1", "notes");
+    api.upsert_store(&s).await.unwrap();
+    s.visibility = StoreVisibility::Shared;
+    api.upsert_store(&s).await.unwrap();
+    let got = api.get_store("store-1").await.unwrap().unwrap();
+    assert_eq!(got.visibility, StoreVisibility::Shared);
+}
+
+#[tokio::test]
+async fn delete_existing_store_returns_true() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    assert!(api.delete_store("store-1").await.unwrap());
+    assert!(api.get_store("store-1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_nonexistent_store_returns_false() {
+    let (_dir, api) = make_api().await;
+    assert!(!api.delete_store("nope").await.unwrap());
+}
+
+#[tokio::test]
+async fn list_stores_returns_all_alphabetical_by_name() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("id-c", "charlie"))
+        .await
+        .unwrap();
+    api.upsert_store(&make_store("id-a", "alpha"))
+        .await
+        .unwrap();
+    api.upsert_store(&make_store("id-b", "bravo"))
+        .await
+        .unwrap();
+    let stores = api.list_stores().await.unwrap();
+    assert_eq!(stores.len(), 3);
+    assert_eq!(stores[0].name, "alpha");
+    assert_eq!(stores[1].name, "bravo");
+    assert_eq!(stores[2].name, "charlie");
+}
+
+#[tokio::test]
+async fn unique_store_name_enforced() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("id-1", "notes"))
+        .await
+        .unwrap();
+    let result = api.upsert_store(&make_store("id-2", "notes")).await;
+    assert!(result.is_err(), "duplicate name should fail");
+}
+
+#[tokio::test]
+async fn upsert_source_requires_existing_store() {
+    let (_dir, api) = make_api().await;
+    let result = api
+        .upsert_source(&make_path_source("src-1", "missing-store", "/docs"))
+        .await;
+    assert!(result.is_err(), "FK should reject orphan source");
+}
+
+#[tokio::test]
+async fn upsert_and_get_path_source_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_path_source("src-1", "store-1", "/docs");
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got, s);
+}
+
+#[tokio::test]
+async fn upsert_and_get_url_source_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_url_source("src-1", "store-1", "https://example.com");
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got, s);
+}
+
+#[tokio::test]
+async fn check_constraint_rejects_path_kind_without_root() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut bad = make_path_source("src-1", "store-1", "/docs");
+    bad.root = None;
+    let result = api.upsert_source(&bad).await;
+    assert!(result.is_err(), "CHECK should reject path without root");
+}
+
+#[tokio::test]
+async fn url_kind_with_root_is_now_allowed() {
+    // The v3 schema relaxes the CHECK constraint: url-kind sources no longer
+    // require `root IS NULL`. A url source that also has a root column value
+    // is valid (the new CHECK only requires that `url IS NOT NULL`).
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut src = make_url_source("src-1", "store-1", "https://example.com");
+    src.root = Some("/docs".to_string());
+    let result = api.upsert_source(&src).await;
+    assert!(
+        result.is_ok(),
+        "url kind with root should now be accepted by the relaxed CHECK; got: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn list_sources_filters_by_store_id() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "store-1"))
+        .await
+        .unwrap();
+    api.upsert_store(&make_store("store-2", "store-2"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-2", "store-1", "/b"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-3", "store-2", "/c"))
+        .await
+        .unwrap();
+    let s1 = api.list_sources("store-1").await.unwrap();
+    assert_eq!(s1.len(), 2);
+    let s2 = api.list_sources("store-2").await.unwrap();
+    assert_eq!(s2.len(), 1);
+}
+
+#[tokio::test]
+async fn delete_source_returns_true_then_false() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    assert!(api.delete_source("src-1").await.unwrap());
+    assert!(!api.delete_source("src-1").await.unwrap());
+}
+
+#[tokio::test]
+async fn delete_sources_for_store_returns_removed_count() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-2", "store-1", "/b"))
+        .await
+        .unwrap();
+    let n = super::delete_sources_for_store(&api.conn, "store-1")
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn delete_store_cascades_to_sources() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-2", "store-1", "/b"))
+        .await
+        .unwrap();
+    api.delete_store("store-1").await.unwrap();
+    let remaining = api.list_sources("store-1").await.unwrap();
+    assert!(
+        remaining.is_empty(),
+        "FK CASCADE should remove sources with parent store"
+    );
+}
+
+#[tokio::test]
+async fn find_source_by_root_finds_it() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/docs/notes"))
+        .await
+        .unwrap();
+    let found = api
+        .find_source_by_root_or_url("/docs/notes", "store-1")
+        .await
+        .unwrap();
+    assert_eq!(found.unwrap().id, "src-1");
+}
+
+#[tokio::test]
+async fn find_source_by_url_finds_it() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_url_source("src-1", "store-1", "https://example.com"))
+        .await
+        .unwrap();
+    let found = api
+        .find_source_by_root_or_url("https://example.com", "store-1")
+        .await
+        .unwrap();
+    assert_eq!(found.unwrap().id, "src-1");
+}
+
+#[tokio::test]
+async fn find_source_scoped_to_store() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("s1", "s1")).await.unwrap();
+    api.upsert_store(&make_store("s2", "s2")).await.unwrap();
+    api.upsert_source(&make_path_source("src-a", "s1", "/shared"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-b", "s2", "/shared"))
+        .await
+        .unwrap();
+    let f1 = api
+        .find_source_by_root_or_url("/shared", "s1")
+        .await
+        .unwrap();
+    assert_eq!(f1.unwrap().id, "src-a");
+    let f2 = api
+        .find_source_by_root_or_url("/shared", "s2")
+        .await
+        .unwrap();
+    assert_eq!(f2.unwrap().id, "src-b");
+}
+
+#[tokio::test]
+async fn unique_root_per_store_enforced() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/docs"))
+        .await
+        .unwrap();
+    let result = api
+        .upsert_source(&make_path_source("src-2", "store-1", "/docs"))
+        .await;
+    assert!(
+        result.is_err(),
+        "partial UNIQUE (store_id, root) should reject duplicate"
+    );
+}
+
+#[tokio::test]
+async fn same_root_across_different_stores_allowed() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("s1", "s1")).await.unwrap();
+    api.upsert_store(&make_store("s2", "s2")).await.unwrap();
+    api.upsert_source(&make_path_source("src-a", "s1", "/docs"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-b", "s2", "/docs"))
+        .await
+        .unwrap();
+}
+
+/// Regression test for #130/#117 item 7: `ChunkRecord.metadata` (and, by
+/// extension, `resources.metadata_json`) must persist the *tagged* `Metadata`
+/// enum — `"kind":"document"` plus the flattened Dublin Core fields — not the
+/// old untagged flat struct. Verifies both ends: the raw stored JSON carries
+/// the tag, and `find_document` round-trips non-trivial Dublin Core fields.
+#[tokio::test]
+async fn metadata_json_round_trips_tagged_document_kind() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/docs"))
+        .await
+        .unwrap();
+
+    let metadata = Metadata::Document(DocumentMetadata {
+        dublin_core: DublinCoreMetadata {
+            title: Some("Round Trip Doc".to_string()),
+            creator: vec!["Ada Lovelace".to_string()],
+            subject: vec!["math".to_string(), "computing".to_string()],
+            date: Some("2026-07-01".to_string()),
+            language: Some("en".to_string()),
+            ..Default::default()
+        },
+        page_count: Some(12),
+        word_count: Some(3400),
+    });
+
+    let record = ChunkRecord {
+        id: "chunk-1".to_string(),
+        resource_id: "doc-1".to_string(),
+        store_id: "store-1".to_string(),
+        text: "some chunk text".to_string(),
+        span: Span::new(0, 15),
+        heading_path: vec![],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        policy_version: "v1".to_string(),
+        fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
+        content_hash: "abc123".to_string(),
+        origin_store: "store-1".to_string(),
+        source_id: "src-1".to_string(),
+        ingestor_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: "file:///docs/doc.md".to_string(),
+        metadata: metadata.clone(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+        page: None,
+        window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
+    };
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    // Raw column check: the persisted JSON must be tagged.
+    let conn = api.conn.reader();
+    let mut rows = conn
+        .query(
+            "SELECT metadata_json FROM resources WHERE id = ?",
+            libsql::params!["doc-1".to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("resource row must exist");
+    let metadata_json: String = row.get(0).unwrap();
+    drop(conn);
+    assert!(
+        metadata_json.contains("\"kind\":\"document\""),
+        "persisted metadata_json must be tagged with kind=document, got: {metadata_json}"
+    );
+
+    // Round trip via the public find_document API.
+    let info = api
+        .find_document("doc-1", None)
+        .await
+        .unwrap()
+        .expect("document must be found");
+    assert_eq!(
+        info.metadata, metadata,
+        "metadata must survive a write→read round trip"
+    );
+    assert_eq!(info.metadata.title(), Some("Round Trip Doc"));
+    assert_eq!(
+        info.metadata.dublin_core().creator,
+        vec!["Ada Lovelace".to_string()]
+    );
+}
+
+/// Regression test for issue C4: a genuinely invalid `metadata_json` value
+/// (syntactically broken JSON, not just untagged-legacy-shape JSON) must
+/// still fall back to `Metadata::default()` rather than erroring the whole
+/// `find_document` lookup — defensive reads must never error the row. The
+/// fallback now also emits a `tracing::warn!` naming the resource id and the
+/// parse error (see `connection::parse_metadata_json_lenient`), but this test
+/// only asserts on the observable behavior: no error, default metadata.
+#[tokio::test]
+async fn find_document_tolerates_invalid_metadata_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/docs"))
+        .await
+        .unwrap();
+
+    let record = ChunkRecord {
+        id: "chunk-1".to_string(),
+        resource_id: "doc-1".to_string(),
+        store_id: "store-1".to_string(),
+        text: "some chunk text".to_string(),
+        span: Span::new(0, 15),
+        heading_path: vec![],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        policy_version: "v1".to_string(),
+        fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
+        content_hash: "abc123".to_string(),
+        origin_store: "store-1".to_string(),
+        source_id: "src-1".to_string(),
+        ingestor_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: "file:///docs/doc.md".to_string(),
+        metadata: Metadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+        page: None,
+        window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
+    };
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    // Corrupt the persisted metadata_json directly with syntactically
+    // invalid JSON — this is distinct from the benign legacy-untagged case
+    // (which is still valid JSON, just the wrong shape).
+    let conn = api.conn.writer().await;
+    conn.execute(
+        "UPDATE resources SET metadata_json = ? WHERE id = ?",
+        libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let info = api
+        .find_document("doc-1", None)
+        .await
+        .unwrap()
+        .expect("document must still be found despite invalid metadata_json");
+    assert_eq!(
+        info.metadata,
+        Metadata::default(),
+        "invalid metadata_json must fall back to default metadata, not error the read"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Feed sources (issue #116)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn feed_source_kind_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":50,"fetch_full_content":true}"#),
+    );
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.kind, SourceKind::Feed);
+    assert_eq!(got, s);
+}
+
+#[tokio::test]
+async fn upsert_and_get_feed_source_with_populated_config_json_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":10,"fetch_full_content":false}"#),
+    );
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(
+        got.config_json.as_deref(),
+        Some(r#"{"max_entries":10,"fetch_full_content":false}"#)
+    );
+}
+
+#[tokio::test]
+async fn upsert_and_get_feed_source_with_null_config_json_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.config_json, None);
+}
+
+#[tokio::test]
+async fn list_sources_includes_feed_source_config_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":5,"fetch_full_content":true}"#),
+    ))
+    .await
+    .unwrap();
+    let sources = api.list_sources("store-1").await.unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].kind, SourceKind::Feed);
+    assert_eq!(
+        sources[0].config_json.as_deref(),
+        Some(r#"{"max_entries":5,"fetch_full_content":true}"#)
+    );
+}
+
+#[tokio::test]
+async fn find_feed_source_by_url_finds_it_with_config_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":null,"fetch_full_content":true}"#),
+    ))
+    .await
+    .unwrap();
+    let found = api
+        .find_source_by_root_or_url("https://example.com/feed.xml", "store-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "src-1");
+    assert_eq!(
+        found.config_json.as_deref(),
+        Some(r#"{"max_entries":null,"fetch_full_content":true}"#)
+    );
+}
+
+#[tokio::test]
+async fn upsert_feed_source_on_conflict_updates_config_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":10,"fetch_full_content":true}"#),
+    );
+    api.upsert_source(&s).await.unwrap();
+
+    // ON CONFLICT(id) DO UPDATE path: change config_json and re-upsert with
+    // the same id.
+    s.config_json = Some(r#"{"max_entries":20,"fetch_full_content":false}"#.to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(
+        got.config_json.as_deref(),
+        Some(r#"{"max_entries":20,"fetch_full_content":false}"#)
+    );
+}
+
+#[tokio::test]
+async fn check_constraint_allows_feed_kind_with_null_root_and_url() {
+    // C1/C3: the CHECK constraint's third disjunct
+    // `(kind NOT IN ('path', 'url'))` tolerates a 'feed' kind row
+    // regardless of root/url — this test inserts raw SQL (bypassing
+    // `upsert_source`, which always sets `url` for a feed row) to pin that
+    // the CHECK constraint itself, not just the Rust-level API, accepts
+    // kind='feed' with both root and url NULL.
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let conn = api.conn.writer().await;
+    let result = conn
+        .execute(
+            "INSERT INTO sources (id, store_id, kind, root, url, include, exclude, \
+                 preset, refresh, created_at, config_json) \
+             VALUES ('src-1', 'store-1', 'feed', NULL, NULL, '[]', '[]', 'prose', NULL, \
+                 '2026-06-25T12:00:00Z', NULL)",
+            (),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "CHECK constraint must accept kind='feed' with NULL root and url; got: {:?}",
+        result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// sources.feed_etag / sources.feed_last_modified
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn feed_source_round_trips_feed_etag_and_feed_last_modified() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    s.feed_etag = Some("\"abc\"".to_string());
+    s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    s.feed_inputs_digest = Some("digest-abc".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.feed_etag.as_deref(), Some("\"abc\""));
+    assert_eq!(
+        got.feed_last_modified.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+    assert_eq!(got.feed_inputs_digest.as_deref(), Some("digest-abc"));
+}
+
+#[tokio::test]
+async fn feed_source_with_null_feed_validators_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    // `make_feed_source` already leaves both columns `None` — assert it
+    // explicitly rather than relying on that as an incidental default.
+    let s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    assert_eq!(s.feed_etag, None);
+    assert_eq!(s.feed_last_modified, None);
+    assert_eq!(s.feed_inputs_digest, None);
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.feed_etag, None);
+    assert_eq!(got.feed_last_modified, None);
+    assert_eq!(got.feed_inputs_digest, None);
+}
+
+/// The positive case the `job_exec` validator-refresh persistence hop
+/// depends on: re-upserting an existing source id with the *same* url must
+/// let refreshed `feed_etag`/`feed_last_modified` values through.
+#[tokio::test]
+async fn upsert_source_same_id_same_url_updates_feed_validators() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    s.feed_etag = Some("\"v1\"".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    s.feed_etag = Some("\"v2\"".to_string());
+    s.feed_last_modified = Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.feed_etag.as_deref(), Some("\"v2\""));
+    assert_eq!(
+        got.feed_last_modified.as_deref(),
+        Some("Thu, 22 Oct 2015 07:28:00 GMT")
+    );
+}
+
+/// The invalidation guard (specs/02-domain-model.md's Feed connector,
+/// "Conditional GET and pruning"): a stored validator is only meaningful
+/// against the origin that issued it, so re-upserting an existing source id
+/// with a *different* url must null both columns — enforced in
+/// `upsert_source`'s SQL itself (`ON CONFLICT`'s `CASE WHEN sources.url IS
+/// excluded.url`), not left to each caller to remember. The caller here
+/// deliberately still passes non-null values for both columns, proving the
+/// guard overrides what was asked for, not just what a well-behaved caller
+/// would have passed.
+#[tokio::test]
+async fn upsert_source_same_id_changed_url_nulls_feed_validators() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/old-feed.xml", None);
+    s.feed_etag = Some("\"stale\"".to_string());
+    s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    s.feed_inputs_digest = Some("digest-stale".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    // Edit the url in place and re-upsert with the same id — carrying the
+    // old validators forward as a naive caller might.
+    s.url = Some("https://example.com/new-feed.xml".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.url.as_deref(), Some("https://example.com/new-feed.xml"));
+    assert_eq!(
+        got.feed_etag, None,
+        "a changed url must null feed_etag even if the caller passed a value"
+    );
+    assert_eq!(
+        got.feed_last_modified, None,
+        "a changed url must null feed_last_modified even if the caller passed a value"
+    );
+    assert_eq!(
+        got.feed_inputs_digest, None,
+        "the digest describes validators that no longer exist, so it goes with them"
+    );
+}
+
+/// Mirror image of the guard above, for a path source's always-`None` url:
+/// SQLite `NULL = NULL` is unknown, not true, so the `CASE` must compare
+/// with `IS` — otherwise a path source's url "changing" from NULL to NULL
+/// on every re-upsert would spuriously null its (inapplicable, always-`None`
+/// in practice) feed columns too.
+#[tokio::test]
+async fn upsert_source_same_id_both_urls_null_preserves_feed_columns() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_path_source("src-1", "store-1", "/docs");
+    s.feed_etag = Some("\"irrelevant-but-present\"".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    // Re-upsert unchanged (url stays None both times).
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.url, None);
+    assert_eq!(got.feed_etag.as_deref(), Some("\"irrelevant-but-present\""));
+}
+
+// ---------------------------------------------------------------------------
+// update_source_feed_cache
+// ---------------------------------------------------------------------------
+
+/// The race this method exists for: an index job persists cache state from a
+/// `SourceRow` it snapshotted at the start of the run, and a `source delete`
+/// can land in between. `upsert_source` would re-insert the row and silently
+/// undo a deletion the scheduler has already acted on; an update-only write
+/// reports the miss instead.
+#[tokio::test]
+async fn update_source_feed_cache_on_a_missing_id_reports_no_row() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+
+    let updated = api
+        .update_source_feed_cache("src-gone", Some("\"v1\""), None, Some("digest-1"))
+        .await
+        .unwrap();
+    assert!(!updated, "no row matched, and none may be created");
+    assert!(
+        api.get_source("src-gone").await.unwrap().is_none(),
+        "an update-only write must never resurrect a deleted source"
+    );
+}
+
+/// Everything outside the three cache columns must survive untouched — the
+/// caller passes only an id and the cache values, so any other column that
+/// moved would mean the write is reaching further than it claims.
+#[tokio::test]
+async fn update_source_feed_cache_touches_only_the_three_cache_columns() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let before = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":10,"fetch_full_content":true}"#),
+    );
+    api.upsert_source(&before).await.unwrap();
+
+    let updated = api
+        .update_source_feed_cache(
+            "src-1",
+            Some("\"v2\""),
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"),
+            Some("digest-2"),
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let after = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(after.feed_etag.as_deref(), Some("\"v2\""));
+    assert_eq!(
+        after.feed_last_modified.as_deref(),
+        Some("Thu, 22 Oct 2015 07:28:00 GMT")
+    );
+    assert_eq!(after.feed_inputs_digest.as_deref(), Some("digest-2"));
+
+    // Compare the whole row against the original with only the three cache
+    // columns overwritten: a field-by-field list would silently stop
+    // covering any column added later.
+    assert_eq!(
+        after,
+        SourceRow {
+            feed_etag: after.feed_etag.clone(),
+            feed_last_modified: after.feed_last_modified.clone(),
+            feed_inputs_digest: after.feed_inputs_digest.clone(),
+            ..before
+        }
+    );
+}
+
+/// `None` means `NULL`, not "leave alone": a 200 that carries no `ETag` is
+/// the origin withdrawing one, and the stored column has to follow.
+#[tokio::test]
+async fn update_source_feed_cache_clears_columns_to_null() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    s.feed_etag = Some("\"v1\"".to_string());
+    s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    s.feed_inputs_digest = Some("digest-1".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    assert!(api
+        .update_source_feed_cache("src-1", None, None, None)
+        .await
+        .unwrap());
+
+    let after = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(after.feed_etag, None);
+    assert_eq!(after.feed_last_modified, None);
+    assert_eq!(after.feed_inputs_digest, None);
+}
+
+mod documents;

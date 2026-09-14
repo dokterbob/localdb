@@ -17,7 +17,7 @@ pub(crate) async fn create_oauth_client(
             message: format!("failed to serialize oauth_clients.redirect_uris: {e}"),
             correlation_id: "oauth_client_redirect_uris_serialize".to_string(),
         })?;
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "INSERT INTO oauth_clients (id, client_name, redirect_uris, created_at)
          VALUES (?, ?, ?, ?)",
@@ -37,7 +37,7 @@ pub(crate) async fn find_oauth_client(
     db: &LibsqlDb,
     id: &str,
 ) -> Result<Option<OAuthClientRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {CLIENT_COLUMNS} FROM oauth_clients WHERE id = ?"),

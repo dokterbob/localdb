@@ -438,6 +438,12 @@ async fn seed_chunk(state: &server::AppState, store_name: &str, text: &str, uri:
         seq_in_block: 0,
         block_kind: None,
         window_block_seqs: vec![],
+        modified_at: None,
+        page: None,
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
     state
         .backend()

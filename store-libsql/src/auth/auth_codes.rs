@@ -13,7 +13,7 @@ const AUTH_CODE_COLUMNS: &str = "id, client_id, user_id, code_hash, code_challen
     code_challenge_method, redirect_uri, expires_at, consumed_at, created_at";
 
 pub(crate) async fn create_auth_code(db: &LibsqlDb, code: &AuthCodeRow) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "INSERT INTO auth_codes
             (id, client_id, user_id, code_hash, code_challenge, code_challenge_method,
@@ -41,7 +41,7 @@ pub(crate) async fn find_auth_code_by_hash(
     db: &LibsqlDb,
     code_hash: &str,
 ) -> Result<Option<AuthCodeRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {AUTH_CODE_COLUMNS} FROM auth_codes WHERE code_hash = ?"),
@@ -60,7 +60,7 @@ pub(crate) async fn consume_auth_code(
     id: &str,
     consumed_at: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE auth_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",

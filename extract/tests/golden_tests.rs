@@ -253,7 +253,7 @@ fn html_fixture_nav_stripped_or_minimized() {
 
 #[test]
 fn scanned_pdf_fixture_returns_err() {
-    // The fixture is a minimal PDF that pdf-extract may either:
+    // The fixture is a minimal PDF the parser may either:
     //   - fail to parse entirely → ExtractionFailed (corrupt/parse error)
     //   - parse but find no text  → UnsupportedFormat (scanned-PDF path)
     // In both cases the extractor must not return Ok.

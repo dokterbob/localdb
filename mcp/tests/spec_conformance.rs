@@ -39,7 +39,7 @@ use localdb_core::{
     types::Span,
     FakeEmbedder,
 };
-use mcp::{handler::McpHandler, AvailableStore, StaticStoreProvider, StoreDescriptor};
+use mcp::{handler::McpHandler, AvailableStore, StoreDescriptor};
 
 // ---------------------------------------------------------------------------
 // Spec extraction
@@ -311,6 +311,7 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             embedding: vec![0.1, 0.2, 0.3, 0.4],
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            modified_at: Some("2026-06-10T12:00:00Z".to_string()),
             content_hash: doc_hash.clone(),
             origin_store: "store-1".to_string(),
             source_id: new_ulid(),
@@ -321,7 +322,12 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             block_seq,
             seq_in_block: 0,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         });
     }
     store.upsert_chunks(chunks).await.expect("seed chunks");
@@ -331,11 +337,14 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
         name: "test-store".to_string(),
         visibility: "private".to_string(),
     };
-    let available = AvailableStore::from_arc(sd, store);
+    let stores = vec![AvailableStore::from_arc(sd, store)];
+    let backend: std::sync::Arc<dyn localdb_core::StoreBackend> =
+        std::sync::Arc::new(mcp::tools::StoresBackend::new(&stores));
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
     let handler = McpHandler::new(
-        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(stores)),
+        backend,
         embedder,
         false,
         Some(localdb_core::auth::Principal::local_trust()),

@@ -21,14 +21,15 @@ use crate::connection::{map_libsql_err, parse_metadata_json_lenient};
 ///  10  r.mime
 ///  11  r.policy_version
 ///  12  r.added_at         → fetched_at
-///  13  r.content_hash
-///  14  r.origin_store
-///  15  r.metadata_json    → metadata
-///  16  c.block_seq
-///  17  c.seq_in_block
-///  18  c.location_json
-///  19  c.block_kind
-///  20  distance/score     (appended by each query, not read here)
+///  13  r.modified_at      → modified_at
+///  14  r.content_hash
+///  15  r.origin_store
+///  16  r.metadata_json    → metadata
+///  17  c.block_seq
+///  18  c.seq_in_block
+///  19  c.location_json
+///  20  c.block_kind
+///  21  distance/score     (appended by each query, not read here)
 pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecord, Error> {
     let id: String = row.get(0).map_err(map_libsql_err)?;
     let resource_id: String = row.get(1).map_err(map_libsql_err)?;
@@ -43,9 +44,10 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
     let mime: Option<String> = row.get(10).map_err(map_libsql_err)?;
     let policy_version: String = row.get(11).map_err(map_libsql_err)?;
     let added_at: String = row.get(12).map_err(map_libsql_err)?; // → fetched_at
-    let content_hash: String = row.get(13).map_err(map_libsql_err)?;
-    let origin_store: String = row.get(14).map_err(map_libsql_err)?;
-    let metadata_str: String = row.get(15).map_err(map_libsql_err)?;
+    let modified_at: Option<String> = row.get(13).map_err(map_libsql_err)?;
+    let content_hash: String = row.get(14).map_err(map_libsql_err)?;
+    let origin_store: String = row.get(15).map_err(map_libsql_err)?;
+    let metadata_str: String = row.get(16).map_err(map_libsql_err)?;
 
     let heading_path: Vec<String> =
         serde_json::from_str(&heading_path_str).map_err(|e| Error::Internal {
@@ -64,18 +66,20 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
     // see `parse_metadata_json_lenient`.
     let metadata: Metadata = parse_metadata_json_lenient(&metadata_str, &resource_id);
 
-    let block_seq: i64 = row.get(16).map_err(map_libsql_err)?;
-    let seq_in_block: i64 = row.get(17).map_err(map_libsql_err)?;
+    let block_seq: i64 = row.get(17).map_err(map_libsql_err)?;
+    let seq_in_block: i64 = row.get(18).map_err(map_libsql_err)?;
 
     // location_json is written by upsert_chunks_inner; fall back to text length
     // for rows written before this column was populated. Shape:
-    // `{"start": N, "end": N, "window_block_seqs": [..]}`, with
-    // `window_block_seqs` present only for message-window chunks (#129) —
-    // absent (and thus defaulting to empty) for ordinary chunks.
+    // `{"start": N, "end": N, "window_block_seqs": [..], "page": N}`, with
+    // `window_block_seqs` present only for message-window chunks (#129) and
+    // `page` only for paginated formats (#103) — both absent (and thus
+    // defaulting to empty / None) for ordinary chunks.
     let text_len = text.len();
     let mut window_block_seqs: Vec<u32> = Vec::new();
+    let mut page: Option<u32> = None;
     let span = {
-        let location_json: Option<String> = row.get(18).map_err(map_libsql_err)?;
+        let location_json: Option<String> = row.get(19).map_err(map_libsql_err)?;
         match location_json {
             Some(json) => {
                 let v: serde_json::Value =
@@ -89,6 +93,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
                         .map(|s| s as u32)
                         .collect();
                 }
+                page = v.get("page").and_then(|p| p.as_u64()).map(|p| p as u32);
                 match (start, end) {
                     (Some(s), Some(e)) => Span { start: s, end: e },
                     _ => Span {
@@ -104,7 +109,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         }
     };
 
-    let block_kind: Option<String> = row.get(19).map_err(map_libsql_err)?;
+    let block_kind: Option<String> = row.get(20).map_err(map_libsql_err)?;
 
     Ok(ChunkRecord {
         id,
@@ -116,6 +121,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         embedding,
         policy_version,
         fetched_at: added_at,
+        modified_at,
         content_hash,
         origin_store,
         source_id,
@@ -126,7 +132,14 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         block_seq: block_seq as u32,
         seq_in_block: seq_in_block as u32,
         block_kind,
+        page,
         window_block_seqs,
+        // Write-only stamps (core::store::ChunkRecord doc comment) — not
+        // part of `CHUNK_COLS`, so a chunk read never carries them.
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     })
 }
 

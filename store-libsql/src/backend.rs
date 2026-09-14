@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::{
     DocumentInfo, Error, RetrievalStore, SourceRow, StoreBackend, StoreBackendConfig,
-    StoreBackendConnection, StoreRow, VectorEncoding,
+    StoreBackendConnection, StoreRow, TableSize, VectorEncoding,
 };
 
 use crate::auth::LibsqlAuthStore;
@@ -80,8 +80,43 @@ impl StoreBackend for SqliteBackend {
         registry::sources::find_source_by_root_or_url(&self.conn, value, store_id).await
     }
 
-    async fn find_document(&self, doc_id: &str) -> Result<Option<DocumentInfo>, Error> {
-        registry::documents::find_document(&self.conn, doc_id).await
+    async fn update_source_feed_cache(
+        &self,
+        id: &str,
+        feed_etag: Option<&str>,
+        feed_last_modified: Option<&str>,
+        feed_inputs_digest: Option<&str>,
+    ) -> Result<bool, Error> {
+        registry::sources::update_source_feed_cache(
+            &self.conn,
+            id,
+            feed_etag,
+            feed_last_modified,
+            feed_inputs_digest,
+        )
+        .await
+    }
+
+    async fn find_document(
+        &self,
+        doc_id: &str,
+        store_id: Option<&str>,
+    ) -> Result<Option<DocumentInfo>, Error> {
+        registry::documents::find_document(&self.conn, doc_id, store_id).await
+    }
+
+    async fn list_documents(
+        &self,
+        store_id: &str,
+        source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<DocumentInfo>, Error> {
+        registry::documents::list_documents(&self.conn, store_id, source_id, limit, offset).await
+    }
+
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error> {
+        registry::documents::count_documents(&self.conn, store_id, source_id).await
     }
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {
@@ -91,6 +126,44 @@ impl StoreBackend for SqliteBackend {
             self.embedding_dim,
             self.encoding,
         )))
+    }
+
+    async fn largest_tables(&self, limit: usize) -> Result<Vec<TableSize>, Error> {
+        registry::diagnostics::largest_tables(&self.conn, limit).await
+    }
+}
+
+/// Test-only escape hatch for backdating `resources.last_checked_at`
+/// directly, bypassing `RetrievalStore::touch_resource_checked`'s "advance to
+/// now" contract.
+///
+/// `touch_resource_checked`/`touch_resource_liveness` only ever move this
+/// column forward to the current time — by design, there is no store-API way
+/// to set it to an arbitrary past value. A test that needs to simulate a
+/// resource whose last successful check happened long enough ago to clear
+/// the recheck floor (specs/04-search-pipeline.md §1 "Recheck gate") has
+/// nothing else to reach for. `store-libsql`'s own tests reach the private
+/// `conn` field directly (same crate); this exists for integration tests in
+/// other crates — `server/src/job_exec/tests/feed_liveness_sweep.rs` — that
+/// can't.
+#[cfg(any(test, feature = "test-support"))]
+impl SqliteBackend {
+    /// Overwrite `resources.last_checked_at` for one resource. `value` is an
+    /// RFC 3339 timestamp string, or `None` to clear it back to `NULL`.
+    pub async fn set_last_checked_at_for_test(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        value: Option<&str>,
+    ) -> Result<(), Error> {
+        let conn = self.conn.writer().await;
+        conn.execute(
+            "UPDATE resources SET last_checked_at = ?1 WHERE store_id = ?2 AND id = ?3",
+            libsql::params![value, store_id, resource_id],
+        )
+        .await
+        .map_err(crate::connection::map_libsql_err)?;
+        Ok(())
     }
 }
 

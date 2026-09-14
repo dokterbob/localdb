@@ -1,0 +1,57 @@
+# yaml-language-server: $schema={{SCHEMA_URL}}
+#
+# localdb configuration — generated automatically on first run.
+# Full reference: docs/configuration.md
+#
+# Every key below is optional except `version`. Unknown keys are a hard
+# error (typos are caught, not silently ignored).
+# `$schema` (above and below) enables autocomplete/inline validation in any
+# editor speaking the yaml-language-server protocol (VS Code + "YAML"
+# extension, Zed, most LSP-aware editors).
+
+version: 1
+$schema: {{SCHEMA_URL}}
+
+# --- HTTP daemon (`localdb serve`; values below are the defaults) ---
+server:
+  # auth: auto # auto | required | off; off requires a loopback bind
+  # public_url: https://localdb.example.com # OAuth public base URL behind a proxy
+  bind: 127.0.0.1   # loopback only; set to 0.0.0.0 to listen on all interfaces
+  port: 7700        # set to 0 to let the OS assign an ephemeral port
+  job_workers: 1    # daemon job-queue workers; jobs for the same store never run concurrently
+
+# --- Path overrides (optional; platform defaults apply to omitted keys) ---
+# paths:
+#   data: ~/localdb/data      # unified database (localdb.db)
+#   models: ~/localdb/models  # embedding model cache
+#   logs: ~/localdb/logs      # structured log output
+
+# --- Global indexing policy: inherited by every store unless overridden.
+#     Chunking + embedding + parsers version together; changes trigger
+#     reindexing of affected stores. ---
+defaults:
+  indexing:
+    chunking:
+      preset_overrides: {}   # per-source-kind tweaks; see specs/04-search-pipeline.md
+    embedding:
+      model: pplx-embed-context-v1-0.6b   # context-aware late-chunking, local, MIT-licensed
+      provider: local   # local (auto CoreML/ONNX) | openai-compatible | perplexity | voyage
+      # `local` (default): downloads ~706 MB from HuggingFace on first use,
+      #   no API key required. Smaller alternative: model: bge-small-en-v1.5.
+      # Hosted: provider: perplexity, model: pplx-embed-context-v1 —
+      #   requires a `providers:` entry below with api_key_env set.
+    parsers: [pdf, epub, office, html, markdown, plaintext]   # tried in order; order is load-bearing
+# --- External embedding providers (optional; OpenAI-compatible API) ---
+# providers:
+#   - name: my-ollama              # referenced by defaults.indexing.embedding.provider
+#     kind: openai-compatible      # openai-compatible | perplexity | voyage
+#     base_url: http://localhost:11434/v1
+#     api_key_env: OLLAMA_KEY      # env var holding the key — secrets are never inlined
+
+# --- Outbound HTTP policy (optional; applies to file/URL/feed fetches) ---
+# http:
+#   user_agent: ~             # ~ = localdb/<version> (+https://github.com/dokterbob/localdb)
+#   max_retries: 3            # retries for a rate-limited/transient-error response before giving up
+#   rate_limit:
+#     requests_per_second: 1  # per public destination host; loopback/LAN hosts are exempt
+#     burst: 4                # token-bucket burst capacity above the sustained rate

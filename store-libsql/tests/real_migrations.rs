@@ -2,7 +2,7 @@
 //! (issue #127) against a fixture chain whose DDL was originally copied
 //! **verbatim** from two in-flight consumer branches, as of 2026-07-08:
 //!
-//! - `v5`/`v6` mirror the `auth` branch's (issue #98) former ad-hoc runner in
+//! - `v5`/`v6` mirror the `auth` branch's (issue #98, not yet landed)
 //!   `store-libsql/src/schema.rs`: `create_auth_tables` (the 7 auth tables +
 //!   their indexes) and the `v5 -> v6` `add_access_requests_collected_at_column`
 //!   step.
@@ -12,25 +12,20 @@
 //!   retagging `resources.metadata_json` from the old flat Dublin-Core shape
 //!   to the tagged `Metadata::Document` shape.
 //!
-//! **Both have since landed, in the opposite order this file's own numbering
-//! implies.** PR #151 landed first, claiming the real chain's `v5`
-//! (`drop_chunks_block_id_and_retag_resource_metadata`). The `auth` branch's
-//! pair landed second and renumbered to `v6`/`v7`
-//! (`create_auth_tables`/`add_access_requests_collected_at_column` in
-//! `chain.rs`) — the reverse of this file's own `fixture_chain()`, which
-//! keeps its **own independent v5/v6/v7 numbering** rather than reusing
-//! `chain::migrations()`: it exists to exercise the generic runner/downgrade
-//! machinery against a *multi-step* chain (an auth-shaped pair plus a
-//! block_id-drop-shaped step), which is broader coverage than replaying the
-//! real chain alone would give, and its numbering is intentionally
-//! decoupled from whichever consumer branch landed in which order.
-//! `migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`
+//! **PR #151 has since landed**: its migration is now the real chain's first
+//! entry, `chain::migrations()`'s version 5
+//! (`drop_chunks_block_id_and_retag_resource_metadata` in `chain.rs`) — not
+//! version 7, since `auth`'s v5/v6 hadn't claimed those slots yet at adoption
+//! time. This file's own `fixture_chain()` deliberately keeps its own
+//! independent v5/v6/v7 numbering rather than reusing `chain::migrations()`:
+//! it exists to exercise the generic runner/downgrade machinery against a
+//! *multi-step* chain (an auth-shaped pair plus a block_id-drop-shaped
+//! step), which is broader coverage than replaying today's one-entry real
+//! chain would give. `migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`
 //! is the test that pins the real chain (`chain::migrations()`) against
 //! `schema::create_schema` instead; this file's fixtures are intentionally
 //! synthetic and may drift from whatever the real chain looks like at any
-//! given time. `migrate_store_on_real_chain_drops_block_id_and_retags_metadata`
-//! below is this file's one test that exercises the real, compiled chain
-//! directly rather than the fixture.
+//! given time.
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +34,7 @@ use tempfile::TempDir;
 
 use localdb_core::{Error, VectorEncoding};
 use store_libsql::migrations::baseline::create_baseline_schema;
+use store_libsql::migrations::chain;
 use store_libsql::migrations::runner::apply_pending;
 use store_libsql::migrations::table::{self, MigrationRow};
 use store_libsql::migrations::{Down, Migration, MigrationContext, Up};
@@ -389,6 +385,29 @@ async fn row_count(conn: &Connection, table: &str) -> i64 {
     rows.next().await.unwrap().unwrap().get(0).unwrap()
 }
 
+/// Asserts `table.column` exists, is nullable (`PRAGMA table_info`'s
+/// `notnull = 0`), and carries no default value.
+async fn assert_column_nullable_with_no_default(conn: &Connection, table: &str, column: &str) {
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('{table}') WHERE name = ?"
+            ),
+            params![column],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{table}.{column} must exist"));
+    let notnull: i64 = row.get(0).unwrap();
+    let dflt_value: Option<String> = row.get(1).unwrap();
+    assert_eq!(notnull, 0, "{table}.{column} must be nullable");
+    assert_eq!(dflt_value, None, "{table}.{column} must have no default");
+}
+
 /// `sqlite_master` rows with sqlite's own bookkeeping, FTS5 shadow tables,
 /// and `schema_migrations` itself stripped out — the same normalization
 /// `runner.rs`'s drift-guard test and `downgrade.rs`'s fixtures use to
@@ -689,12 +708,9 @@ async fn downgrade_v6_to_v5_removes_only_the_collected_at_column() {
 /// above: seed a realistic v4 store (the same `seed_v4_data` fixture the
 /// fixture-chain test uses — two stores, blocks with a `block_id` FK,
 /// untagged flat `metadata_json`), run `migrate_store` exactly the way
-/// `localdb db migrate` does, and confirm it lands on head (v7, now that the
-/// real chain also carries the auth branch's `v6`/`v7` entries alongside
-/// PR #151's `v5`) with `block_id` gone, the composite index swapped in,
-/// `resources.metadata_json` retagged, the 7 auth tables plus
-/// `access_requests.collected_at` present, and the built-in `localdb-cli`
-/// OAuth2 client seeded — while leaving the chunk rows' own data intact.
+/// `localdb db migrate` does, and confirm it lands on v5 with `block_id`
+/// gone, the composite index swapped in, and `resources.metadata_json`
+/// retagged — while leaving the chunk rows' own data intact.
 #[tokio::test]
 async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
     let (_dir, path) = temp_db_path();
@@ -709,57 +725,32 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
         .unwrap();
 
     assert_eq!(report.from_version, BASELINE_VERSION);
-    assert_eq!(report.to_version, BASELINE_VERSION + 3);
+    assert_eq!(report.to_version, chain::head_version_current());
     assert_eq!(
         report.applied.iter().map(|s| s.version).collect::<Vec<_>>(),
         vec![
             BASELINE_VERSION + 1,
             BASELINE_VERSION + 2,
-            BASELINE_VERSION + 3
-        ]
+            BASELINE_VERSION + 3,
+            BASELINE_VERSION + 4,
+            BASELINE_VERSION + 5,
+            BASELINE_VERSION + 6
+        ],
+        "a v4 store steps through the whole compiled chain, not just v5"
     );
     assert!(!report.legacy_rebuilt);
     assert!(
         report.staleness_marked,
-        "the block_id-drop migration (v5) is needs_reindex: true"
+        "the block_id-drop migration is needs_reindex: true (v6/v7/v8, the index \
+         shrink, the index_updated_at backfill, and the conditional-GET validator columns, \
+         are not)"
     );
 
     let (_db, conn) = open_conn(&path).await;
-    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 3);
+    assert_eq!(user_version(&conn).await, chain::head_version_current());
     assert!(!column_exists(&conn, "chunks", "block_id").await);
     assert!(!index_exists(&conn, "idx_chunks_store_resource").await);
     assert!(index_exists(&conn, "idx_chunks_store_resource_pos").await);
-
-    // v6: the 7 auth tables exist.
-    for table in [
-        "users",
-        "auth_tokens",
-        "oauth_clients",
-        "auth_codes",
-        "store_grants",
-        "invites",
-        "access_requests",
-    ] {
-        assert!(table_exists(&conn, table).await, "missing table {table}");
-    }
-    // v6: the built-in localdb-cli OAuth2 client is seeded.
-    let mut rows = conn
-        .query(
-            "SELECT client_name FROM oauth_clients WHERE id = 'localdb-cli'",
-            (),
-        )
-        .await
-        .unwrap();
-    let row = rows
-        .next()
-        .await
-        .unwrap()
-        .expect("localdb-cli oauth client row must be seeded by v6");
-    let client_name: String = row.get(0).unwrap();
-    assert_eq!(client_name, "localdb CLI");
-
-    // v7: access_requests.collected_at exists.
-    assert!(column_exists(&conn, "access_requests", "collected_at").await);
 
     // Seeded rows preserved.
     assert_eq!(row_count(&conn, "stores").await, 2);
@@ -787,4 +778,437 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
     assert!(parsed["page_count"].is_null());
     assert!(parsed["word_count"].is_null());
     assert_eq!(parsed["title"], "Doc One");
+}
+
+/// v7 (`add_index_updated_at`), against the REAL compiled chain: a v4 store
+/// migrated all the way to head gets `resources.index_updated_at` backfilled
+/// from `added_at` for every pre-existing row, so no row is left `NULL`.
+#[tokio::test]
+async fn migrate_store_on_real_chain_backfills_index_updated_at_from_added_at() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+
+    let report = store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.to_version, chain::head_version_current());
+
+    let (_db, conn) = open_conn(&path).await;
+    assert!(column_exists(&conn, "resources", "index_updated_at").await);
+
+    for res_id in ["res-1", "res-2"] {
+        let mut rows = conn
+            .query(
+                "SELECT added_at, index_updated_at FROM resources WHERE id = ?",
+                params![res_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let added_at: String = row.get(0).unwrap();
+        let index_updated_at: Option<String> = row.get(1).unwrap();
+        assert_eq!(
+            index_updated_at.as_deref(),
+            Some(added_at.as_str()),
+            "{res_id}'s index_updated_at must be backfilled from added_at"
+        );
+    }
+}
+
+/// v7's down-step: `relax_modified_at_and_add_index_updated_at` is
+/// `Down::Unsupported` (see `chain.rs`) — the `modified_at` relaxation can't
+/// be undone by `ALTER TABLE` alone (SQLite can only append columns, so the
+/// original `NOT NULL` constraint and mid-table position are unrecoverable),
+/// and a `resources` table rebuild is unsafe inside a migration transaction
+/// (`chunks`/`blocks` FK to it, `PRAGMA foreign_keys` can't toggle
+/// mid-transaction). Downgrading a store sitting at head (v7) past it must
+/// therefore be refused up front, naming the migration/version/reason and
+/// leaving the store completely untouched — the same contract v5's
+/// `Unsupported` step already gets, exercised here against the REAL compiled
+/// chain rather than the fixture mirror.
+#[tokio::test]
+async fn downgrade_real_chain_from_head_is_refused_by_relax_modified_at_step() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+    store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+
+    let before = dump_db(&path).await;
+    let result = store_libsql::downgrade_store(&path, Some(BASELINE_VERSION + 2)).await;
+    let after = dump_db(&path).await;
+
+    match result {
+        Err(Error::InvalidConfig { message }) => {
+            assert!(
+                message.contains("relax_modified_at_and_add_index_updated_at"),
+                "should name the blocking migration: {message}"
+            );
+            assert!(
+                message.contains(&(BASELINE_VERSION + 3).to_string()),
+                "should name the blocking version (7): {message}"
+            );
+            assert!(
+                message.contains("cannot be restored by ALTER TABLE alone"),
+                "should include the stored reason: {message}"
+            );
+            assert!(
+                message.contains("--to 7"),
+                "should suggest downgrading to v7's own version to keep it applied: {message}"
+            );
+        }
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+
+    assert_eq!(
+        before, after,
+        "a refused downgrade must not mutate the store at all"
+    );
+}
+
+/// v7's `modified_at` relaxation: a v4 store migrated all the way to head
+/// (a) keeps every pre-existing resource's `modified_at` value intact
+/// through the add/copy/drop/rename dance, (b) genuinely accepts a `NULL`
+/// `modified_at` on new inserts (the whole point of the migration), (c)
+/// produces exactly the column shape `schema::create_resources` documents —
+/// `modified_at TEXT` with no `NOT NULL` — in `sqlite_master`, and (d) never
+/// cascades through `chunks`/`blocks`' foreign keys to `resources`: both
+/// tables' pre-migration rows survive untouched, pinning the no-table-rebuild
+/// property the migration's doc comment claims.
+#[tokio::test]
+async fn migrate_v7_relaxes_modified_at_not_null() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+
+    let report = store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.to_version, chain::head_version_current());
+
+    let (_db, conn) = open_conn(&path).await;
+
+    // (a) the seeded rows' modified_at values survived the dance.
+    for res_id in ["res-1", "res-2"] {
+        let mut rows = conn
+            .query(
+                "SELECT modified_at FROM resources WHERE id = ?",
+                params![res_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let modified_at: Option<String> = row.get(0).unwrap();
+        assert_eq!(
+            modified_at.as_deref(),
+            Some("2024-01-01T00:00:00Z"),
+            "{res_id}'s modified_at must survive the add/copy/drop/rename dance"
+        );
+    }
+
+    // (b) INSERT with a NULL modified_at now succeeds.
+    conn.execute(
+        "INSERT INTO resources \
+         (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
+          content_hash, added_at, modified_at, origin_store, policy_version, \
+          metadata_json, extractor_version) \
+         VALUES ('store-1', 'res-null-modified', 'src-1', 'path', 'file', \
+                 'file:///doc-null.md', 'hash-null', '2024-01-01T00:00:00Z', NULL, \
+                 'store-1', '1', '{}', '1')",
+        (),
+    )
+    .await
+    .expect("modified_at must now be nullable");
+
+    // (c) sqlite_master for resources: `modified_at TEXT` with no NOT NULL.
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resources'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let sql: String = row.get(0).unwrap();
+    assert!(
+        sql.contains("modified_at TEXT,") || sql.contains("modified_at TEXT\n"),
+        "resources.modified_at must be a bare nullable TEXT column: {sql}"
+    );
+    assert!(
+        !sql.contains("modified_at TEXT NOT NULL"),
+        "resources.modified_at must no longer be NOT NULL: {sql}"
+    );
+
+    // (d) chunks/blocks pre-migration rows are untouched — no cascade through
+    // resources' FK-referenced children.
+    assert_eq!(row_count(&conn, "blocks").await, 4);
+    assert_eq!(row_count(&conn, "chunks").await, 4);
+    let mut rows = conn
+        .query(
+            "SELECT resource_id FROM blocks WHERE store_id = 'store-1' ORDER BY seq",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("store-1's blocks must survive");
+    let resource_id: String = row.get(0).unwrap();
+    assert_eq!(resource_id, "res-1");
+    let mut rows = conn
+        .query(
+            "SELECT store_id, resource_id, text FROM chunks WHERE id = 'chunk-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("chunk-1 must survive");
+    let store_id: String = row.get(0).unwrap();
+    let resource_id: String = row.get(1).unwrap();
+    let text: String = row.get(2).unwrap();
+    assert_eq!(store_id, "store-1");
+    assert_eq!(resource_id, "res-1");
+    assert_eq!(text, "chunk text 1");
+}
+
+/// v8 (`add_conditional_get_validators`), against the REAL compiled chain: a
+/// v4 store migrated to head gets the two `resources` columns
+/// (`external_last_modified`, `last_checked_at`) and the three `sources`
+/// columns (`feed_etag`, `feed_last_modified`, `feed_inputs_digest`), all
+/// five nullable with no default, and every pre-existing row reads them back
+/// `NULL` — nothing backfills them, unlike v7's `index_updated_at`.
+#[tokio::test]
+async fn migrate_store_on_real_chain_adds_conditional_get_validator_columns() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+
+    let report = store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.to_version, chain::head_version_current());
+
+    let (_db, conn) = open_conn(&path).await;
+
+    for (table, column) in [
+        ("resources", "external_last_modified"),
+        ("resources", "last_checked_at"),
+        ("sources", "feed_etag"),
+        ("sources", "feed_last_modified"),
+        ("sources", "feed_inputs_digest"),
+    ] {
+        assert_column_nullable_with_no_default(&conn, table, column).await;
+    }
+
+    for res_id in ["res-1", "res-2"] {
+        let mut rows = conn
+            .query(
+                "SELECT external_last_modified, last_checked_at FROM resources WHERE id = ?",
+                params![res_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let external_last_modified: Option<String> = row.get(0).unwrap();
+        let last_checked_at: Option<String> = row.get(1).unwrap();
+        assert_eq!(
+            external_last_modified, None,
+            "{res_id}'s external_last_modified must read back NULL: nothing backfills it"
+        );
+        assert_eq!(
+            last_checked_at, None,
+            "{res_id}'s last_checked_at must read back NULL: nothing backfills it"
+        );
+    }
+
+    for src_id in ["src-1", "src-2"] {
+        let mut rows = conn
+            .query(
+                "SELECT feed_etag, feed_last_modified, feed_inputs_digest \
+                 FROM sources WHERE id = ?",
+                params![src_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let feed_etag: Option<String> = row.get(0).unwrap();
+        let feed_last_modified: Option<String> = row.get(1).unwrap();
+        let feed_inputs_digest: Option<String> = row.get(2).unwrap();
+        assert_eq!(
+            feed_etag, None,
+            "{src_id}'s feed_etag must read back NULL: nothing backfills it"
+        );
+        assert_eq!(
+            feed_last_modified, None,
+            "{src_id}'s feed_last_modified must read back NULL: nothing backfills it"
+        );
+        assert_eq!(
+            feed_inputs_digest, None,
+            "{src_id}'s feed_inputs_digest must read back NULL: nothing backfills it"
+        );
+    }
+}
+
+/// v8's down-step is a plain, reversible `Down::Sql` (unlike v7's
+/// `Down::Unsupported`): downgrading a store sitting at head back to v7 must
+/// drop exactly the five new columns, restore precisely the schema a store
+/// migrated only through v7 has, and leave the pre-existing v4 data intact.
+#[tokio::test]
+async fn downgrade_real_chain_from_head_to_v7_drops_conditional_get_validator_columns() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+    store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+
+    let report = store_libsql::downgrade_store(&path, Some(BASELINE_VERSION + 3))
+        .await
+        .unwrap();
+    assert_eq!(report.to_version, BASELINE_VERSION + 3);
+
+    let (_db, conn) = open_conn(&path).await;
+    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 3);
+
+    for (table, column) in [
+        ("resources", "external_last_modified"),
+        ("resources", "last_checked_at"),
+        ("sources", "feed_etag"),
+        ("sources", "feed_last_modified"),
+        ("sources", "feed_inputs_digest"),
+    ] {
+        assert!(
+            !column_exists(&conn, table, column).await,
+            "{table}.{column} must be dropped by the downgrade"
+        );
+    }
+
+    // Schema must match exactly a store built by applying only the first
+    // three real migrations (v5-v7) on top of baseline.
+    let (_fresh_dir, fresh_path) = temp_db_path();
+    let (_fresh_db, fresh_conn) = open_conn(&fresh_path).await;
+    create_baseline_schema(&fresh_conn, &ctx()).await.unwrap();
+    let real_chain = chain::migrations();
+    apply_pending(&fresh_conn, &real_chain[..3], &ctx())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        normalized_master_rows(&conn).await,
+        normalized_master_rows(&fresh_conn).await,
+        "downgrading past v8 must restore exactly the v7 schema"
+    );
+
+    // Pre-existing data (seeded before ever reaching v8) survives the round
+    // trip untouched.
+    assert_eq!(row_count(&conn, "stores").await, 2);
+    assert_eq!(row_count(&conn, "sources").await, 2);
+    assert_eq!(row_count(&conn, "resources").await, 2);
+    assert_eq!(row_count(&conn, "blocks").await, 4);
+    assert_eq!(row_count(&conn, "chunks").await, 4);
+
+    // Counts alone would still pass if a drop had shifted values between
+    // columns, so read specific fields back on both tables whose shape the
+    // downgrade changed.
+    let mut rows = conn
+        .query(
+            "SELECT uri, content_hash, added_at FROM resources \
+             WHERE store_id = 'store-1' AND id = 'res-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "file:///doc1.md");
+    assert_eq!(row.get::<String>(1).unwrap(), "hash-abc");
+    assert_eq!(row.get::<String>(2).unwrap(), "2024-01-01T00:00:00Z");
+
+    let mut rows = conn
+        .query(
+            "SELECT kind, root, created_at FROM sources WHERE id = 'src-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "path");
+    assert_eq!(row.get::<String>(1).unwrap(), "/test/path1");
+    assert_eq!(row.get::<String>(2).unwrap(), "2024-01-01T00:00:00Z");
+}
+
+#[tokio::test]
+async fn auth_migrations_round_trip_preserves_populated_v8_database() {
+    let (_dir, path) = temp_db_path();
+    let before;
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+        apply_pending(&conn, &chain::migrations()[..4], &ctx())
+            .await
+            .unwrap();
+        before = normalized_master_rows(&conn).await;
+    }
+    for _ in 0..2 {
+        let report = store_libsql::migrate_store(&path, &ctx(), false)
+            .await
+            .unwrap();
+        assert_eq!(report.from_version, 8);
+        assert_eq!(report.to_version, 10);
+        assert!(!report.staleness_marked);
+        {
+            let (_db, conn) = open_conn(&path).await;
+            for table in [
+                "users",
+                "auth_tokens",
+                "oauth_clients",
+                "auth_codes",
+                "store_grants",
+                "invites",
+                "access_requests",
+            ] {
+                assert!(table_exists(&conn, table).await);
+            }
+            assert!(column_exists(&conn, "access_requests", "collected_at").await);
+            assert_eq!(row_count(&conn, "oauth_clients").await, 1);
+            let mut rows = conn
+                .query("SELECT id FROM oauth_clients", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<String>(0)
+                    .unwrap(),
+                "localdb-cli"
+            );
+            assert_eq!(row_count(&conn, "chunks").await, 4);
+        }
+        store_libsql::downgrade_store(&path, Some(8)).await.unwrap();
+        let (_db, conn) = open_conn(&path).await;
+        assert_eq!(normalized_master_rows(&conn).await, before);
+        assert_eq!(row_count(&conn, "resources").await, 2);
+        assert_eq!(row_count(&conn, "chunks").await, 4);
+    }
 }

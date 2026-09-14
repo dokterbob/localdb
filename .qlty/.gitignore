@@ -1,0 +1,5 @@
+# Local qlty CLI caches (logs/, out/, results/, sources/, plugin_cachedir/…).
+# Only the config itself is tracked.
+*
+!.gitignore
+!qlty.toml

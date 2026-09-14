@@ -1,6 +1,7 @@
 #[cfg(test)]
 use crate::connection::LibsqlDb;
 
+pub(crate) mod diagnostics;
 pub(crate) mod documents;
 pub(crate) mod sources;
 pub(crate) mod sql;

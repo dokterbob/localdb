@@ -1,109 +1,133 @@
 # localdb — Contributor Architecture Guide
 
-> Version 0.1.0 · AGPL-3.0-or-later · github.com/dokterbob/localdb
-
-This document orients new contributors: crate boundaries, data flow, process model, on-disk
-layout, and a frank account of what is not yet wired. For design rationale and decisions
-behind each choice, follow the links into the `specs/` tree — that is the authority; this
-document is the behavior layer on top of it.
+This document orients new contributors: crate boundaries, data flow, process model, on-disk layout,
+and a frank account of what is not yet wired. For design rationale and decisions behind each choice,
+follow the links into the `specs/` tree — that is the authority; this document is the behavior layer
+on top of it.
 
 ---
 
 ## Crate map
 
-The workspace is a single Cargo workspace with one binary (`localdb`) built from eight crates.
-No retrieval, indexing, or domain logic lives in a surface crate — all surfaces share one core
-(see [specs/01-architecture.md](../specs/01-architecture.md) §1).
+The workspace is a single Cargo workspace with one binary (`localdb`) built from ten crates. No
+retrieval, indexing, or domain logic lives in a surface crate — all surfaces share one core (see
+[specs/01-architecture.md](https://github.com/dokterbob/localdb/blob/main/specs/01-architecture.md)
+§1).
 
 ### `core`
 
-The domain model and shared logic. Defines every entity (`Store`, `Source`, `Document`,
-`Chunk`, `IndexJob`, `Citation`), the two key traits (`RetrievalStore` and
-`Embedder`), content-addressed ID derivation (blake3), the RRF fusion engine, indexing
-orchestration, and the error taxonomy. Contains no I/O framework; everything async-capable
-lives in other crates. This is the crate everything else imports.
+The domain model and shared logic. Defines every entity (`Store`, `Source`, `Document`, `Chunk`,
+`IndexJob`, `Citation`), the two key traits (`RetrievalStore` and `Embedder`), content-addressed ID
+derivation (blake3), the RRF fusion engine, indexing orchestration, and the error taxonomy. Contains
+no I/O framework; everything async-capable lives in other crates. This is the crate everything else
+imports.
 
 ### `extract`
 
-Format detection and extraction. Accepts raw bytes and returns a normalized Markdown string
-plus `DocumentMetadata` extracted from frontmatter (Dublin Core fields). Supported in v1:
-Markdown (pulldown-cmark), plain text, HTML (readability-style), and text-layer PDF. Binary
-files and non-UTF-8 content are declined gracefully. Unsupported or unreadable files are
-counted as skipped/errored in `IndexJob` stats, never fatal. See
-[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §2.
+Format detection and extraction. Accepts raw bytes and returns a normalized Markdown string plus
+`DocumentMetadata` extracted from frontmatter (Dublin Core fields). Supported in v1: Markdown
+(pulldown-cmark), plain text, HTML (readability-style), and text-layer PDF. Binary files and
+non-UTF-8 content are declined gracefully. Unsupported or unreadable files are counted as
+skipped/errored in `IndexJob` stats, never fatal. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§2.
+
+### `fetch`
+
+The `UrlFetcher` implementation (reqwest) plus the shared outgoing-HTTP layer (issue #207): retry
+via `backon` (429/408/5xx/timeout, honoring `Retry-After`) and per-host pacing via `governor` (keyed
+on destination host, loopback/LAN exempt). Two client constructors cover the two trust levels:
+`new()` is unrestricted, for operator-configured URLs; `new_public_only()` adds the SSRF destination
+guard, for URLs discovered in untrusted content (e.g. feed entry links). Production call sites use
+`new_pair()`, which builds both fetchers from one shared per-host limiter so pacing stays correct
+across the trust boundary. Shared by `fetch` itself and by `embed`'s hosted providers (reactive
+retry only there — no proactive pacing against paid APIs).
+
+### `ingest`
+
+Concrete `Ingestor` implementations — `FileIngestor`, `UrlIngestor`, `FeedIngestor`, and future
+connectors (Notion, Telegram, …). Depends on `core`, `extract`, and `fetch`; owns all acquisition
+I/O, from enumerating a source down to handing normalized bytes to `extract`.
 
 ### `embed`
 
-`Embedder` implementations. Declares providers for local ONNX inference
-(`OnnxEmbedder`, feature-gated `local-onnx`), local CoreML inference on Apple Silicon
-(feature-gated `local-coreml`, macOS-only), OpenAI-compatible flat HTTP endpoints
-(`OpenAiEmbedder`), Perplexity contextualized embeddings (`PerplexityEmbedder`), and Voyage
-(`VoyageEmbedder`). All implement the document-aware `Embedder` trait from `core`, which
-groups chunks by document so contextualized/late-chunking models can use the surrounding
-document as context. The CLI wires the embedder via `embed::create_embedder` from the config
-policy; the default is `local` / `pplx-embed-context-v1-0.6b`. The `local` provider auto-selects
-the CoreML (ANE/GPU) backend on Apple Silicon macOS when built with `--features local-coreml`,
-falling back to ONNX (CPU) otherwise; `local-coreml` / `local-onnx` force a backend. The two
-backends emit index-interchangeable vectors. See
-[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4 and the
-[Platform notes](#platform-notes) below.
+`Embedder` implementations. Declares providers for local ONNX inference (`OnnxEmbedder`,
+feature-gated `local-onnx`), local CoreML inference on Apple Silicon (feature-gated `local-coreml`,
+macOS-only), OpenAI-compatible flat HTTP endpoints (`OpenAiEmbedder`), Perplexity contextualized
+embeddings (`PerplexityEmbedder`), and Voyage (`VoyageEmbedder`). All implement the document-aware
+`Embedder` trait from `core`, which groups chunks by document so contextualized/late-chunking models
+can use the surrounding document as context. The CLI wires the embedder via `embed::create_embedder`
+from the config policy; the default is `local` / `pplx-embed-context-v1-0.6b`. The `local` provider
+auto-selects the CoreML (ANE/GPU) backend on Apple Silicon macOS when built with
+`--features local-coreml`, falling back to ONNX (CPU) otherwise; `local-coreml` / `local-onnx` force
+a backend. The two backends emit index-interchangeable vectors. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§4 and the [Platform notes](#platform-notes) below.
 
 ### `store-libsql`
 
-The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FTS5 BM25). A single unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF fusion is done in `core`. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
+The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FTS5 BM25). A single
+unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses
+SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF
+fusion is done in `core`. In-process, writes serialise on one mutex-guarded writer connection while
+reads are served from a small round-robin pool of read-only connections, so reads no longer block on
+writes within a process. See
+[specs/01-architecture.md](https://github.com/dokterbob/localdb/blob/main/specs/01-architecture.md)
+§2.
 
-Schema changes go through an explicit migrations runner (`store-libsql/src/migrations/`): a
-frozen baseline DDL snapshot (`baseline.rs`, `PRAGMA user_version = 4`) plus a linear, numbered
-chain of `Migration` entries applied one transaction at a time. A `schema_migrations` table is
-the source of truth for version, with `PRAGMA user_version` kept as a cheap, non-authoritative
-marker. **Opening a store never migrates it, in either direction** — a version mismatch on open
-is refused with an actionable hint, on every surface (CLI, HTTP daemon, MCP alike). The only way
-to change a store's schema version is `localdb db migrate` / `localdb db downgrade [--to N]`
-(CLI-only; `db status` is read-only and never refuses). See
-[docs/migrations.md](migrations.md) for the full user-facing and authoring guide, and
-[specs/02-domain-model.md](../specs/02-domain-model.md) §9 /
-[specs/05-surfaces.md](../specs/05-surfaces.md) §2.1 for the design.
+Schema changes go through an explicit migrations runner (`store-libsql/src/migrations/`): a frozen
+baseline DDL snapshot (`baseline.rs`, `PRAGMA user_version = 4`) plus a linear, numbered chain of
+`Migration` entries applied one transaction at a time. A `schema_migrations` table is the source of
+truth for version, with `PRAGMA user_version` kept as a cheap, non-authoritative marker. **Opening a
+store never migrates it, in either direction** — a version mismatch on open is refused with an
+actionable hint, on every surface (CLI, HTTP daemon, MCP alike). The only way to change a store's
+schema version is `localdb db migrate` / `localdb db downgrade [--to N]` (CLI-only; `db status` is
+read-only and never refuses). See [docs/migrations.md](migrations.md) for the full user-facing and
+authoring guide, and
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§9 / [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)
+§2.1 for the design.
 
 ### `cli`
 
-Command implementations. A thin layer on `core` and the daemon client; no business logic.
-Each command handler acquires config and runtime state, probes the daemon socket, then either
-delegates to the HTTP API (thin-client mode) or opens the store in-process (embedded mode).
-Calls `embed::create_embedder` from the config policy to obtain the embedder for `index` and
-`search`; `FakeEmbedder` is used only in unit tests.
+Command implementations. A thin layer on `core` and the daemon client; no business logic. Each
+command handler acquires config and runtime state, probes the daemon socket, then either delegates
+to the HTTP API (thin-client mode) or opens the store in-process (embedded mode). Calls
+`embed::create_embedder` from the config policy to obtain the embedder for `index` and `search`;
+`FakeEmbedder` is used only in unit tests.
 
 ### `server`
 
-The axum-based HTTP API daemon. Exposes the `/v1` REST surface (and, once auth is enforced,
-the OAuth2 authorization-code + PKCE flow at `/authorize`/`/token`/`/revoke`, RFC 7591 Dynamic
-Client Registration at `/register`, and RFC 9728/8414 discovery at `/.well-known/oauth-*` — see
-[Authentication](#authentication) below), manages the daemon unix socket for discovery, runs
-the file-watcher (`notify`), the URL refresh scheduler, and the background job queue. Opens the
-same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is visible.
-Multi-process is the first-class concurrency model — the daemon is one writer among peers (CLI
-sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
-`busy_timeout=5000`. Ingestion via `POST /v1/jobs` is currently a no-op — see
-[Known gaps §1](#known-gaps). See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon unix socket for
+discovery, runs the file-watcher (`notify`), the URL refresh scheduler, and the background job
+queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is
+visible. Multi-process is the first-class concurrency model — the daemon is one writer among peers
+(CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
+`busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
+(`server::job_exec::run_job`) through an async job queue with a configurable worker pool
+(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a stub;
+a second submission for a store already running rejects with `index_in_progress`, 409, while jobs
+for different stores run concurrently up to `server.job_workers` workers. `GET /jobs/{id}/events`
+streams the job's live progress over SSE (issue #83). The URL-refresh scheduler submits through the
+same job engine. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.
 
 ### `mcp`
 
-MCP server built on the official `rmcp` SDK (full macro-native `#[tool_router]`/
-`#[tool_handler]`), speaking the same `Citation` shape that every other surface uses.
-Exposes four read-only tools — `search`, `get_document`, `get_chunks`, `list_stores`.
-Served over two transports: stdio (`localdb mcp`, embedded-in-process or, if a daemon
-is already running, proxied to its `/mcp` route — see `mcp/src/proxy.rs`) and HTTP
-(`/mcp`, mounted on `server`'s axum router alongside `/v1` — see `mcp/src/http.rs` and
-`server/src/mcp_bridge.rs`). The `--allow-write` flag is parsed for forward
-compatibility but write tools are rejected in v1 on both transports.
-See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.
+MCP server built on the official `rmcp` SDK (full macro-native `#[tool_router]`/ `#[tool_handler]`),
+speaking the same `Citation` shape that every other surface uses. Exposes five read-only tools —
+`search`, `get_document`, `get_chunks`, `list_stores`, `list_documents`. Served over two transports:
+stdio (`localdb mcp`, embedded-in-process or, if a daemon is already running, proxied to its `/mcp`
+route — see `mcp/src/proxy.rs`) and HTTP (`/mcp`, mounted on `server`'s axum router alongside `/v1`
+— see `mcp/src/http.rs` and `server/src/mcp_bridge.rs`). The `--allow-write` flag is parsed for
+forward compatibility but write tools are rejected in v1 on both transports. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.
 
 ### `localdb` (binary)
 
-The single-binary entry point. Parses the top-level subcommand tree with clap and delegates
-to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mcp`, `status`,
-`store` (incl. `grant`/`revoke`), `source`, `index`, `search`, `add`, `login`, `logout`, `user`,
-`key`, `invite` — see [Authentication](#authentication) for the auth-related ones and
-[docs/cli.md](cli.md) for the full reference.
+The single-binary entry point. Parses the top-level subcommand tree with clap and delegates to the
+appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mcp`, `status`, `store`,
+`source`, `document`, `db`, `job`, `index`, `search`, `add`, `completions`.
 
 ---
 
@@ -147,12 +171,18 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  └─────────────────────────────────────────────────────────┘
 ```
 
-Content-addressed IDs (`blake3`) flow through every step: documents get
-`blake3(uri ‖ content_hash)` and chunks get `blake3(document_id ‖ chunk_text ‖ span)`,
-making re-indexing idempotent. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
+Content-addressed IDs (`blake3`) flow through every step: documents get `blake3(uri ‖ content_hash)`
+and chunks get `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`, making re-indexing
+idempotent. Span (byte offsets) is deliberately excluded — it can shift slightly between runs (e.g.
+from whitespace-normalization tweaks) without the chunk's actual membership changing, which would
+otherwise needlessly churn IDs. See
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§3.
 
-The `Citation` is the canonical output shape used by every surface — CLI, HTTP, and MCP all
-return the same structure. See [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
+The `Citation` is the canonical output shape used by every surface — CLI, HTTP, and MCP all return
+the same structure. See
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§6.
 
 ---
 
@@ -172,93 +202,95 @@ return the same structure. See [specs/02-domain-model.md](../specs/02-domain-mod
   (HTTP to daemon)     open store in-process
 ```
 
-On every invocation, CLI and MCP probe a unix socket at `<data_dir>/daemon.sock`. If a
-daemon is running and responsive, the command routes over HTTP. If not, the store is opened
-in-process (libsql database; embeddings come from the configured embedder, defaulting to the
-local ONNX model). No configuration is needed for the common case. See [specs/01-architecture.md](../specs/01-architecture.md) §3.
+On every invocation, CLI and MCP probe a unix socket at `<data_dir>/daemon.sock`. If a daemon is
+running and responsive, the command routes over HTTP. If not, the store is opened in-process (libsql
+database; embeddings come from the configured embedder, defaulting to the local ONNX model). No
+configuration is needed for the common case. See
+[specs/01-architecture.md](https://github.com/dokterbob/localdb/blob/main/specs/01-architecture.md)
+§3.
 
 ---
 
 ## Authentication {#authentication}
 
-The daemon's HTTP surface (`/v1/*` and `/mcp`) is bearer-token authenticated once auth is
-*enforced* — controlled by `server.auth: auto | required | off` (default `auto`, which enforces
-iff the daemon is bound to a non-loopback address). A loopback-bound daemon under `auto`, and
-every daemonless CLI/embedded-MCP invocation, remain unauthenticated by design: the same trust
-boundary as the on-disk files themselves. See
-[specs/05-surfaces.md](../specs/05-surfaces.md) §3/§3.1 for the full decision matrix.
+The daemon's HTTP surface (`/v1/*` and `/mcp`) is bearer-token authenticated once auth is _enforced_
+— controlled by `server.auth: auto | required | off` (default `auto`, which enforces iff the daemon
+is bound to a non-loopback address). A loopback-bound daemon under `auto`, and every daemonless
+CLI/embedded-MCP invocation, remain unauthenticated by design: the same trust boundary as the
+on-disk files themselves. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3/§3.1 for the full
+decision matrix.
 
-**Bootstrap.** The first `localdb serve` with auth enforced and zero users yet prints a
-one-time setup code to stderr. Paste it into the browser consent page `/authorize` opens (or
-pass it via `localdb login --setup-code <code>`) to create the first admin account.
+**Bootstrap.** The first `localdb serve` with auth enforced and no admin yet prints a one-time setup
+code to stderr. Paste it into the browser consent page `/authorize` opens (or pass it via
+`localdb login --setup-code <code>`) to create the first admin account.
 
-**Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a
-blake3 hash. Access tokens are short-lived (1h); refresh tokens (30d) rotate on every use with
-reuse detection (presenting an already-rotated refresh token revokes its whole family). API
-keys (`localdb key create`) share the same token table, never expire by default, and track
+**Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a blake3
+hash. Access tokens are short-lived (1h); refresh tokens (30d) rotate on every use with reuse
+detection (presenting an already-rotated refresh token revokes its whole family). API keys
+(`localdb key create`) share the same token table, never expire by default, and track
 `last_used_at`.
 
-**OAuth2 authorization-code + PKCE (S256)** is the flow behind `GET/POST /authorize` (an
-inline-HTML consent page) and `POST /token`. `POST /revoke` implements RFC 7009 (always `200`,
-even for an unknown token).
+**OAuth2 authorization-code + PKCE (S256)** is the flow behind `GET/POST /authorize` (an inline-HTML
+consent page) and `POST /token`. `POST /revoke` implements RFC 7009 (always `200`, even for an
+unknown token).
 
-**Zero-config MCP client onboarding (RFC 9728 + 8414 + 7591).** A stock MCP client (Claude Code
-and similar) pointed at `http://host:port/mcp` with no static header can onboard with no manual
-configuration: a `401` on any protected route carries `WWW-Authenticate: Bearer
-resource_metadata="<base>/.well-known/oauth-protected-resource"`; that protected-resource
-metadata document (RFC 9728) points at the authorization server; the authorization-server
-metadata document (RFC 8414, `/.well-known/oauth-authorization-server`) advertises
-`/register`, `/authorize`, and `/token`; `POST /register` (RFC 7591 Dynamic Client Registration)
-mints the client a `client_id` it then uses to run the ordinary code+PKCE flow. `<base>` is
-`server.public_url` when configured (set this behind a TLS-terminating reverse proxy — see
-[specs/03-config.md](../specs/03-config.md) §1) or, otherwise, derived from the request's own
+**Zero-config MCP client onboarding (RFC 9728 + 8414 + 7591).** A stock MCP client (Claude Code and
+similar) pointed at `http://host:port/mcp` with no static header can onboard with no manual
+configuration: a `401` on any protected route carries
+`WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource"`; that
+protected-resource metadata document (RFC 9728) points at the authorization server; the
+authorization-server metadata document (RFC 8414, `/.well-known/oauth-authorization-server`)
+advertises `/register`, `/authorize`, and `/token`; `POST /register` (RFC 7591 Dynamic Client
+Registration) mints the client a `client_id` it then uses to run the ordinary code+PKCE flow.
+`<base>` is `server.public_url` when configured (set this behind a TLS-terminating reverse proxy —
+see [specs/03-config.md](../specs/03-config.md) §1) or, otherwise, derived from the request's own
 `Host` header after strict sanitization (`server::auth::base_url`) — the header is
-attacker-influencable on these unauthenticated routes, so a malformed one is rejected rather
-than ever echoed back.
+attacker-influencable on these unauthenticated routes, so a malformed one is rejected rather than
+ever echoed back.
 
-Client redirect-uri policy differs by origin: the built-in `localdb-cli` client keeps the RFC
-8252 §7.3 loopback-any-port exception (`http://127.0.0.1:<any port>/...` /
-`http://localhost:<any port>/...`, since the CLI binds a fresh ephemeral port per login
-attempt); a client created via `/register` is matched by **exact** redirect_uri only — no
-loopback-any-port leniency — and its `redirect_uris` must each be either an `https://` URL or a
-loopback `http://` URL (custom URI schemes such as `myapp://callback` are rejected; see
-`core::auth::validate_registration_redirect_uri`'s doc comment for the rationale). Public
-clients only — DCR never mints a `client_secret`.
+Client redirect-uri policy differs by origin: the built-in `localdb-cli` client keeps the RFC 8252
+§7.3 loopback-any-port exception (`http://127.0.0.1:<any port>/...` /
+`http://localhost:<any port>/...`, since the CLI binds a fresh ephemeral port per login attempt); a
+client created via `/register` is matched by **exact** redirect_uri only — no loopback-any-port
+leniency — and its `redirect_uris` must each be either an `https://` URL or a loopback `http://` URL
+(custom URI schemes such as `myapp://callback` are rejected; see
+`core::auth::validate_registration_redirect_uri`'s doc comment for the rationale). Public clients
+only — DCR never mints a `client_secret`.
 
 **Authorization (D7).** Every user has a role, `admin` or `member`. Admins see and manage every
 store; members see/search only `shared`-visibility stores they hold an explicit grant for
 (`localdb store grant/revoke`). `private` stores are always admin-only, ungrantable. Invites
-(`localdb invite create/list/revoke/requests/approve/deny`) let a new user join without an
-admin creating their account directly: `open`-mode invites mint a user + API key immediately on
+(`localdb invite create/list/revoke/requests/approve/deny`) let a new user join without an admin
+creating their account directly: `open`-mode invites mint a user + API key immediately on
 redemption; `closed`-mode invites file a pending access request an admin must approve before a
 credential is minted.
 
 **CLI identity.** `localdb login` drives the browser OAuth flow (`--invite <token>` redeems an
-invite instead — no browser round trip) and caches the resulting bearer in `credentials.json`
-next to `config.yaml` ([specs/03-config.md](../specs/03-config.md) §6); `localdb logout`
-revokes it and clears the cache. `localdb status` shows the caller's identity and cached token
-expiry once authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached
-credential for a single invocation. Exit code `6` (new) is reserved for
-`unauthorized`/`forbidden`.
+invite instead — no browser round trip) and caches the resulting bearer in `credentials.json` next
+to `config.yaml` ([specs/03-config.md](../specs/03-config.md) §6); `localdb logout` revokes it and
+clears the cache. `localdb status` shows the caller's identity and cached token expiry once
+authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached credential for a
+single invocation. Exit code `6` (new) is reserved for `unauthorized`/`forbidden`.
 
 **Behavior changes worth flagging to anyone tracking this branch:**
-- **Config hot-reload was removed.** Earlier builds re-read `config.yaml` on file change while
-  the daemon ran; as of the auth work, config is read once at process startup only
-  ([specs/03-config.md](../specs/03-config.md) §5) — a change to the file takes effect on the
-  next restart, not live.
+
+- **Config hot-reload was removed.** Earlier builds re-read `config.yaml` on file change while the
+  daemon ran; as of the auth work, config is read once at process startup only
+  ([specs/03-config.md](../specs/03-config.md) §5) — a change to the file takes effect on the next
+  restart, not live.
 - **Pre-migration-list unified databases now hard-error at startup** instead of being silently
   reinitialized: a database whose schema version has no migration path gets `invalid_config`
-  instructing the operator to recreate it or restore from backup, and the file is left
-  completely untouched before that error is raised
-  ([specs/02-domain-model.md](../specs/02-domain-model.md) §9).
+  instructing the operator to recreate it or restore from backup, and the file is left completely
+  untouched before that error is raised ([specs/02-domain-model.md](../specs/02-domain-model.md)
+  §9).
 
 ---
 
 ## On-disk layout
 
-The config file and the data directory are independent paths (`--config` /
-`LOCALDB_CONFIG` choose the former; `paths.data` the latter). After
-`localdb init` and `localdb index`:
+The config file and the data directory are independent paths (`--config` / `LOCALDB_CONFIG` choose
+the former; `paths.data` the latter). Both are created implicitly on first use (or explicitly via
+`localdb init`); after `localdb index` has run:
 
 ```
 <config_dir>/
@@ -271,149 +303,488 @@ The config file and the data directory are independent paths (`--config` /
   daemon.sock                  # unix socket (present only while daemon runs)
 ```
 
-The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.localdb.localdb/data`
-(the bundle ID is intentionally verbose — see [Known gaps §4](#known-gaps)).
-Override with `paths.data` in `config.yaml` or point to a custom config with `--config`.
+The default `data_dir` on macOS is `~/Library/Application Support/localdb/data`. Override with
+`paths.data` in `config.yaml` or point to a custom config with `--config`.
 
-The `models/` directory (configured via `paths.models`) is populated on first `localdb index`
-or `localdb search` when the default `local` embedder downloads `pplx-embed-context-v1-0.6b`
-(~706 MB ONNX) from HuggingFace. On Apple Silicon macOS built with `--features local-coreml`,
-the CoreML bundle is additionally fetched from `dokterbob/pplx-embed-coreml` (XET-deduped via
-`hf-hub` 1.0). Subsequent runs use the cached model.
+The `models/` directory (configured via `paths.models`) is populated on the first indexing or search
+operation (including `source add`'s auto-index) when the default `local` embedder downloads
+`pplx-embed-context-v1-0.6b` (~706 MB ONNX) from HuggingFace. On Apple Silicon macOS built with
+`--features local-coreml`, the CoreML bundle is additionally fetched from
+`dokterbob/pplx-embed-coreml` (XET-deduped via `hf-hub` 1.0). Subsequent runs use the cached model.
 
 `--features local-onnx` builds (the default on Linux; the ONNX fallback on macOS) additionally
-populate `<cache_dir>/localdb/ort/<version>/` on first use with the embedded ONNX Runtime
-shared library — a separate, sibling directory to `models/`, not configurable via `paths.*`.
-See [Platform notes: ONNX Runtime loading](#platform-notes).
+populate `<cache_dir>/localdb/ort/<version>/` on first use with the embedded ONNX Runtime shared
+library — a separate, sibling directory to `models/`, not configurable via `paths.*`. See
+[Platform notes: ONNX Runtime loading](#platform-notes).
 
 ---
 
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | OK |
-| 1 | Internal error |
-| 2 | Invalid usage or config (clap errors, config parse failures) |
-| 3 | Not found (unknown store, unknown source) |
-| 4 | Conflict / already running (duplicate store, second daemon) |
-| 5 | Unavailable (daemon unreachable, model missing) |
-| 6 | Permission denied — missing or insufficient auth (`unauthorized`/`forbidden`) |
+| Code | Meaning                                                                |
+| ---- | ---------------------------------------------------------------------- |
+| 0    | OK                                                                     |
+| 1    | Internal error                                                         |
+| 2    | Invalid usage or config (clap errors, config parse failures)           |
+| 3    | Not found (unknown store, unknown source)                              |
+| 4    | Conflict / already running (duplicate store, second daemon)            |
+| 5    | Unavailable (daemon unreachable, model missing, rate-limited upstream) |
 
 ---
 
-## Platform notes {#platform-notes}
+<a id="platform-notes"></a>
 
-**CoreML embedding backend (macOS / Apple Silicon).** The default `pplx-embed-context-v1-0.6b`
-model can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt-in
-`local-coreml` cargo feature (macOS-only; every code path is
+## Platform notes
+
+**CoreML embedding backend (macOS / Apple Silicon).** The default `pplx-embed-context-v1-0.6b` model
+can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt-in `local-coreml` cargo
+feature (macOS-only; every code path is
 `#[cfg(all(target_os = "macos", feature = "local-coreml"))]`). Build it with
 `cargo build -p localdb --features local-coreml`. Because the feature pulls edition-2024
-dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85**; the workspace `rust-version` is `1.85`.
-Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default builds
-never touch any CoreML code.
+dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85** — but that floor is subsumed: since the
+`pdf_oxide` PDF parser landed, the workspace `rust-version` is **1.88** on every platform
+(`pdf_oxide` itself declares `rust-version = "1.88"`, and it pulls `image` 0.25, which needs the
+same). Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default
+builds never touch any CoreML code.
 
-The default `local` provider auto-selects CoreML on Apple Silicon when the feature is built and
-the bundle loads, otherwise falls back to ONNX (CPU). `local-coreml` forces CoreML (hard error if
-unavailable); `local-onnx` forces ONNX. CoreML and ONNX vectors are index-interchangeable
-(same `model_id`, 1024-dim, `Binary`; measured ~0.995–0.9995 cosine parity, ~98–99% per-dimension
-sign agreement), so switching backends needs no reindex. See [specs/03-config.md](../specs/03-config.md) §7 and
-[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
+The default `local` provider auto-selects CoreML on Apple Silicon when the feature is built and the
+bundle loads, otherwise falls back to ONNX (CPU). `local-coreml` forces CoreML (hard error if
+unavailable); `local-onnx` forces ONNX. CoreML and ONNX vectors are index-interchangeable (same
+`model_id`, 1024-dim, `Binary`; measured ~0.995–0.9995 cosine parity, ~98–99% per-dimension sign
+agreement), so switching backends needs no reindex. See
+[specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §7 and
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§4.
 
 **ONNX Runtime loading (`local-onnx`, all platforms).** `embed`'s `ort` dependency uses the
 `load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and instead
-`dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads *Microsoft's
-official* ONNX Runtime release (pinned to 1.24.4) for the build's target platform
-(`linux-x64`, `linux-aarch64`, `osx-arm64`), verifies it against a pinned sha256, and embeds it
-into the `embed` crate via `include_bytes!`. On first construction of any local-ONNX embedder,
+`dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads _Microsoft's
+official_ ONNX Runtime release (pinned to 1.24.4) for the build's target platform (`linux-x64`,
+`linux-aarch64`, `osx-arm64`), verifies it against a pinned sha256, and embeds it into the `embed`
+crate via `include_bytes!`. On first construction of any local-ONNX embedder,
 `embed::ort_runtime::ensure_ort_initialized` extracts that embedded library to
-`<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention; idempotent —
-skipped if an up-to-date copy is already there) and calls `ort::init_from` on it before any
-other `ort` API is touched. Embedding the runtime grows the `localdb` binary by roughly
-12–20 MB depending on platform (measured: +11.8 MiB on macOS arm64, where it also replaced
-the previous statically-linked archive); the compressed release tarballs grow less.
+`<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention; idempotent — skipped if
+an up-to-date copy is already there) and calls `ort::init_from` on it before any other `ort` API is
+touched. Embedding the runtime grows the `localdb` binary by roughly 12–20 MB depending on platform
+(measured: +11.8 MiB on macOS arm64, where it also replaced the previous statically-linked archive);
+the compressed release tarballs grow less.
 
-Two overrides exist for power users / distro packagers who want to supply their own ONNX
-Runtime instead of the embedded one:
-- `ORT_DYLIB_PATH` (runtime env var): `ensure_ort_initialized` honours this directly and
-  `dlopen`s that path instead of extracting the embedded copy.
-- `LOCALDB_ORT_LIB` (build-time env var, read by `embed/build.rs`): points the *build* at a
-  local ONNX Runtime library to embed instead of downloading one (offline/distro builds).
+Two overrides exist for power users / distro packagers who want to supply their own ONNX Runtime
+instead of the embedded one:
 
-Both overrides require ONNX Runtime **≥ 1.24** — `fastembed`'s own (unconditional) `ort`
-dependency declaration requests the `api-24` feature regardless of which `fastembed` features
-we enable, so despite `embed`'s own `ort` dependency line specifying no `api-*` feature, Cargo
-feature unification still enables `api-24` for the whole build. This is why the pinned embedded
-version is exactly 1.24.4, not an older 1.17–1.23 release.
+- `ORT_DYLIB_PATH` (runtime env var): `ensure_ort_initialized` honours this directly and `dlopen`s
+  that path instead of extracting the embedded copy.
+- `LOCALDB_ORT_LIB` (build-time env var, read by `embed/build.rs`): points the _build_ at a local
+  ONNX Runtime library to embed instead of downloading one (offline/distro builds).
+
+Both overrides require ONNX Runtime **≥ 1.24** — `fastembed`'s own (unconditional) `ort` dependency
+declaration requests the `api-24` feature regardless of which `fastembed` features we enable, so
+despite `embed`'s own `ort` dependency line specifying no `api-*` feature, Cargo feature unification
+still enables `api-24` for the whole build. This is why the pinned embedded version is exactly
+1.24.4, not an older 1.17–1.23 release.
 
 Why this exists: `ort`'s `download-binaries` feature (the previous approach) statically links
-pyke.io's prebuilt ONNX Runtime archive into `ort-sys`. That archive is built with GCC 14 on
-Ubuntu 24.04 and references `__isoc23_strtol*` symbols, giving the *release binary itself* a
-`GLIBC_2.38` floor — it refused to start on glibc-2.35 distros (Linux Mint 21.x, Ubuntu 22.04).
-It was also ABI-incompatible with GCC-11 libstdc++ when built on ubuntu-22.04. See
+pyke.io's prebuilt ONNX Runtime archive into `ort-sys`. That archive is built with GCC 14 on Ubuntu
+24.04 and references `__isoc23_strtol*` symbols, giving the _release binary itself_ a `GLIBC_2.38`
+floor — it refused to start on glibc-2.35 distros (Linux Mint 21.x, Ubuntu 22.04). It was also
+ABI-incompatible with GCC-11 libstdc++ when built on ubuntu-22.04. See
 [issue #133](https://github.com/dokterbob/localdb/issues/133) and
 [pykeio/ort#523](https://github.com/pykeio/ort/issues/523) (unresolved upstream). The Microsoft
 official Linux builds we embed instead float at `GLIBC_2.27` / `GLIBCXX_3.4.22` / `CXXABI_1.3.11`
-(verified via `objdump -T`), comfortably under Ubuntu 22.04's `GLIBC_2.35` baseline; the
-embedded macOS dylib declares a minimum of macOS 14.0 (`LC_BUILD_VERSION`). Because our own
-Rust code still inherits the *build machine's* glibc floor independent of this mechanism, the
-release and CI workflows also pin Linux builds to `ubuntu-22.04` (not `ubuntu-latest`) and
-verify both the `localdb` binary and the embedded `.so` stay at or below `GLIBC_2.35`.
+(verified via `objdump -T`), comfortably under Ubuntu 22.04's `GLIBC_2.35` baseline; the embedded
+macOS dylib declares a minimum of macOS 14.0 (`LC_BUILD_VERSION`). Because our own Rust code still
+inherits the _build machine's_ glibc floor independent of this mechanism, the release and CI
+workflows also pin Linux builds to `ubuntu-22.04` (not `ubuntu-latest`) and verify both the
+`localdb` binary and the embedded `.so` stay at or below `GLIBC_2.35`.
 
 ---
 
-## Known gaps {#known-gaps}
+<a id="known-gaps"></a>
 
-This section documents verified divergences between the specs and the v0.1.0 implementation. They are listed honestly so contributors know where work remains. Each item names the responsible code area.
+## Known gaps
 
-**1. HTTP daemon `POST /v1/jobs` is a no-op.**
-The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. To actually index, run `localdb index` from the CLI (which still works while the daemon runs — concurrent writers serialise via SQLite WAL).
+This section documents verified divergences between the specs and the current implementation. They
+are listed honestly so contributors know where work remains. Each item names the responsible code
+area.
 
-**Gap #2. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
-**Resolved as of 2026-06-28:** `cli/src/lib.rs` now validates path existence in `run_source_add_async` via `normalize_path_source`.
-`localdb source add /does/not/exist --store notes` succeeds (exit 0) even when the path does not exist on disk. Validation is deferred to index time. The source spec validation in `core/src/config/` or the CLI source-add handler is the place to add an existence check.
+**Recently closed, not (re)listed below:** `--store` used to be honored only by `search`/`mcp` —
+every other command silently operated on an arbitrary store instead of respecting the flag's absence
+consistently (#178, #118). `--store` is now resolved and validated the same way everywhere, with a
+per-command default documented in
+[specs/05-surfaces.md §2.2](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#22-store-scope):
+all stores for `search`/`status`/`store list`/`index`, the store named `default` for `source`/`add`,
+and rejected outright for `db status`/`migrate`/`downgrade`. Separately, MCP
+`get_document`/`get_chunks` now accept an optional `store` argument (id or name) to disambiguate a
+document id that exists in more than one store (#144; see [docs/mcp.md](mcp.md#get_document)). Gaps
+#6 and #7 below (the `/mcp` HTTP store-list snapshot and daemon-proxied `localdb mcp --store`) are
+related but distinct and remain open.
 
-**Gap #3. macOS default paths use a verbose bundle ID.** ([#15](https://github.com/dokterbob/localdb/issues/15))
-**Resolved as of 2026-06-28:** `core/src/config/platform.rs` now uses `ProjectDirs::from("", "", "localdb")` for clean default paths.
-The default config, data, and model-cache locations on macOS all live under the bundle ID `com.localdb.localdb.localdb` (e.g. data at `~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in `core/src/config/platform.rs`. Specs/03 shows shorter `localdb/` paths. Cosmetic; override with `paths.*` in config for cleaner locations.
+**1. ~~HTTP daemon `POST /v1/jobs` is a no-op~~ — RESOLVED.**
+([#187](https://github.com/dokterbob/localdb/issues/187),
+[#208](https://github.com/dokterbob/localdb/issues/208)) `POST /v1/jobs` now runs the real ingestion
+pipeline (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
+(`server.job_workers`, default 1) and a per-store in-flight guard — a duplicate submission for a
+store already running rejects with `index_in_progress` (409), rather than silently no-opping.
+`localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events` (SSE, issue
+#83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't be
+established; the summary, `--json`, and `--strict` output are identical to embedded mode.
+`index --delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
+daemon before `localdb index` is no longer necessary. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2/§3
+for the full contract. The worker-pool size (`server.job_workers`) is operator-configurable as of
+#208: values greater than 1 let jobs for different stores run concurrently, while the per-store
+guard still prevents two concurrent jobs on the same store from racing regardless of pool size.
 
-**4. The CoreML context bundle ships only the L512 sequence-length bucket.**
-The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its bucket manifest from HF repo `dokterbob/pplx-embed-coreml`. Today only the `context/L512-int8` bucket is published. The larger context buckets (`L ∈ {1024, 2048, 4096}`) are picked up automatically from the manifest once published, so no code change is needed. This XET-deduped download that shares the ~1.15 GB encoder weights across buckets relies on the `hf-hub` 1.0 pre-release.
+**Gap #2. `source add` does not validate path existence.**
+([#14](https://github.com/dokterbob/localdb/issues/14)) **Resolved as of 2026-06-28:**
+`cli/src/lib.rs` now validates path existence in `run_source_add_async` via `normalize_path_source`.
+`localdb source add /does/not/exist --store notes` fails immediately with `invalid_request` (exit 2)
+and the source is never registered.
 
-**5. Sources added before the include-allowlist change keep empty `include` globs.**
-As of the `only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources that were added before this change already have an empty `include` list recorded in the unified database and will continue to index all files they enumerate until they are removed and re-added with `localdb source add`. There is no automatic migration, and this change is intentionally not folded into `policy_version`. The per-file chunk preset is determined deterministically from the filename/MIME type at index time, so re-indexing existing content with the new code produces correct results without a policy-hash change.
+**Gap #3. macOS default paths use a verbose bundle ID.**
+([#15](https://github.com/dokterbob/localdb/issues/15)) **Resolved as of 2026-06-28:**
+`core/src/config/platform.rs` now uses `ProjectDirs::from("", "", "localdb")`, so macOS defaults
+live under a plain `localdb` segment — config and data at `~/Library/Application Support/localdb/`,
+the model cache at `~/Library/Caches/localdb/models/`, logs at `~/Library/Logs/localdb/` — matching
+the paths `specs/03-config.md` specifies.
+
+**4. The CoreML context bundle ships only the L512 sequence-length bucket.** The CoreML backend
+(`local-coreml` feature; see [Platform notes](#platform-notes)) reads its bucket manifest from HF
+repo `dokterbob/pplx-embed-coreml`. Today only the `context/L512-int8` bucket is published. The
+larger context buckets (`L ∈ {1024, 2048, 4096}`) are picked up automatically from the manifest once
+published, so no code change is needed. This XET-deduped download that shares the ~1.15 GB encoder
+weights across buckets relies on the `hf-hub` 1.0 pre-release.
+
+**5. Sources added before the include-allowlist change keep empty `include` globs.** As of the
+`only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an
+extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources
+that were added before this change already have an empty `include` list recorded in the unified
+database and will continue to index all files they enumerate until they are removed and re-added
+with `localdb source add`. There is no automatic migration, and this change is intentionally not
+folded into `policy_version`. The per-file chunk preset is determined deterministically from the
+filename/MIME type at index time, so re-indexing existing content with the new code produces correct
+results without a policy-hash change.
 
 **6. Resolved as of T2 (2026-07-07): `/mcp` now sees stores added after daemon startup.**
-`McpHandler` no longer holds a `Vec<AvailableStore>` snapshot taken once at
-`start_daemon` time. It instead holds a `StoreProvider` (`mcp::store_provider`, design
-decision D12) — `server::mcp_bridge::AppStateStoreProvider` for the daemon-hosted `/mcp`
-route, `cli::app_db::AppDbStoreProvider` for embedded-stdio `localdb mcp` — that
-re-derives the store list from the database on every tool call. A store added later via
-`POST /v1/stores` (or a concurrent `localdb store add`) is visible on the very next
-`search`/`get_document`/`get_chunks`/`list_stores` call, no restart needed. This was
-previously blocked by the mistaken belief that `rmcp`'s synchronous Streamable HTTP
-service-factory closure prevented any async re-resolution; in fact that closure only
-constrains *construction-time* lookups (building a new `McpHandler` per session) — an
+`McpHandler` no longer holds a `Vec<AvailableStore>` snapshot taken once at `start_daemon` time. It
+instead holds a `StoreProvider` (`mcp::store_provider`, design decision D12) —
+`server::mcp_bridge::AppStateStoreProvider` for the daemon-hosted `/mcp` route,
+`cli::app_db::AppDbStoreProvider` for embedded-stdio `localdb mcp` — that re-derives the store list
+from the database on every tool call. A store added later via `POST /v1/stores` (or a concurrent
+`localdb store add`) is visible on the very next `search`/`get_document`/`get_chunks`/`list_stores`
+call, no restart needed. This was previously blocked by the mistaken belief that `rmcp`'s
+synchronous Streamable HTTP service-factory closure prevented any async re-resolution; in fact that
+closure only constrains _construction-time_ lookups (building a new `McpHandler` per session) — an
 individual tool method's own `async fn` body is unaffected, which is exactly where
 `StoreProvider::available_stores().await` is now called. See
 [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine).
 
-**7. `--store` is not honored when `localdb mcp` proxies to a running daemon.**
-The daemon's `/mcp` route has no concept of a per-stdio-session store filter, so
-proxied stdio mode always exposes the daemon's full store set regardless of
-`--store`; a non-fatal warning is printed to stderr. Building client-side
-re-filtering for this was rejected as not worth the complexity in v1. See
-[docs/mcp.md](mcp.md#daemon-proxied-stdio) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+**7. MCP `--store` scoping is a guardrail, not a security boundary.** `localdb mcp --store <name>`
+does now narrow the store set in both stdio modes (issue #201 — proxied mode used to warn and serve
+the daemon's _full_ store set, which silently widened access exactly when the caller asked to narrow
+it). In proxied mode the scope is enforced per request, on the `stores`/`store` tool arguments,
+because `rmcp`'s Streamable HTTP service factory is synchronous and has no access to the request —
+so there is no transport-level channel for a per-connection scope (same root cause as gap 6 above).
+
+The residual gap is containment, not enforcement: the daemon's `/mcp` route is loopback and
+**unauthenticated**, so any process that can open a socket can bypass `localdb mcp` and talk to it
+unscoped. This stops an agent reading another project's docs by accident; it does not contain a
+hostile one. Closing it needs daemon-side auth, which v1 does not have. Embedded mode has no such
+endpoint, so there the scope is as strong as the process boundary. See
+[docs/mcp.md](mcp.md#store-scoping) and
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2.1.
+
+**8. `extractor_version` is dead code; PDF reindex relies on the content hash.** The
+`extractor_version` field is hardcoded (`"1"` in both ingestors and in `store-libsql`'s resource
+upsert) and is never read by the skip-check — that check keys only on `content_hash`. The
+`pdf-extract` → `pdf_oxide` swap changes the extracted text of every PDF, so the content hash
+changes and PDFs re-index automatically on the next `localdb index` (picking up page citations and
+better text). `compute_blocks_hash` folds in each block's page, so a _repagination_ that leaves text
+and kinds unchanged also changes the hash and re-indexes. The one residual gap: if a future parser
+change produces _byte-identical_ text **and identical pages** for some PDF, the hash is unchanged
+and that document is not re-extracted. Threading a real per-parser `extractor_version` into the
+skip-check would close that last axis and is a deferred follow-up (cross-ref
+[#47](https://github.com/dokterbob/localdb/issues/47)).
+
+Conditional GET widens what this gap costs for URL-backed resources, beyond the byte-identical case
+above.
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 spells it out: an unchanged origin answers 304 before any parser touches the bytes, so a parser
+improvement cannot reach an already-indexed URL resource at all — not merely the ones whose output
+would have been identical. The conditional-header suppression rule there names `extractor_version`
+as its designated join point for exactly this reason; until the field carries a real value, only a
+`policy_version` bump reaches those resources.
+
+**9. Residual PDF-extraction gaps.** `extract/src/pdf.rs` repairs several classes of upstream
+extraction defect (see
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§"PDF extraction is tuned for retrieval"). These remain:
+
+- **No title fallback.** A PDF carrying neither `/Title` nor XMP `dc:title` gets `title: null`.
+  There is deliberately no filename or first-page heuristic — a guessed title presented as metadata
+  is worse than an absent one.
+- **Heading and code-block inference is heuristic, and upstream.** Headings come from the
+  extractor's font clustering and code blocks from its monospace detection. Our guards suppress
+  **false positives only**: a heading the extractor never detected (a Part title in a different
+  face, say) cannot be recovered, so `heading_path` will keep reporting the last heading it did see.
+  Conversely, code that reads as English prose — Inform 7, period-terminated Gherkin, pseudocode
+  paragraphs — is un-fenced and labelled `text`. Both cost a wrong label, never altered text.
+- **Spurious intra-word spaces.** Glyph-run clustering can split a word (`"consid ered"`,
+  `"investi tions"`). There is no hyphen and no positional signal left after reflow, so rejoining
+  needs sentence context rather than a regex: English is full of legitimate pairs whose
+  concatenation is also a word (`a bout`/`about`, `in to`/`into`, `any one`/`anyone`), and
+  misjoining those silently changes meaning. Tracked separately.
+- **Untagged running headers survive.** Artifact-tagged furniture is dropped, but a PDF that does
+  not tag its running heads keeps them. The upstream geometric stripper is unsafe: it matches
+  glyph-run spans against the top/bottom 15% of the page rather than assembled lines, so in a
+  multi-column layout the first line of every column falls in that band and any short fragment
+  recurring there is deleted from the body text — measured at −2.2% of characters on a two-column
+  corpus fixture. Reported upstream as
+  [pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022).
+- **Over-tagged artifacts are dropped silently.** Dropping `/Artifact`-tagged spans is the one
+  setting under which a correctly parsed span is discarded on purpose, so a producer that tags body
+  content as an artifact loses it with no warning. No corpus fixture covers that case. The trade is
+  deliberate: it needs a broken producer, whereas indexing running headers and page-number folios as
+  content happened on every well-formed tagged PDF.
+
+**10. ~~Feed sources are exempt from the delete-sweep — there is no entry pruning~~ — RESOLVED.**
+([#171](https://github.com/dokterbob/localdb/issues/171)) A feed exposes only its most recent
+entries, so an entry falling out of the feed does not by itself mean it was deleted upstream:
+treating it as a delete would wipe most of a feed's indexed history on a normal fetch, and a feed
+`304` (or a transient empty parse) would zero out every entry in one sweep. The ingestion pipeline's
+presumed-gone delete-sweep therefore still skips `ingestor_kind = feed` sources entirely, exactly as
+before — **that exemption is unchanged by this resolution and remains correct**: an entry merely
+scrolling off the feed window is still never, on its own, treated as a deletion signal.
+
+What's resolved is entry pruning itself. A bounded liveness sweep now runs under `--delete`: it
+probes a batch of entries this run did not observe against their own stored link, and deletes only
+the ones a probe positively confirms gone (404/410) — the confirmed-gone bucket, not the
+presumed-gone one, so it never infers a delete from absence. "Did not observe" is not the same as
+"aged out of the window", and the sweep does not claim it is: a run whose feed document answered 304
+observes nothing at all, so an entry the window still lists can be probed and, on a confirmed
+404/410, pruned. A link-less entry has no link to probe at all — it is stored under a synthetic
+`{feed_url}#entry:{id}` URI — and is deliberately never a candidate: the query excludes every URI
+carrying a fragment, since HTTP never sends one on the wire and probing it verbatim would hit the
+feed root instead. Neither is the feed's own document, which in single-document mode is stored as a
+resource like any other: it is the one feed resource carrying no `external_id`, and the query
+requires one — otherwise a 404/410 on the feed URL would delete the source's whole index. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Aged-out feed entries: the liveness sweep" for the batch cap (25 candidates probed per source
+per run), recheck floor (`max(refresh_interval, 24h)`), and per-outcome rules: `Gone` deletes;
+`NotModified` refreshes the stored validators and the throttle clock; a `200` advances the clock
+alone, keeping the stored validators, since caching the fresh ones would describe a body the sweep
+discarded; `Blocked` and transport errors move nothing but the clock — a deliberate, narrower
+exception to what the column means everywhere else, not a redefinition of it. `last_checked_at` is
+now the last time we successfully contacted the origin for a resource's URI (a `200` or `304` that
+left the store consistent), advanced by the feed entry loop, `url` sources, and single-document feed
+mode as well as the sweep; the sweep alone also advances it on `Blocked`/transport-error outcomes,
+so a set of permanently-blocked entries doesn't lead the oldest-first query forever. See
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§2's `last_checked_at` row and
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "What a probe writes" for the full rule, and gap #20 below for how this same column now also
+gates the entry loop itself.
+
+**11. ~~Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
+then it's never read back and reused; `Last-Modified` is not persisted at all~~ — RESOLVED.**
+([#171](https://github.com/dokterbob/localdb/issues/171)) `url` sources and feed entry links now
+capture both `external_etag` and `external_last_modified` (`resources.external_last_modified`,
+schema v8) on every successful fetch, and replay them as `If-None-Match`/`If-Modified-Since` on the
+next run (`IngestCallback::lookup_fetch_metadata`), subject to the same `policy_version` suppression
+rule as before
+([specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Incremental re-index"). The feed root fetch is conditional too:
+`sources.feed_etag`/`sources.feed_last_modified` (also schema v8) persist the feed document's own
+validators — the only place they can live, since the feed document never becomes a `Resource` in
+discovery mode — and `FeedIngestor` replays them on every run, including in single-document mode,
+where they're now stamped onto the `Resource` it builds instead of the previous hardcoded `None`. A
+304 anywhere in this chain folds any rotated validator over what was already stored (silence about a
+validator means unchanged, not "clear it"); a 200 fully replaces the stored validators, even with
+both `None`, since a fresh full representation's silence means the origin stopped offering that
+validator.
+
+Conditional GET alone still costs one round trip per feed entry per run — a `304` is cheap in bytes,
+not in requests. A recheck gate now sits in front of it for feed discovery entries: before
+`process_url` runs, `process_discovery_entry` skips the HTTP fetch entirely and reports the entry
+`docs_skipped`/`docs_recheck_deferred` when the entry is already known at the run's
+`policy_version`, its stored `last_checked_at` is within the recheck floor
+(`max(source.refresh_interval_secs, 24h)` — the same derivation the liveness sweep above uses), and
+the feed's current claim for the entry still reproduces its stored `metadata_hash`.
+`localdb index --refetch` bypasses the floor check and suppresses that run's feed-document
+validators, forcing a full recheck of a feed source's entries even when nothing looks stale; it is a
+no-op for `file`/`url` sources, since a `url` source's own refresh interval already is its check
+cadence. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Recheck gate" and
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) for
+`index --refetch` and `docs_recheck_deferred`.
+
+**12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates
+the Feed ingestor.** `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind`
+variants
+([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§2); an unrecognized kind fails the whole `list_sources`/`index` call for the store, not just the
+one source with that kind. Concretely: add even one `kind = 'feed'` source to a store, and every
+older `localdb` binary whose `IngestorKind` enum doesn't yet have `Feed` can no longer list or index
+_any_ source in that store — not just the feed one — until it's upgraded. Adding a source kind is
+therefore a floor-version event for a store, the same way a schema migration is, but with none of
+the migration framework's tooling around it (there is no `db downgrade` for this — the
+incompatibility lives in a data row, not the schema version). See
+[docs/migrations.md](migrations.md). Graceful degradation (skip unrecognized kinds instead of
+hard-erroring the whole store) is a follow-up issue.
+
+**13. Cross-source URL ownership: two sources claiming the same URL in one store can race, and the
+loser's sweep deletes the other's live document.** Resource upsert keys off `(store_id, uri)` and
+reassigns `source_id` to whichever source most recently ingested that URI; the delete-sweep runs
+per-source, over the URIs that source saw this run. If two sources resolve to the same URL within
+the same run window — e.g. a feed entry linking to a page that's also directly registered as a `url`
+source — the resource can be silently reassigned between them, and the loser's next sweep, no longer
+seeing that URI as "its own," deletes the shared, still-live document. This predates the feed
+connector (it already applied to two `url` sources, or a `path`/`url` collision, sharing a URI) and
+is not fixed by this work; the feed connector's discovery mode just makes the collision more likely
+in practice, since feeds routinely link to pages users have also added directly.
+
+**14. ~~Feed `refresh` is accepted, persisted, and validated but does not do anything yet~~ —
+RESOLVED.** ([#171](https://github.com/dokterbob/localdb/issues/171)) Feed sources are now
+registered with the daemon's `UrlRefreshScheduler` on the same terms as `url` sources, through both
+registration points: the startup loop that re-registers existing sources (`spawn_url_scheduler` in
+`server/src/daemon.rs`) and the live registration for a source added while the daemon is already
+running (`AppState::add_source` in `server/src/state.rs`). The scheduler itself needed no change —
+it registers by `source_id`/`store_name` and never took a source kind — so a feed's persisted
+`refresh` interval now drives a real periodic poll through the job queue. Scheduled refreshes run
+under `DeletionPolicy::Retain` regardless of source kind, so background polling never deletes;
+removal stays opt-in via `localdb index --delete`. **Operator note:** a feed source configured with
+a `refresh` interval before this landed starts polling as soon as the daemon is upgraded.
+
+**15. ~~Enrichment metadata changes don't persist while content is unchanged~~ — RESOLVED.**
+([#176](https://github.com/dokterbob/localdb/issues/176)) The skip-check (`core/src/ingestion.rs`,
+`on_resource`) now compares a third value, `metadata_hash` (`core::ids::compute_metadata_hash`, over
+the persisted `Metadata` plus `external_id`/`external_etag`), alongside `content_hash` and
+`policy_version`. A `content_hash`/`policy_version` match with a `metadata_hash` mismatch now
+triggers a metadata-only write (`RetrievalStore::update_resource_metadata`, a `ResourceRecord`
+payload) that rewrites the resource row in place — no chunks, blocks, or embeddings touched —
+instead of skipping outright, tracked via a `DocOutcome::MetadataUpdated` progress outcome and the
+`docs_metadata_updated` result counter. This is format-general, not feed-specific: it covers a PDF
+whose Info dictionary/XMP is corrected as much as a feed's own metadata. The source-claimed
+`modified_at` participates in `metadata_hash` as a nullable claim (`None` when the source makes no
+claim — no ingestion-time fallback is ever hashed or stored,
+[#283](https://github.com/dokterbob/localdb/issues/283)), so a genuine claim change on
+byte-identical content takes the metadata-only path too.
+
+One field is not covered by this fix: `Resource.mime` (the ingestor-captured Content-Type, distinct
+from the sniffed format inside `metadata_json`, which _is_ hashed) is not one of `metadata_hash`'s
+inputs and has no `ResourceRecord` column at all. A Content-Type-only change on otherwise
+byte-identical content is therefore invisible to the skip-check: `content_hash`, `policy_version`,
+and `metadata_hash` all still match, so the resource is skipped outright rather than taking the
+metadata-only-write path, and the stored (API-exposed) mime goes stale. Tracked in
+[#288](https://github.com/dokterbob/localdb/issues/288).
+
+**16. ~~`index_resource`'s zero-chunk arm still deletes on an empty replacement~~ — RESOLVED.**
+([#185](https://github.com/dokterbob/localdb/issues/185),
+[#156](https://github.com/dokterbob/localdb/issues/156)) `index_resource` now returns
+`IndexOutcome::Empty` for a resource that chunks to nothing and deletes nothing — an invariant at
+the sink rather than per-ingestor discipline. `FileIngestor` additionally classifies zero-block
+extraction as `on_skipped(Other)`, matching `UrlIngestor`. At the source level,
+`enumerate_path_source` distinguishes `PathEnumeration::RootUnavailable` from `Complete(vec![])`,
+and the delete-sweep is suppressed both for an incomplete enumeration and for a run that observed
+none of the source's own URIs. Deletion is also now opt-in (`--delete`). See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 for the full contract, and gaps 18 and 19 below for the retention trade-offs this deliberately
+accepts.
+
+**17. There is no opt-in for private-network feed entry links.**
+([#196](https://github.com/dokterbob/localdb/issues/196)) Discovery mode fetches entry links through
+a public-destination-only HTTP client (see
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§ "Feed connector", _Destination policy_), and v0.1 offers no way to relax that. An operator running
+an internal feed whose entries link to LAN hosts gets those entries indexed from their embedded
+summaries only — the linked pages are never fetched, silently from the operator's point of view
+apart from a `WARN` log line. There is also a residual hole the guard deliberately does not close:
+the **feed URL itself** uses the unrestricted client (it is operator-configured, the same trust
+class as a `url` source), so a feed URL that 30x's to a private destination is still followed. A
+per-source or global allow-private-destinations setting would address both at once — the opt-in and
+the residual redirect risk — and is the shape the follow-up issue proposes.
+
+A related feed-specific identity bug lives in the same family:
+[#186](https://github.com/dokterbob/localdb/issues/186) — an entry with no guid, no link and no
+title gets a random UUID identity on every parse, so it is re-indexed and its previous copy
+delete-swept on every run.
+
+**18. A source that loses everything at once keeps its documents until it is re-created.** (accepted
+trade-off of [#156](https://github.com/dokterbob/localdb/issues/156)'s guard 2) The zero-seen
+backstop cannot distinguish "the connector is broken" from "every document really was removed" —
+both look like a run that observed none of the source's own URIs — and it resolves that ambiguity in
+favor of retention. So a `path` source whose directory is legitimately emptied, or whose files are
+all renamed in one run, keeps its now-stale documents even under `--delete`. The run warns loudly,
+naming the source and the count, and the remedy is `localdb source remove` followed by `source add`
+and a reindex. Chosen deliberately: the alternative is the failure mode that motivated the guard. A
+future `--delete --force`, or a confirmation prompt showing the affected URIs, would give the escape
+hatch without weakening the default.
+
+**19. A file legitimately emptied keeps its previous content indexed.** (accepted trade-off of
+[#185](https://github.com/dokterbob/localdb/issues/185)'s sink invariant) `index_resource` refuses
+to delete on an empty replacement, because it cannot tell a file that is now genuinely blank from
+one whose extraction failed to produce anything this run. Truncating a file to zero bytes therefore
+leaves its old content searchable, and the run reports it as skipped. The escape hatch is clean and
+needs no new surface: delete the file, and the sweep removes it normally under `--delete`.
+
+**20. Drift on a feed entry is noticed at most once per recheck floor.** (accepted trade-off of the
+recheck gate, gap #11 above) This heading describes a **still-in-window** entry, not an aged-out
+one: an aged-out entry is never emitted by the entry loop at all (nothing persists window membership
+— gap #10 above), and the liveness sweep that can still touch it deliberately discards the body a
+`200` probe returns, so drift on a truly aged-out entry is never noticed at all unless it re-enters
+the feed window. For an entry still in the window, a silent page edit a feed doesn't announce — no
+`updated` bump, no title or author change — is caught within one floor-length window of the origin's
+next successful contact: the ordinary entry loop on a fresh `200`, or the due-entry revisit on a
+`304` (see below), whichever comes first. A feed that keeps answering `304` no longer defers a due
+entry indefinitely: the due-entry revisit walks entries this source has previously indexed past the
+recheck floor even when the feed document itself hasn't changed, capped at the same 25-per-run batch
+bound the liveness sweep uses — drawn in random order rather than the sweep's oldest-first, since
+the revisit (unlike the sweep) never advances `last_checked_at` on a failed outcome, and a
+deterministic oldest-first pick would let a batch-sized clique of permanently failing entries starve
+everything behind it. Three escape hatches reopen the gate early: `localdb index --refetch`; a
+change to any part of the connector's claim — `external_id`, `modified_at_override`, or the supplied
+enrichment (`updated`/`published`, authors, …) — that alters the merged `metadata_hash` the gate
+compares; and a `policy_version` bump. The claim comparison inherits two asymmetries from
+`MetadataEnrichment::apply_to`: a title change only alters the hash while the resource still has no
+stored title for the feed's fallback to fill (the merge only ever fills a missing title, never
+replaces one), and a creators list going non-empty → empty never changes the stored creators (the
+merge only replaces them on non-empty input), so an author _removal_ alone does not reopen the gate.
+Under `--delete`, this interacts with the liveness sweep (gap #10 above): when guard 2's zero-seen
+backstop fires on a `304`'d feed document, a sweep probe of a still-in-window entry advances that
+entry's `last_checked_at` exactly like an ordinary probe, deferring by a full floor whichever
+mechanism would otherwise have rechecked it next — the ordinary entry loop's turn on a future `200`,
+or the due-entry revisit's own turn on a future `304`. This is bounded, not open-ended: the sweep
+deliberately discards the fresh validators its own `200` outcome would otherwise cache, so whichever
+mechanism's turn comes next always lands on a full `200`, never a spuriously cheap `304`. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Due-entry revisit on a feed 304" and "Interaction with the recheck gate" (under "Aged-out feed
+entries: the liveness sweep").
 
 ---
 
-## Deferred design decisions {#design-decisions}
+<a id="design-decisions"></a>
 
-Several items surfaced during the v0.1.0 issue sweep require cross-cutting design decisions before code can be written. They are documented (with options and recommendations) in [docs/design-decisions.md](design-decisions.md):
+## Deferred design decisions
 
-- **A7**: `policy_version` does not hash resolved per-source chunking parameters.
-- **A8 / B4**: Pagination offset computed but never applied; `total_candidates` is pre-dedup.
-- **B2**: Cross-store deduplication semantics (collapse vs. distinct citations).
-- **B3**: Rerank seam re-attaches store metadata by index position (safe today, unsafe with real reranker).
-- **E1**: Structured MCP tool results (spec-decided, implementation deferred to v0.2.0).
-- **A9-charset**: Allowed character set for store names beyond traversal-safety.
+Several items surfaced during the v0.1.0 issue sweep need a cross-cutting decision before code can
+be written. Each is tracked as an issue carrying the problem statement, the options, and a
+recommendation:
+
+- **[#47](https://github.com/dokterbob/localdb/issues/47)**: `policy_version` does not hash resolved
+  per-source chunking parameters.
+- **[#95](https://github.com/dokterbob/localdb/issues/95)**: cross-store deduplication semantics —
+  collapse citations sharing a content hash, or keep them distinct.
+- **[#267](https://github.com/dokterbob/localdb/issues/267)**: structured MCP tool results. The spec
+  already decided this; the implementation is what is deferred.
+- **[#268](https://github.com/dokterbob/localdb/issues/268)**: allowed character set for store names
+  beyond traversal-safety.
+
+### Authentication
+
+Loopback binds default to local trust. On non-loopback binds, `server.auth: auto` requires bearer
+authentication; `required` enforces it on every bind, and `off` refuses non-loopback binds. Use
+`localdb login` for browser login, or an API key. Admins manage users, keys, grants, invites,
+stores, sources and jobs. Members read only shared stores they have been granted. HTTP and MCP apply
+the same policy. Configuration is loaded at startup; restart the daemon to apply edits. See
+[the HTTP API](http-api.md) for the authentication endpoints and flows.

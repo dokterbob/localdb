@@ -29,14 +29,16 @@
 //! are T6.
 
 use localdb_core::{
-    auth::{AuthStore as _, Role, UserRow},
     Error,
+    auth::{AuthStore as _, Role, UserRow},
 };
 use serde_json::json;
 
 use crate::{
-    app_db::{load_app_db, AppDb},
-    daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
+    app_db::AppDb,
+    daemon_client::{
+        CliContext, DaemonState, daemon_request_async, encode_path_segment, probe_daemon,
+    },
     normalize::{exit_err, print_json},
 };
 
@@ -123,7 +125,7 @@ pub(crate) async fn run_user_add_async(ctx: &CliContext, name: &str, admin: bool
     }
     let role = if admin { Role::Admin } else { Role::Member };
 
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if direct_db {
@@ -153,6 +155,7 @@ pub(crate) async fn run_user_add_async(ctx: &CliContext, name: &str, admin: bool
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let user = match db.auth_service().create_user(name, role).await {
         Ok(u) => u,
@@ -186,7 +189,7 @@ pub fn run_key_create(ctx: &CliContext, user_name: &str, direct_db: bool) {
 }
 
 pub(crate) async fn run_key_create_async(ctx: &CliContext, user_name: &str, direct_db: bool) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if direct_db {
@@ -195,7 +198,10 @@ pub(crate) async fn run_key_create_async(ctx: &CliContext, user_name: &str, dire
         probe_daemon(data_dir, ctx.daemon_url.as_deref())
     {
         let id = resolve_user_id_for_key_create(ctx, &base_url, user_name).await;
-        let url = format!("{base_url}/v1/users/{id}/keys");
+        let url = format!(
+            "{base_url}/v1/users/{id}/keys",
+            id = encode_path_segment(&id)
+        );
         match daemon_request_async(ctx, reqwest::Method::POST, &url, None).await {
             Ok(v) => {
                 let secret = v.get("secret").and_then(|s| s.as_str()).unwrap_or("");
@@ -215,6 +221,7 @@ pub(crate) async fn run_key_create_async(ctx: &CliContext, user_name: &str, dire
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let issued = match issue_key_for_user(&db, user_name).await {
         Ok(issued) => issued,
@@ -286,7 +293,7 @@ pub fn run_user_list(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_user_list_async(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -300,6 +307,7 @@ pub(crate) async fn run_user_list_async(ctx: &CliContext) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let users = match db.auth_store().list_users().await {
         Ok(u) => u,
@@ -339,12 +347,12 @@ pub fn run_user_remove(ctx: &CliContext, name: &str) {
 }
 
 pub(crate) async fn run_user_remove_async(ctx: &CliContext, name: &str) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let id = resolve_user_id_via_daemon(ctx, &base_url, name).await;
-        let url = format!("{base_url}/v1/users/{id}");
+        let url = format!("{base_url}/v1/users/{id}", id = encode_path_segment(&id));
         match daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await {
             Ok(_) => {
                 if ctx.json {
@@ -357,6 +365,7 @@ pub(crate) async fn run_user_remove_async(ctx: &CliContext, name: &str) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let user = match db.auth_store().get_user_by_name(name).await {
         Ok(Some(u)) => u,
@@ -394,12 +403,12 @@ pub fn run_user_set_role(ctx: &CliContext, name: &str, role: &str) {
 
 pub(crate) async fn run_user_set_role_async(ctx: &CliContext, name: &str, role: &str) {
     let role = parse_role_arg(ctx, role);
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let id = resolve_user_id_via_daemon(ctx, &base_url, name).await;
-        let url = format!("{base_url}/v1/users/{id}");
+        let url = format!("{base_url}/v1/users/{id}", id = encode_path_segment(&id));
         let body = json!({ "role": role_to_str(role) });
         match daemon_request_async(ctx, reqwest::Method::PATCH, &url, Some(body)).await {
             Ok(v) => {
@@ -413,6 +422,7 @@ pub(crate) async fn run_user_set_role_async(ctx: &CliContext, name: &str, role: 
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let user = match db.auth_store().get_user_by_name(name).await {
         Ok(Some(u)) => u,
@@ -469,7 +479,7 @@ pub fn run_key_list(ctx: &CliContext, user_name: Option<&str>) {
 }
 
 pub(crate) async fn run_key_list_async(ctx: &CliContext, user_name: Option<&str>) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -504,7 +514,10 @@ pub(crate) async fn run_key_list_async(ctx: &CliContext, user_name: Option<&str>
 
         let mut all_keys = Vec::new();
         for (id, name) in &targets {
-            let keys_url = format!("{base_url}/v1/users/{id}/keys");
+            let keys_url = format!(
+                "{base_url}/v1/users/{id}/keys",
+                id = encode_path_segment(id)
+            );
             match daemon_request_async(ctx, reqwest::Method::GET, &keys_url, None).await {
                 Ok(v) => {
                     for mut k in v.as_array().cloned().unwrap_or_default() {
@@ -520,6 +533,7 @@ pub(crate) async fn run_key_list_async(ctx: &CliContext, user_name: Option<&str>
         print_key_list(ctx, &all_keys);
         return;
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     let targets: Vec<localdb_core::auth::UserRow> = match user_name {
         Some(n) => match db.auth_store().get_user_by_name(n).await {
@@ -565,11 +579,14 @@ pub fn run_key_revoke(ctx: &CliContext, key_id: &str) {
 }
 
 pub(crate) async fn run_key_revoke_async(ctx: &CliContext, key_id: &str) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        let url = format!("{base_url}/v1/keys/{key_id}");
+        let url = format!(
+            "{base_url}/v1/keys/{key_id}",
+            key_id = encode_path_segment(key_id)
+        );
         match daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await {
             Ok(_) => {
                 if ctx.json {
@@ -582,6 +599,7 @@ pub(crate) async fn run_key_revoke_async(ctx: &CliContext, key_id: &str) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
 
     match db.auth_store().find_token(key_id).await {
         Ok(Some(_)) => {}

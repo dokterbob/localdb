@@ -93,6 +93,40 @@ async fn search_routes_validate_query_and_store_filter_before_returning_empty_re
 }
 
 #[tokio::test]
+async fn search_rejects_a_cursor_and_limit_pair_whose_page_end_overflows() {
+    // Given: a daemon router with a store, so `SearchService::query` reaches
+    // its pagination arithmetic (an empty store list short-circuits before
+    // it, so at least one store must exist to exercise this path).
+    let (_dir, app) = make_app().await;
+    create_store(app.clone(), "docs").await;
+
+    // When: a client-supplied cursor near `usize::MAX` is combined with any
+    // limit, so `cursor + limit` cannot be represented as a `usize`.
+    //
+    // Regression for issue #187 review, finding G3: this used to be computed
+    // unchecked three times (`top_n`, the `next_cursor` comparison, and the
+    // `next_cursor` value) — panicking in debug (no `CatchPanicLayer`, so the
+    // connection just dies) or silently wrapping in release (an empty page
+    // plus a bogus `next_cursor`).
+    let resp = request(
+        app,
+        Method::POST,
+        "/v1/search",
+        Some(json!({
+            "query": "rust",
+            "cursor": "18446744073709551615",
+            "limit": 1,
+        })),
+    )
+    .await;
+
+    // Then: the overflowing page is rejected as a typed 400, not a panic or
+    // a silently wrapped result.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp.into_body()).await["code"], "invalid_request");
+}
+
+#[tokio::test]
 async fn job_routes_create_source_scoped_jobs_and_report_missing_jobs() {
     // Given: a store with a source that can scope an indexing job.
     let (_dir, app) = make_app().await;

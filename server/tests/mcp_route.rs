@@ -75,8 +75,14 @@ async fn mcp_route_lists_and_calls_tools_over_real_http() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["get_chunks", "get_document", "list_stores", "search"],
-        "the four read-only tools should be registered over HTTP just as over stdio"
+        vec![
+            "get_chunks",
+            "get_document",
+            "list_documents",
+            "list_stores",
+            "search"
+        ],
+        "the five read-only tools should be registered over HTTP just as over stdio"
     );
 
     let result = client
@@ -181,8 +187,10 @@ async fn mcp_route_reports_provider_errors_as_tool_errors_and_stays_up() {
             paths: Default::default(),
             defaults: Default::default(),
             providers: vec![],
+            ..Default::default()
         },
         dir.path().to_path_buf(),
+        dir.path().to_path_buf().join("models"),
         queue.clone(),
         server::UrlRefreshScheduler::new(queue),
         server::AuthMode::Open,
@@ -193,7 +201,7 @@ async fn mcp_route_reports_provider_errors_as_tool_errors_and_stays_up() {
     let failing_provider: std::sync::Arc<dyn mcp::StoreProvider> =
         std::sync::Arc::new(FailingStoreProvider);
     let app = server::build_router(
-        state,
+        state.clone(),
         failing_provider,
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
@@ -703,6 +711,20 @@ async fn mcp_grant_revoked_is_gone_on_the_very_next_call() {
         "grant revocation must take effect on the very next call, no restart"
     );
 
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("list_documents").with_arguments(
+                serde_json::json!({"store": "revocable-shared"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(call_tool_json(result)["error"]["code"], "forbidden");
+
     let _ = client.cancel().await;
     server_task.abort();
 }
@@ -732,4 +754,41 @@ async fn request_with_bearer_admin(
         .oneshot(builder.body(request_body).unwrap())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn scoped_proxy_authenticates_to_enforced_daemon() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let secret =
+        common::seed_user_with_key(&state, "proxy-admin", localdb_core::auth::Role::Admin).await;
+    state.add_store("included", "private").await.unwrap();
+    state.add_store("excluded", "private").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let proxy =
+        mcp::proxy::ProxyHandler::connect_with_auth(&base, &["included".into()], Some(secret))
+            .await
+            .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    let proxy_task = tokio::spawn(async move {
+        proxy
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let client = ClientInfo::default().serve(client_transport).await.unwrap();
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert_eq!(list_stores_names(result), vec!["included"]);
+    let _ = client.cancel().await;
+    proxy_task.abort();
+    server_task.abort();
 }

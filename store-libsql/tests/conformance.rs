@@ -2,7 +2,7 @@ use tempfile::tempdir;
 
 use localdb_core::block::{Block, BlockKind, BlockLocation};
 use localdb_core::store::conformance;
-use localdb_core::store::{ChunkRecord, MetadataFilter};
+use localdb_core::store::{ChunkRecord, DateAxis, MetadataFilter};
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
 use localdb_core::{Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
 use store_libsql::SqliteBackend;
@@ -53,6 +53,10 @@ async fn setup() -> (tempfile::TempDir, SqliteBackend) {
                 preset: "prose".to_string(),
                 refresh: None,
                 created_at: "2026-06-25T12:00:00Z".to_string(),
+                config_json: None,
+                feed_etag: None,
+                feed_last_modified: None,
+                feed_inputs_digest: None,
             })
             .await
             .unwrap();
@@ -160,6 +164,123 @@ async fn metadata_filter_uri_prefix() {
 }
 
 #[tokio::test]
+async fn metadata_filter_values_are_bound_not_interpolated() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_metadata_filter_values_are_bound_not_interpolated(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn metadata_filter_and_combination() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_metadata_filter_and_combination(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_null_axis_value_excluded() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_null_axis_value_excluded(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_partial_bound_on_timestamp_axis() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_partial_bound_on_timestamp_axis(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_document_axis_partial_precision_widening() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_document_axis_partial_precision_widening(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_per_axis_round_trip() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_per_axis_round_trip(handle.as_ref()).await;
+}
+
+/// `DateAxis::Updated` (`resources.index_updated_at`) is the one axis no
+/// caller-supplied literal ever reaches — the store always stamps its own
+/// write-time clock (`upsert_chunks_inner`'s single `now_rfc3339()` call per
+/// batch). This test is real-backend-only (not part of
+/// `core::store::conformance`): it needs the store's own wall-clock write
+/// time, which `FakeStore` never populates for this axis at all (`DateAxis::
+/// value_of` always returns `None` for `Updated`), so a shared conformance
+/// function would trivially fail against `FakeStore` regardless of bound
+/// direction.
+#[tokio::test]
+async fn date_filter_updated_axis_now_relative() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let before_write = localdb_core::ingestion::now_rfc3339();
+    handle
+        .upsert_chunks(vec![make_record(
+            "chunk-updated-now",
+            "doc-updated-now",
+            "store-1",
+            vec![1.0, 0.0],
+        )])
+        .await
+        .unwrap();
+
+    // A bound comfortably in the past: the just-written row's
+    // `index_updated_at` (stamped `now()` by the store during the upsert
+    // above) must be at-or-after it.
+    let one_hour_ago = shift_rfc3339_hours(&before_write, -1);
+    let after_filter = vec![MetadataFilter::DateAfter {
+        axis: DateAxis::Updated,
+        value: one_hour_ago.clone(),
+    }];
+    let after_results = handle
+        .dense_search(&[1.0, 0.0], 10, &after_filter)
+        .await
+        .unwrap();
+    assert!(
+        after_results
+            .iter()
+            .any(|r| r.chunk.id == "chunk-updated-now"),
+        "a row just written must match DateAfter(Updated, now - 1h), got {after_results:?}"
+    );
+
+    // The same bound used as an upper bound must exclude it — the row's
+    // `index_updated_at` is after (not before) an hour ago.
+    let before_filter = vec![MetadataFilter::DateBefore {
+        axis: DateAxis::Updated,
+        value: one_hour_ago,
+    }];
+    let before_results = handle
+        .dense_search(&[1.0, 0.0], 10, &before_filter)
+        .await
+        .unwrap();
+    assert!(
+        before_results
+            .iter()
+            .all(|r| r.chunk.id != "chunk-updated-now"),
+        "a row just written must NOT match DateBefore(Updated, now - 1h), got {before_results:?}"
+    );
+}
+
+/// Shift an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) by a whole number
+/// of hours, staying in the same canonical form. Local test helper — not
+/// `core::dates` material, since it only ever needs to move a known-canonical
+/// timestamp, never parse an arbitrary one.
+fn shift_rfc3339_hours(ts: &str, hours: i64) -> String {
+    use chrono::{DateTime, Utc};
+    let parsed: DateTime<Utc> = ts
+        .parse()
+        .expect("test-supplied timestamp must be RFC 3339");
+    let shifted = parsed + chrono::Duration::hours(hours);
+    shifted.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[tokio::test]
 async fn get_chunk() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
@@ -171,6 +292,13 @@ async fn window_block_seqs_round_trip() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
     conformance::test_window_block_seqs_round_trip(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn page_round_trip() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_page_round_trip(handle.as_ref()).await;
 }
 
 #[tokio::test]
@@ -289,6 +417,10 @@ async fn dense_search_with_filter_returns_matching_chunks() {
             preset: "prose".to_string(),
             refresh: None,
             created_at: "2026-06-25T12:00:00Z".to_string(),
+            config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         })
         .await
         .unwrap();
@@ -360,6 +492,10 @@ async fn reopen_with_same_encoding_succeeds() {
         preset: "prose".to_string(),
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
     })
     .await
     .unwrap();
@@ -492,7 +628,7 @@ async fn replace_rolls_back_old_document_on_write_failure() {
     doc_b.source_id = "nonexistent-src".to_string();
 
     let result = handle
-        .upsert_chunks_and_blocks("store-1", "doc-b", vec![doc_b], &[], Some("doc-a"))
+        .upsert_chunks_and_blocks("store-1", "doc-b", vec![doc_b], &[], Some("doc-a"), None)
         .await;
     assert!(
         result.is_err(),
@@ -541,7 +677,7 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
         .await
         .unwrap();
 
-    let result = db.find_document("doc-shared").await;
+    let result = db.find_document("doc-shared", None).await;
     assert!(
         matches!(result, Err(Error::InvalidRequest { .. })),
         "expected InvalidRequest for ambiguous cross-store document; got: {:?}",
@@ -647,6 +783,7 @@ async fn upsert_chunks_and_blocks_rejects_cross_tenant_record() {
             )],
             &[],
             None,
+            None,
         )
         .await;
     assert!(matches!(
@@ -692,7 +829,7 @@ async fn upsert_chunks_and_blocks_writes_blocks_in_same_transaction() {
     ];
 
     let written = handle
-        .upsert_chunks_and_blocks("store-1", "doc-with-blocks", records, &blocks, None)
+        .upsert_chunks_and_blocks("store-1", "doc-with-blocks", records, &blocks, None, None)
         .await
         .unwrap();
     assert_eq!(written, 1);
@@ -744,6 +881,10 @@ async fn upsert_chunks_with_binary_encoding_round_trips_through_search_and_get_c
         preset: "prose".to_string(),
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
     })
     .await
     .unwrap();
@@ -844,6 +985,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         embedding,
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-25T12:00:00Z".to_string(),
+        modified_at: Some("2026-06-25T12:00:00Z".to_string()),
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id,
@@ -854,6 +996,11 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     }
 }

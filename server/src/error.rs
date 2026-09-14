@@ -3,7 +3,8 @@
 //! Maps `localdb_core::Error` to HTTP status codes per specs/05-surfaces.md §5.
 
 use axum::{
-    http::{header, HeaderValue, StatusCode},
+    extract::{rejection::JsonRejection, FromRequest, Request},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -35,17 +36,95 @@ impl IntoResponse for ApiError {
         let status = http_status_for(&self.0);
         let body = ErrorResponse {
             code: self.0.code().to_string(),
-            message: self.0.to_string(),
+            message: error_response_message(&self.0),
         };
         let mut response = (status, Json(body)).into_response();
-        // D6 (specs/05-surfaces.md §3.1): every 401 MUST carry a
-        // `WWW-Authenticate: Bearer` challenge, wherever it originates.
         if status == StatusCode::UNAUTHORIZED {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
         }
         response
+    }
+}
+
+/// The `message` field of a JSON error response body.
+///
+/// Bare (`raw_message()`), not the full `Display` string
+/// (`to_string()`): a daemon HTTP client (`cli::daemon_client::decode_daemon_error`)
+/// reconstructs the typed error via `Error::from_code(code, message)`, which
+/// re-adds the `Display` prefix (e.g. "invalid config: "). Storing the
+/// already-prefixed string here would double it (issue #187 review, finding
+/// F4). Variants `raw_message()` can't reconstruct fall back to the full
+/// `Display` string, since there's no bare field to store instead.
+fn error_response_message(err: &CoreError) -> String {
+    err.raw_message()
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string())
+}
+
+/// A JSON request body extractor whose deserialization failures round-trip
+/// through the same `ApiError` shape every other request-validation failure
+/// on this daemon does, rather than axum's own default `JsonRejection`
+/// response — plain text, and (for a data/type error, as opposed to a
+/// syntax error) `422` rather than `400`.
+///
+/// Every malformed field on a request body is `invalid_request`, `400` —
+/// the same status a semantically-invalid-but-well-typed value already gets
+/// (e.g. `CreateJobRequest.deletion_policy: "obliterate"`, rejected by
+/// `parse_deletion_policy`). Without this wrapper, a *type*-mismatched field
+/// (e.g. `refetch: "yes"` where a bool is expected) would be rejected by
+/// axum's `Json<T>` extractor itself, before the handler ever runs, and
+/// never see that treatment — specs/05-surfaces.md's `POST /v1/jobs` body
+/// documents `refetch`'s non-bool case as `invalid_request`/`400`
+/// explicitly, so this wrapper is what makes that true.
+///
+/// Only *body-content* failures are enveloped. Transport-level rejections —
+/// a missing/wrong `Content-Type` (`415`) or a body over the size limit
+/// (`413`) — pass through as axum's stock responses, exactly as every
+/// plain-`Json` route on this daemon returns them: the spec's error
+/// taxonomy (specs/05-surfaces.md §5) has no codes for those conditions,
+/// and collapsing them into a `400` would misreport what the client did
+/// wrong.
+pub struct ApiJson<T>(pub T);
+
+/// [`ApiJson`]'s rejection: the `invalid_request` envelope for a malformed
+/// body, or axum's own stock response for everything else (see
+/// [`ApiJson`]'s doc comment).
+pub enum ApiJsonRejection {
+    Invalid(ApiError),
+    Passthrough(Response),
+}
+
+impl IntoResponse for ApiJsonRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Invalid(e) => e.into_response(),
+            Self::Passthrough(r) => r,
+        }
+    }
+}
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiJsonRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(
+                rejection @ (JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)),
+            ) => Err(ApiJsonRejection::Invalid(ApiError(
+                CoreError::InvalidRequest {
+                    message: format!("invalid request body: {rejection}"),
+                },
+            ))),
+            Err(other) => Err(ApiJsonRejection::Passthrough(other.into_response())),
+        }
     }
 }
 
@@ -57,13 +136,15 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
         | CoreError::ResourceNotFound { .. }
         | CoreError::JobNotFound { .. } => StatusCode::NOT_FOUND,
 
-        CoreError::RuntimeStateLocked | CoreError::DaemonRunning | CoreError::IndexInProgress => {
-            StatusCode::CONFLICT
-        }
+        CoreError::RuntimeStateLocked
+        | CoreError::DaemonRunning
+        | CoreError::IndexInProgress
+        | CoreError::JobCancelled
+        | CoreError::JobAlreadyTerminal => StatusCode::CONFLICT,
 
-        CoreError::DaemonUnreachable | CoreError::ProviderUnavailable { .. } => {
-            StatusCode::BAD_GATEWAY
-        }
+        CoreError::DaemonUnreachable
+        | CoreError::ProviderUnavailable { .. }
+        | CoreError::RateLimited { .. } => StatusCode::BAD_GATEWAY,
 
         CoreError::InvalidConfig { .. }
         | CoreError::UnsupportedFormat { .. }
@@ -71,174 +152,18 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
 
         CoreError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
 
-        CoreError::ModelMissing { .. } => StatusCode::SERVICE_UNAVAILABLE,
-
-        CoreError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // Raised client-side by the CLI about the daemon it is talking to,
+        // never by the daemon about itself; mapped for exhaustiveness, and
+        // 503 is the honest reading either way.
+        CoreError::ModelMissing { .. } | CoreError::DaemonCapabilityUnavailable { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
 
         CoreError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
         CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
+        CoreError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::StatusCode;
-    use localdb_core::Error;
-
-    #[test]
-    fn not_found_errors_map_to_404() {
-        assert_eq!(
-            http_status_for(&Error::StoreNotFound { id: "x".into() }),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            http_status_for(&Error::SourceNotFound { id: "x".into() }),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            http_status_for(&Error::ResourceNotFound { id: "x".into() }),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            http_status_for(&Error::JobNotFound { id: "x".into() }),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    #[test]
-    fn conflict_errors_map_to_409() {
-        assert_eq!(
-            http_status_for(&Error::RuntimeStateLocked),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(http_status_for(&Error::DaemonRunning), StatusCode::CONFLICT);
-        assert_eq!(
-            http_status_for(&Error::IndexInProgress),
-            StatusCode::CONFLICT
-        );
-    }
-
-    #[test]
-    fn bad_gateway_errors_map_to_502() {
-        assert_eq!(
-            http_status_for(&Error::DaemonUnreachable),
-            StatusCode::BAD_GATEWAY
-        );
-        assert_eq!(
-            http_status_for(&Error::ProviderUnavailable {
-                message: "m".into()
-            }),
-            StatusCode::BAD_GATEWAY
-        );
-    }
-
-    #[test]
-    fn invalid_config_maps_to_422() {
-        assert_eq!(
-            http_status_for(&Error::InvalidConfig {
-                message: "m".into()
-            }),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-    }
-
-    #[test]
-    fn unsupported_format_maps_to_422() {
-        assert_eq!(
-            http_status_for(&Error::UnsupportedFormat {
-                format: "application/octet-stream".into()
-            }),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-    }
-
-    #[test]
-    fn extraction_failed_maps_to_422() {
-        assert_eq!(
-            http_status_for(&Error::ExtractionFailed {
-                format: "office/docx".into(),
-                reason: "zip error".into(),
-            }),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-    }
-
-    #[test]
-    fn invalid_request_maps_to_400() {
-        assert_eq!(
-            http_status_for(&Error::InvalidRequest {
-                message: "m".into()
-            }),
-            StatusCode::BAD_REQUEST
-        );
-    }
-
-    #[test]
-    fn model_missing_maps_to_503() {
-        assert_eq!(
-            http_status_for(&Error::ModelMissing {
-                message: "m".into()
-            }),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-
-    #[test]
-    fn internal_maps_to_500() {
-        assert_eq!(
-            http_status_for(&Error::Internal {
-                message: "bug".into(),
-                correlation_id: "abc".into(),
-            }),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn unauthorized_response_carries_www_authenticate_bearer() {
-        let response = ApiError(Error::Unauthorized {
-            message: "m".into(),
-        })
-        .into_response();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok()),
-            Some("Bearer"),
-            "D6: every 401 must carry WWW-Authenticate: Bearer"
-        );
-    }
-
-    #[test]
-    fn forbidden_response_has_no_www_authenticate() {
-        let response = ApiError(Error::Forbidden {
-            message: "m".into(),
-        })
-        .into_response();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
-    }
-
-    #[test]
-    fn unauthorized_maps_to_401() {
-        assert_eq!(
-            http_status_for(&Error::Unauthorized {
-                message: "m".into()
-            }),
-            StatusCode::UNAUTHORIZED
-        );
-    }
-
-    #[test]
-    fn forbidden_maps_to_403() {
-        assert_eq!(
-            http_status_for(&Error::Forbidden {
-                message: "m".into()
-            }),
-            StatusCode::FORBIDDEN
-        );
-    }
-}
+mod tests;

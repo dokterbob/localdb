@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Graph-Wrapped Article</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://example.org/#website",
+      "url": "https://example.org/",
+      "name": "Example Journal"
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://example.org/" },
+        { "@type": "ListItem", "position": 2, "name": "Articles", "item": "https://example.org/articles" }
+      ]
+    },
+    {
+      "@type": "Article",
+      "@id": "https://example.org/articles/graph-wrapped#article",
+      "headline": "Graph-Wrapped Article",
+      "datePublished": "2020-09-10T00:00:00Z",
+      "dateModified": "2020-09-12T00:00:00Z",
+      "author": {
+        "@type": "Person",
+        "name": "S. Ibarra"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<article>
+<h1>Graph-Wrapped Article</h1>
+<p>Some publishing platforms (WordPress plugins, Yoast SEO, many static site
+generators) emit JSON-LD as a top-level <code>@graph</code> array rather
+than a bare <code>Article</code> object, bundling the WebSite, breadcrumb,
+and Article nodes together. This file probes whether the date extractor
+descends into <code>@graph</code> to find the Article's
+<code>datePublished</code> (2020-09-10) instead of giving up because the
+root object isn't directly typed <code>Article</code>.</p>
+</article>
+</body>
+</html>

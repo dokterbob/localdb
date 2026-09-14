@@ -1,16 +1,54 @@
 # MCP Server
 
-localdb ships an MCP server that exposes your indexed stores to any MCP-capable AI
-agent (Claude Desktop, Claude Code, custom agents). It's built on the official
-[`rmcp`](https://docs.rs/rmcp) SDK and speaks the
-[MCP 2025-06-18 protocol](https://modelcontextprotocol.io/). Two transports are
-available, both serving the same four read-only tools:
+localdb ships an MCP server that exposes your indexed stores to an AI app such as Claude Desktop,
+Claude Code, Codex, or LM Studio. That app is the **MCP client**: it calls localdb's tools and
+passes the results to the model answering your questions. For a local model walkthrough, see
+[Chat with your notes locally using LM Studio](lm-studio.md).
+
+The server is built on the official [`rmcp`](https://docs.rs/rmcp) SDK and speaks the
+[MCP 2025-06-18 protocol](https://modelcontextprotocol.io/). Two transports are available, both
+serving the same five read-only tools:
 
 - **Stdio** (`localdb mcp`) — the default, no daemon required.
-- **HTTP** (`/mcp`, mounted on a running `localdb serve` daemon) — for connecting a
-  remote MCP client, or one running on a different machine on your network/Tailscale.
+- **HTTP** (`/mcp`, mounted on a running `localdb serve` daemon) — for connecting a remote MCP
+  client, or one running on a different machine on your network/Tailscale.
 
-For design rationale and the trust model see [../specs/05-surfaces.md](../specs/05-surfaces.md) §4.
+For design rationale and the trust model see
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.
+Using localdb as searchable memory for an AI agent? There's a dedicated recipe:
+[Agent memory with localdb](agent-memory.md).
+
+Alongside the MCP hookup, the repository ships an **agent skill** — a
+[SKILL.md](https://github.com/dokterbob/localdb/blob/main/skills/localdb/SKILL.md) crib sheet
+covering the CLI, the citation JSON shape, the five MCP tools, and common failure modes. Any
+skill-capable agent (Claude Code, Cursor, Codex, and others) can install it with:
+
+```bash
+npx skills add dokterbob/localdb
+```
+
+---
+
+## Data and model privacy
+
+With a local embedding provider, localdb performs indexing, embedding, storage, and search locally.
+Hosted embedding providers send text to their configured service. MCP is an interface to the indexed
+data, not an end-to-end privacy boundary: every result returned by `search`, `get_document`, or
+`get_chunks` is handed to the MCP client. A client backed by a cloud-hosted model may transmit that
+content to its provider, regardless of whether localdb itself runs over local stdio. Retention,
+training, logging, and access policies beyond that point belong to the client and model provider;
+localdb cannot enforce them.
+
+If indexed data must not leave the machine or an approved private environment:
+
+- use an MCP client backed by a local or approved self-hosted model;
+- prefer stdio and do not expose the HTTP daemon beyond the required trust boundary;
+- use `--store` to expose only the stores needed for the task; and
+- review the client's telemetry, logging, memory, and network-egress settings independently.
+
+`--store` is data minimization, not leak prevention after a result has been returned. Likewise,
+read-only tools prevent the client from modifying localdb; they do not prevent it from reading or
+forwarding the content those tools return.
 
 ---
 
@@ -56,63 +94,72 @@ With a custom config:
 claude mcp add localdb -- localdb mcp --config /path/to/config.yaml
 ```
 
+> **Use an absolute path to the binary.** MCP clients spawn `localdb` directly, without your shell's
+> PATH additions (`.bashrc`/`.zshrc` `export PATH=...` lines aren't sourced). If you installed with
+> the shell installer, `~/.cargo/bin` — its default install location — is exactly what goes missing,
+> and the client fails to launch the server with no obvious reason why. In the JSON blocks above,
+> set `command` to the absolute path that `which localdb` prints — JSON config files are not
+> shell-evaluated, so `$(which localdb)` will not work there. In `claude mcp add`, which is a shell
+> command, `$(which localdb)` in place of the bare `localdb` works directly.
+
+<a id="remote-http-connecting-from-another-machine"></a>
+
 ### Remote / HTTP — connecting from another machine
 
-If you run `localdb serve`, it mounts the same four MCP tools at `/mcp` alongside its
-`/v1` REST API. This is how to point an MCP client at localdb running on a different
-machine — e.g. a home server reachable over Tailscale, or a NAS on your LAN.
+If you run `localdb serve`, it mounts the same five MCP tools at `/mcp` alongside its `/v1` REST
+API. This is how to point an MCP client at localdb running on a different machine — e.g. a home
+server reachable over Tailscale, or a NAS on your LAN.
 
-1. Start the daemon bound to an address reachable from the client machine (not just
-   `127.0.0.1`). Binding to a specific non-loopback address — a Tailscale IP, a LAN
-   IP — is a deliberate, supported trust decision; see
-   [docs/http-api.md](http-api.md#trust-model) for the full trust model and how to
-   configure it in `config.yaml`.
+1. Start the daemon bound to an address reachable from the client machine (not just `127.0.0.1`).
+   Binding to a specific non-loopback address — a Tailscale IP, a LAN IP — is a deliberate,
+   supported trust decision; see [docs/http-api.md](http-api.md#trust-model) for the full trust
+   model and how to configure it in `config.yaml`.
 
    ```yaml
    server:
-     bind: 100.x.y.z   # your Tailscale/LAN address
+     bind: 100.x.y.z # your Tailscale/LAN address
      port: 7700
    ```
 
-2. On the client machine, register the daemon's `/mcp` endpoint as an HTTP MCP
-   server. For Claude Code:
+2. On the client machine, register the daemon's `/mcp` endpoint as an HTTP MCP server. For Claude
+   Code:
 
    ```
    claude mcp add --transport http localdb http://100.x.y.z:7700/mcp
    ```
 
-localdb automatically allow-lists whatever address the daemon actually bound to for
-`rmcp`'s DNS-rebinding `Host`-header check — you don't need to configure this
-separately. (Internally: a deliberately-chosen non-loopback bind is added to the
-allowlist alongside `rmcp`'s own `localhost`/`127.0.0.1`/`::1` defaults; a wildcard
-bind, `0.0.0.0`/`::`, disables the check entirely, since it already accepts
-connections from any network. See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.)
+localdb automatically allow-lists whatever address the daemon actually bound to for `rmcp`'s
+DNS-rebinding `Host`-header check — you don't need to configure this separately. (Internally: a
+deliberately-chosen non-loopback bind is added to the allowlist alongside `rmcp`'s own
+`localhost`/`127.0.0.1`/`::1` defaults; a wildcard bind, `0.0.0.0`/`::`, disables the check
+entirely, since it already accepts connections from any network. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2.)
 
-Store resolution over `/mcp` is realtime: a store added later via `POST /v1/stores`
-appears on the very next MCP call (`search`, `get_document`, `get_chunks`,
-`list_stores`) — no daemon restart needed.
+Store resolution over `/mcp` is realtime: a store added later via `POST /v1/stores` appears on the
+very next MCP call (`search`, `get_document`, `get_chunks`, `list_stores`) — no daemon restart
+needed.
 
 ### Authentication
 
 A daemon bound to a non-loopback address enforces bearer-token auth automatically (see
-[docs/http-api.md](http-api.md#trust-model-and-authentication) for the full mode matrix) —
-`/mcp` is one of the protected routes. Two ways to connect:
+[docs/http-api.md](http-api.md#trust-model-and-authentication) for the full mode matrix) — `/mcp` is
+one of the protected routes. Two ways to connect:
 
-**Zero-config discovery (recommended for MCP clients that support it).** Point the client at
-`/mcp` with no credential at all. A stock MCP client (Claude Code and similar) follows the
-standard chain automatically: the first request gets `401` with `WWW-Authenticate: Bearer
-resource_metadata="<base>/.well-known/oauth-protected-resource"`; the client fetches that
-document, follows it to `/.well-known/oauth-authorization-server`, registers itself via
-`POST /register` (RFC 7591 Dynamic Client Registration — no client secret, since this only ever
-mints public clients), and completes the ordinary authorization-code + PKCE flow, opening a
-browser for the human to approve. No token needs to be typed in anywhere. See
-[docs/http-api.md](http-api.md#oauth-discovery--dynamic-client-registration) for the full
-protocol walk-through and the exact JSON shapes.
+**Zero-config discovery (recommended for MCP clients that support it).** Point the client at `/mcp`
+with no credential at all. A stock MCP client (Claude Code and similar) follows the standard chain
+automatically: the first request gets `401` with
+`WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource"`; the
+client fetches that document, follows it to `/.well-known/oauth-authorization-server`, registers
+itself via `POST /register` (RFC 7591 Dynamic Client Registration — no client secret, since this
+only ever mints public clients), and completes the ordinary authorization-code + PKCE flow, opening
+a browser for the human to approve. No token needs to be typed in anywhere. See
+[docs/http-api.md](http-api.md#oauth-discovery--dynamic-client-registration) for the full protocol
+walk-through and the exact JSON shapes.
 
-**Static bearer header (for clients without OAuth discovery support, or scripted/headless
-use).** Mint a credential ahead of time — `localdb login` (interactive browser flow) or
-`localdb key create --user <name>` (long-lived API key, no browser) — and pass it as a static
-header when registering the MCP server:
+**Static bearer header (for clients without OAuth discovery support, or scripted/headless use).**
+Mint a credential ahead of time — `localdb login` (interactive browser flow) or
+`localdb key create --user <name>` (long-lived API key, no browser) — and pass it as a static header
+when registering the MCP server:
 
 ```
 claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
@@ -122,79 +169,189 @@ claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
 Any MCP client that lets you attach a static header to an HTTP transport works the same way.
 
 **Stdio is always unauthenticated.** `localdb mcp` over stdio (embedded, or proxied to a local
-daemon — see [Daemon-proxied stdio](#daemon-proxied-stdio) below) never requires a bearer
-token, regardless of the daemon's own `server.auth` setting: stdio access to the local process
-is already trusted as local-files-equivalent, the same trust boundary as every other
-daemonless CLI command. Auth only applies to the HTTP transport (`/mcp` on a running daemon),
-which is what makes remote access meaningfully different from running `localdb mcp` on the
-same machine as the caller.
+daemon — see [Daemon-proxied stdio](#daemon-proxied-stdio) below) never requires a bearer token,
+regardless of the daemon's own `server.auth` setting: stdio access to the local process is already
+trusted as local-files-equivalent, the same trust boundary as every other daemonless CLI command.
+Auth only applies to the HTTP transport (`/mcp` on a running daemon), which is what makes remote
+access meaningfully different from running `localdb mcp` on the same machine as the caller.
 
 ---
 
 ## Daemon-proxied stdio
 
-If a daemon is already running when you start `localdb mcp`, it detects this the same
-way every other localdb command does and **proxies** every request to the daemon's
-own `/mcp` route instead of opening the store a second time. This means:
+If a daemon is already running when you start `localdb mcp`, it detects this the same way every
+other localdb command does and **proxies** every request to the daemon's own `/mcp` route instead of
+opening the store a second time. This means:
 
-- You no longer need to stop `localdb serve` before using `localdb mcp` — the two now
-  coexist by design (this replaces earlier v1 guidance that told you to stop the
-  daemon first).
-- Proxied mode always exposes the daemon's current (realtime) full store set —
-  **`--store` narrowing is not honored** when a daemon is running, since the daemon's
-  own `/mcp` route has no notion of a per-stdio-session store filter to apply.
-  `localdb mcp --store <name>` against a running daemon prints a non-fatal warning to
-  stderr and serves the daemon's full store set regardless. This is a documented v1
-  limitation, not a bug — see [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+- You no longer need to stop `localdb serve` before using `localdb mcp` — the two now coexist by
+  design (this replaces earlier v1 guidance that told you to stop the daemon first).
+- Absent `--store`, proxied mode exposes whatever store set the daemon had at its own startup, and
+  every request relays verbatim.
+- With `--store`, the scope is enforced per request — see [Store scoping](#store-scoping) below.
 
-If no daemon is running, `localdb mcp` opens the store(s) embedded in-process exactly
-as before — no behavior change for the common case.
+If no daemon is running, `localdb mcp` opens the store(s) embedded in-process exactly as before — no
+behavior change for the common case.
+
+---
+
+## Store scoping
+
+`localdb mcp --store <name>` (repeatable) limits the session to those stores. Use it when an agent
+should only see part of your index — a project-bound store, say, rather than everything you have
+ever indexed.
+
+```
+localdb mcp --store books --store research
+```
+
+Omit `--store` and every store is exposed. An unknown name exits `3` before the server starts
+serving, in both modes — it is never silently dropped. A database with **no** stores is not an
+error: the server starts and exposes zero stores, since an MCP server that exits non-zero at startup
+reads to its client as broken rather than as empty.
+
+The scope is enforced in both process modes, by different mechanisms:
+
+| Mode                 | How                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Embedded (no daemon) | Only the scoped stores are opened. Nothing else is reachable because nothing else exists in the process.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Daemon-proxied       | The scope is applied to every relayed `tools/call`: `search`'s `stores` and `get_document`/`get_chunks`'s optional `store` are filled in (tried against each scoped store in turn) when absent; `list_documents`'s `store` is required, so an absent one is relayed unmodified and surfaces the upstream's own missing-required-argument error instead of being filled in; any explicit `store`/`stores` naming a store outside the scope is rejected; and `list_stores` is filtered so out-of-scope stores cannot even be enumerated. |
+
+Proxied mode has to work through tool arguments because there is no transport-level channel: rmcp's
+HTTP service factory is a synchronous `Fn()` with no access to the request, so neither
+`/mcp?store=x` nor a custom header can select a scoped handler on the daemon side. The tool
+arguments already exist to name stores, so the scope travels per request instead of per connection.
+
+An out-of-scope store name comes back as an ordinary tool-level error:
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "store 'hydra' is outside this session's --store scope; allowed: [books]"
+  }
+}
+```
+
+While the tool set is fixed at five read-only tools, a scoped session relays only those five; any
+other tool name is rejected, so a future mutating tool cannot slip through unscoped on the day it
+lands.
+
+> **This is scoping, not a security boundary.** The daemon's `/mcp` route is loopback and
+> **unauthenticated**: anything that can open a socket can bypass `localdb mcp` entirely and talk to
+> the unscoped endpoint directly. `--store` stops an agent from _accidentally_ reading another
+> project's docs; it does not contain a hostile one. Real containment needs daemon-side
+> authentication, which does not exist in v1. In embedded mode there is no such endpoint, so the
+> scope is as strong as the process boundary.
 
 ---
 
 ## Tools
 
-The server exposes four read-only tools. Write tools are reserved for a future
-`--allow-write` release; `--allow-write` is accepted by the CLI today for
-forward-compatibility but all mutating operations are rejected in v1.
+The server exposes five read-only tools. Write tools are reserved for a future `--allow-write`
+release.
+
+**`--allow-write` currently has no effect.** v1 registers no mutating tool on any transport, so the
+tool set is byte-identical with and without the flag; passing it prints a warning to stderr saying
+so. It is accepted today only so the CLI surface is stable for callers. (Unlike a misapplied
+`--store`, which exits 2, this one only warns: `--allow-write` fails _safe_ — it can withhold a
+capability, never widen access.)
 
 ### `search`
 
-Hybrid search (BM25 + dense vector) across indexed stores. Returns a ranked list
-of citations in the canonical localdb Citation JSON shape.
+Hybrid search (BM25 + dense vector) across indexed stores. Returns a ranked list of citations in the
+canonical localdb Citation JSON shape.
 
 > **Note:** the dense component uses the configured embedder (default: `pplx-embed-context-v1-0.6b`
 > local ONNX). The model is downloaded automatically on first use (~706 MB). See
-> [../specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the pipeline details.
+> [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+> for the pipeline details.
 
 **Input schema** (as actually returned by `tools/list`):
 
 ```json
 {
-  "type": "object",
-  "required": ["query"],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "query": {
-      "type": "string",
-      "description": "Natural language search query"
+    "added_after": {
+      "default": null,
+      "description": "Lower bound (inclusive) on the added date — when this resource was first indexed. Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a relative duration such as \"7d\" or \"30m\", which always resolves to now minus the duration regardless of which bound it fills. Note: \"M\" means months and \"m\" means minutes in the duration grammar — both parse successfully, so a mistaken capital silently produces a bound roughly 44,000 times further out. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "type": ["string", "null"]
     },
-    "stores": {
-      "type": ["array", "null"],
-      "items": { "type": "string" },
-      "description": "Optional list of store names to search. Defaults to all stores."
-    },
-    "limit": {
-      "type": ["integer", "null"],
-      "minimum": 1,
-      "maximum": 100,
-      "description": "Maximum number of results to return (default: 10, max: 100)"
+    "added_before": {
+      "default": null,
+      "description": "Upper bound (inclusive) on the added date — when this resource was first indexed. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "type": ["string", "null"]
     },
     "content_length": {
-      "type": ["integer", "null"],
+      "default": null,
+      "description": "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload always carries the full snippet.",
+      "format": "int64",
       "minimum": 1,
-      "description": "Soft cap on snippet text chars per result in the text rendering (default: 400)"
+      "type": ["integer", "null"]
+    },
+    "document_after": {
+      "default": null,
+      "description": "Lower bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
+      "type": ["string", "null"]
+    },
+    "document_before": {
+      "default": null,
+      "description": "Upper bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
+      "type": ["string", "null"]
+    },
+    "limit": {
+      "default": null,
+      "description": "Maximum number of results to return (default: 10, max: 100)",
+      "format": "int64",
+      "maximum": 100,
+      "minimum": 1,
+      "type": ["integer", "null"]
+    },
+    "mime": {
+      "default": null,
+      "description": "Restrict to resources with this exact MIME type (e.g. \"text/markdown\"). Matched as an exact string: no date or duration parsing is applied.",
+      "type": ["string", "null"]
+    },
+    "modified_after": {
+      "default": null,
+      "description": "Lower bound (inclusive) on the modified date — the source's own claim of when this resource was last changed. Same value grammar as added_after. NULL rule: a resource with no claimed modification time is excluded, regardless of the bound.",
+      "type": ["string", "null"]
+    },
+    "modified_before": {
+      "default": null,
+      "description": "Upper bound (inclusive) on the modified date — the source's own claim of when this resource was last changed. Same value grammar as added_after. NULL rule: a resource with no claimed modification time is excluded, regardless of the bound.",
+      "type": ["string", "null"]
+    },
+    "path": {
+      "default": null,
+      "description": "Restrict to resources whose URI starts with this prefix (e.g. \"file:///docs/\"). Not a date: no date or duration parsing is applied. Matched with SQL LIKE, so a literal `%` or `_` in the prefix acts as a wildcard.",
+      "type": ["string", "null"]
+    },
+    "query": {
+      "description": "Natural language search query",
+      "type": "string"
+    },
+    "stores": {
+      "default": null,
+      "description": "Optional list of store names to search. Defaults to all stores.",
+      "items": {
+        "type": "string"
+      },
+      "type": ["array", "null"]
+    },
+    "updated_after": {
+      "default": null,
+      "description": "Lower bound (inclusive) on the updated date — when the store last wrote this resource's stored state. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "type": ["string", "null"]
+    },
+    "updated_before": {
+      "default": null,
+      "description": "Upper bound (inclusive) on the updated date — when the store last wrote this resource's stored state. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "type": ["string", "null"]
     }
-  }
+  },
+  "required": ["query"],
+  "type": "object"
 }
 ```
 
@@ -212,7 +369,29 @@ of citations in the canonical localdb Citation JSON shape.
 }
 ```
 
-**Example result** (the `text` field carries pretty-printed JSON):
+**Filtered example call**, narrowing to resources modified in the last 30 days:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/call",
+  "params": {
+    "name": "search",
+    "arguments": { "query": "reciprocal rank fusion", "modified_after": "30d" }
+  }
+}
+```
+
+A resource with no claimed `modified_at` at all is excluded by this filter regardless of the bound
+(the NULL rule) — it is indistinguishable in the response from one that was simply modified too long
+ago. The same applies to `document_after`/`document_before`: a resource carries a document date only
+when its source supplied one — HTML, Markdown front matter, Office, PDF (`/CreationDate` or XMP),
+and feed entries all can, plain text cannot.
+
+**Example result.** The single `text` content block carries the pretty-printed JSON, then a
+`\n\n---\n` separator, then a human-readable rendering of the same citations (`search` is the only
+tool that appends this rendering; the others return JSON alone):
 
 ```json
 {
@@ -223,15 +402,40 @@ of citations in the canonical localdb Citation JSON shape.
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"citations\": [\n    {\n      \"chunk_id\": \"eff4065c...\",\n      \"document_id\": \"a9bb80b7...\",\n      \"heading_path\": [],\n      \"provenance\": {\n        \"content_hash\": \"929258b8...\",\n        \"fetched_at\": \"2026-06-11T14:17:30Z\"\n      },\n      \"score\": {\n        \"bm25\": 3.0748,\n        \"dense\": 1.0,\n        \"fused\": 0.032786\n      },\n      \"snippet\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\",\n      \"span\": { \"start\": 0, \"end\": 138 },\n      \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n      \"title\": null,\n      \"uri\": \"file:///home/user/notes/meeting.txt\"\n    }\n  ],\n  \"total_candidates\": 3\n}"
+        "text": "{\n  \"citations\": [\n    {\n      \"block\": {\n        \"kind\": \"text\",\n        \"seq\": 0\n      },\n      \"chunk_id\": \"0bbaaa6b64dffd8b232410017b224c7b499bc3fe235382bfaa8ea63b1e435824\",\n      \"chunk_position\": {\n        \"seq_in_block\": 0\n      },\n      \"heading_path\": [],\n      \"location\": {\n        \"span\": {\n          \"end\": 165,\n          \"start\": 0\n        }\n      },\n      \"metadata\": {\n        \"contributor\": [],\n        \"coverage\": null,\n        \"creator\": [],\n        \"date\": null,\n        \"description\": null,\n        \"format\": \"text/plain\",\n        \"identifier\": null,\n        \"kind\": \"document\",\n        \"language\": null,\n        \"page_count\": null,\n        \"publisher\": null,\n        \"relation\": [],\n        \"rights\": null,\n        \"source\": null,\n        \"subject\": [],\n        \"title\": null,\n        \"type\": null,\n        \"word_count\": null\n      },\n      \"provenance\": {\n        \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n        \"fetched_at\": \"2026-06-11T14:17:30Z\"\n      },\n      \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n      \"score\": {\n        \"bm25\": 3.0748,\n        \"dense\": 0.7099609375,\n        \"fused\": 0.03278688524590164\n      },\n      \"snippet\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\",\n      \"store\": {\n        \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n        \"name\": \"notes\"\n      },\n      \"title\": null,\n      \"uri\": \"file:///home/user/notes/meeting.txt\"\n    }\n  ],\n  \"total_candidates\": 3\n}\n\n---\n1. file:///home/user/notes/meeting.txt\n   Score: 0.0328\n   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone."
       }
     ]
   }
 }
 ```
 
-The citation shape is identical to `localdb search --json`. See
-[../specs/02-domain-model.md](../specs/02-domain-model.md) §6 for field definitions.
+(`metadata` here is mostly null/empty because a plain `.txt` file carries no Dublin Core metadata —
+only `format` is set, from the sniffed MIME type. Every Dublin Core field is always present in the
+JSON; absent values serialize as `null` (or `[]` for the repeated fields), never omitted. How much
+gets populated depends entirely on the parser:
+
+| Parser                   | Populates                                                                                                                                                                          |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EPUB                     | `title`, `creator`, `subject`, `description`, `publisher`, `contributor`, `date`, `format`, `identifier`, `language`, `rights` — read from the OPF package's own Dublin Core block |
+| Markdown / HTML / Office | `title` (first H1) + `format`                                                                                                                                                      |
+| PDF                      | `format` only — the info dictionary is not read                                                                                                                                    |
+| Plain text               | `format` only                                                                                                                                                                      |
+
+EPUB is currently the only parser that populates the rich Dublin Core set. YAML front matter is
+preserved as a `Frontmatter` content block but is **not** parsed into metadata — see
+[#195](https://github.com/dokterbob/localdb/issues/195). The top-level `title` field is a
+convenience copy of `metadata`'s title.)
+
+(The structural fields above — `block`, `chunk_position`, `heading_path`, `location.span`,
+`snippet`, `metadata`, `chunk_id`, `resource_id` and `provenance.content_hash` — are captured from a
+real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative.)
+
+The citation shape is identical to `localdb search --json`. There is no top-level `document_id`,
+`block_seq`, `block_kind`, or `span` — those are superseded by `resource_id`, the nested
+`block {seq, kind}`, `chunk_position {seq_in_block}`, and `location {span, window_block_seqs}`
+respectively. See
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§6 for field definitions.
 
 ---
 
@@ -243,24 +447,37 @@ Fetch the normalized text and metadata for a document by its ID.
 
 ```json
 {
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "id": {
-      "type": "string",
-      "description": "Document ID (content-addressed blake3 hash)"
+      "default": "",
+      "description": "Document ID (content-addressed blake3 hash)",
+      "type": "string"
+    },
+    "store": {
+      "default": null,
+      "description": "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match.",
+      "type": ["string", "null"]
     },
     "uri": {
-      "type": ["string", "null"],
-      "description": "Document URI (e.g. file:///path/to/doc or URL)"
+      "default": null,
+      "description": "Document URI (e.g. file:///path/to/doc or URL)",
+      "type": ["string", "null"]
     }
-  }
+  },
+  "type": "object"
 }
 ```
 
-> **v1 limitation:** `uri`-based lookup is not supported. Pass the document `id`
-> from a `search` citation. Sending a `uri` without `id` returns `isError: true` with the
-> message: `"uri-based get_document is not supported in v1; use the document 'id'
-> from a search result"`.
+> **v1 limitation:** `uri`-based lookup is not supported. Pass the document `id` from a `search`
+> citation. Sending a `uri` without `id` returns `isError: true` with the message:
+> `"uri-based get_document is not supported in v1; use the document 'id' from a search result"`.
+
+> **Store disambiguation (#144):** pass `store` — the `store.id` or `store.name` from a search
+> citation — when the document `id` might exist in more than one store; it is resolved the same way
+> as `search`'s `stores` argument, and an unknown `store` returns `store_not_found`. Omitting
+> `store` scans every available store and returns the first match, which is ambiguous (effectively a
+> coin flip) if the id exists in more than one.
 
 **Example call:**
 
@@ -271,7 +488,7 @@ Fetch the normalized text and metadata for a document by its ID.
   "method": "tools/call",
   "params": {
     "name": "get_document",
-    "arguments": { "id": "a9bb80b7ae3ab7fa65b2181542690785d79e04c4497b59d401583e2358e77ca4" }
+    "arguments": { "id": "5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7" }
   }
 }
 ```
@@ -287,7 +504,7 @@ Fetch the normalized text and metadata for a document by its ID.
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"chunk_count\": 1,\n  \"document_id\": \"a9bb80b7...\",\n  \"provenance\": { \"content_hash\": \"929258b8...\", \"fetched_at\": \"2026-06-11T14:17:30Z\" },\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\",\n  \"title\": null,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
+        "text": "{\n  \"chunk_count\": 1,\n  \"metadata\": {\n    \"contributor\": [],\n    \"coverage\": null,\n    \"creator\": [],\n    \"date\": null,\n    \"description\": null,\n    \"format\": \"text/plain\",\n    \"identifier\": null,\n    \"kind\": \"document\",\n    \"language\": null,\n    \"page_count\": null,\n    \"publisher\": null,\n    \"relation\": [],\n    \"rights\": null,\n    \"source\": null,\n    \"subject\": [],\n    \"title\": null,\n    \"type\": null,\n    \"word_count\": null\n  },\n  \"provenance\": {\n    \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n    \"fetched_at\": \"2026-06-11T14:17:30Z\"\n  },\n  \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n  \"store\": {\n    \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n    \"name\": \"notes\"\n  },\n  \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\",\n  \"title\": null,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
       }
     ]
   }
@@ -298,40 +515,67 @@ Fetch the normalized text and metadata for a document by its ID.
 
 ### `get_chunks`
 
-Fetch a document's chunks in storage order — `(block_seq, seq_in_block)` — paginated
-by `offset`/`limit`. Use this to page through a long document after finding it via
-`search` or `get_document`.
+Fetch a document's chunks in storage order — `(block_seq, seq_in_block)` — paginated by
+`offset`/`limit`, or by an anchor position (`anchor_chunk_id`/`anchor_block_seq`, see
+[Anchor-relative pagination](#anchor-relative-pagination) below). Use this to page through a long
+document after finding it via `search` or `get_document`.
 
 **Input schema:**
 
 ```json
 {
-  "type": "object",
-  "required": ["document_id"],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "document_id": {
-      "type": "string",
-      "description": "Document ID (content-addressed blake3 hash)"
-    },
-    "offset": {
-      "type": ["integer", "null"],
+    "anchor_block_seq": {
+      "default": null,
+      "description": "Resolve via lower-bound to the first chunk with block_seq >= anchor_block_seq (tie-broken by lowest seq_in_block), then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_chunk_id`.",
+      "format": "uint32",
       "minimum": 0,
-      "description": "Number of chunks to skip before the first returned chunk (default: 0)"
+      "type": ["integer", "null"]
+    },
+    "anchor_chunk_id": {
+      "default": null,
+      "description": "Resolve to the chunk with this exact chunk_id, then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_block_seq`.",
+      "type": ["string", "null"]
     },
     "limit": {
-      "type": ["integer", "null"],
-      "minimum": 1,
+      "default": null,
+      "description": "Maximum number of chunks to return (default: 50, max: 200)",
+      "format": "int64",
       "maximum": 200,
-      "description": "Maximum number of chunks to return (default: 50, max: 200)"
+      "minimum": 1,
+      "type": ["integer", "null"]
+    },
+    "offset": {
+      "default": null,
+      "description": "Number of chunks to skip before the first returned chunk (default: 0)",
+      "format": "int64",
+      "minimum": 0,
+      "type": ["integer", "null"]
+    },
+    "resource_id": {
+      "description": "Resource ID (content-addressed blake3 hash)",
+      "type": "string"
+    },
+    "store": {
+      "default": null,
+      "description": "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match.",
+      "type": ["string", "null"]
     }
-  }
+  },
+  "required": ["resource_id"],
+  "type": "object"
 }
 ```
 
-> Like `get_document`, `uri`-based lookup is not supported — use a `document_id`
-> obtained from a prior `search` or `get_document` call. An unknown `document_id`
-> returns `document_not_found`. An `offset` past the end of the chunk list returns an
-> empty `chunks` array, not an error.
+> Like `get_document`, `uri`-based lookup is not supported — use a `resource_id` obtained from a
+> prior `search` or `get_document` call. An unknown `resource_id` returns `resource_not_found`. An
+> `offset` past the end of the chunk list returns an empty `chunks` array, not an error.
+
+> **Store disambiguation (#144):** pass `store` — the `store.id` or `store.name` from a search
+> citation — when the resource id might exist in more than one store; resolved the same way as
+> `get_document`'s `store` argument. Omitting it scans every available store and returns the first
+> match.
 
 **Example call:**
 
@@ -342,7 +586,11 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
   "method": "tools/call",
   "params": {
     "name": "get_chunks",
-    "arguments": { "document_id": "a9bb80b7...", "offset": 0, "limit": 50 }
+    "arguments": {
+      "resource_id": "5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7",
+      "offset": 0,
+      "limit": 50
+    }
   }
 }
 ```
@@ -358,12 +606,89 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"document_id\": \"a9bb80b7...\",\n  \"uri\": \"file:///home/user/notes/meeting.txt\",\n  \"title\": null,\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"total_chunks\": 1,\n  \"offset\": 0,\n  \"limit\": 50,\n  \"returned\": 1,\n  \"chunks\": [\n    {\n      \"chunk_id\": \"eff4065c...\",\n      \"block_seq\": 0,\n      \"seq_in_block\": 0,\n      \"block_kind\": null,\n      \"span\": { \"start\": 0, \"end\": 138 },\n      \"heading_path\": [],\n      \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\"\n    }\n  ]\n}"
+        "text": "{\n  \"anchor_index\": null,\n  \"chunks\": [\n    {\n      \"block_kind\": \"text\",\n      \"block_seq\": 0,\n      \"chunk_id\": \"0bbaaa6b64dffd8b232410017b224c7b499bc3fe235382bfaa8ea63b1e435824\",\n      \"heading_path\": [],\n      \"seq_in_block\": 0,\n      \"span\": {\n        \"end\": 165,\n        \"start\": 0\n      },\n      \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\"\n    }\n  ],\n  \"limit\": 50,\n  \"offset\": 0,\n  \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n  \"returned\": 1,\n  \"store\": {\n    \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n    \"name\": \"notes\"\n  },\n  \"title\": null,\n  \"total_chunks\": 1,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
       }
     ]
   }
 }
 ```
+
+`anchor_index` is `null` here because this call used plain `offset` pagination; see below for what
+it carries on an anchor-based call.
+
+---
+
+### Anchor-relative pagination
+
+As an alternative to `offset`, `get_chunks` accepts `anchor_chunk_id` (string) or `anchor_block_seq`
+(integer ≥ 0). `offset`, `anchor_chunk_id`, and `anchor_block_seq` are **pairwise mutually
+exclusive** — passing more than one of the three in the same call is a tool-level `invalid_request`
+error, not a silent precedence rule.
+
+Anchor resolution runs over the resource's full chunk list, sorted the same way as the
+plain-`offset` path — `(block_seq, seq_in_block)`:
+
+- `anchor_chunk_id` resolves to the chunk with that exact `chunk_id`. Unknown `anchor_chunk_id` →
+  `chunk_not_found`.
+- `anchor_block_seq` resolves via lower-bound: the first chunk with `block_seq >= anchor_block_seq`,
+  tie-broken by the lowest `seq_in_block` at that `block_seq`. If `anchor_block_seq` is past every
+  block in the resource, this is also `chunk_not_found`.
+
+Once an anchor resolves to a position in the full chunk list, the response window is `limit` chunks
+**centered** on that position — the anchor sits at, or as close as possible to, the middle of the
+returned page — clamped at the start/end of the resource's chunk list. The window never shrinks
+below `limit` chunks purely because the anchor is near an edge (it shifts toward the interior
+instead); it only returns fewer than `limit` chunks when the resource has fewer than `limit` chunks
+in total. The response's `offset` field reports the effective offset the returned window corresponds
+to (as if the caller had passed that `offset` directly), and `anchor_index` reports the 0-based
+index of the anchor chunk within the returned `chunks` array — `null` when the request used plain
+`offset` pagination instead.
+
+**Example** (illustrative — placeholder IDs and elided `text`/`span` values, to show the windowing
+arithmetic): a resource with 20 chunks (`block_seq` 0–19, one chunk per block), requested with
+`anchor_chunk_id` set to the `block_seq = 10` chunk and `limit: 5`. With an odd `limit`, centering
+puts 2 chunks before the anchor and 2 after, so the returned window covers `block_seq` 8–12,
+`offset` is 8 (the position of the first returned chunk in the full ordered list), and the anchor is
+the 3rd of the 5 returned chunks (`anchor_index: 2`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "get_chunks",
+    "arguments": {
+      "resource_id": "<resource_id of a 20-chunk document>",
+      "anchor_chunk_id": "<chunk_id at block 10>",
+      "limit": 5
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "result": {
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"anchor_index\": 2,\n  \"chunks\": [\n    { \"block_kind\": \"text\", \"block_seq\": 8, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 9, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 10, \"chunk_id\": \"<anchor chunk_id>\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 11, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 12, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" }\n  ],\n  \"limit\": 5,\n  \"offset\": 8,\n  \"resource_id\": \"<resource_id>\",\n  \"returned\": 5,\n  \"store\": { \"id\": \"<store id>\", \"name\": \"<store>\" },\n  \"title\": null,\n  \"total_chunks\": 20,\n  \"uri\": \"file:///home/user/notes/research-log.md\"\n}"
+      }
+    ]
+  }
+}
+```
+
+If the same `anchor_chunk_id` (`block_seq = 10`) were requested with `limit: 30` against this
+20-chunk resource, the window would clamp to the whole list: `offset: 0`, `returned: 20`,
+`anchor_index: 10`.
+
+See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.1
+for the full spec (issue #146).
 
 ---
 
@@ -371,7 +696,7 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
 
 List all available stores with their names, visibility, and document/chunk counts.
 
-**Input schema:** `{}` (no arguments)
+**Input schema:** `{"properties": {}, "type": "object"}` (no arguments)
 
 **Example call:**
 
@@ -404,72 +729,176 @@ List all available stores with their names, visibility, and document/chunk count
 
 ---
 
-## Error model
+### `list_documents`
 
-MCP failures split into exactly two tiers, by whether the request could be *routed*
-to a tool at all. See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.3 for the
-full rationale — this section shows what each tier actually looks like on the wire.
+List every document registered in a store, optionally filtered to a source, paginated by
+offset/limit. Use this to enumerate what's indexed without going through `search`.
 
-**Tool-level** (`result.isError: true`) — everything you're likely to hit in
-practice: a missing or malformed argument, an unknown store name, a not-found lookup,
-an out-of-range `limit`/`offset`. This includes cases you might expect to be
-protocol-level, like a missing required argument:
+**Input schema:**
 
 ```json
-{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"failed to deserialize parameters: missing field `query`"}],"isError":true}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "store": {
+      "description": "Store id or name to list documents from",
+      "type": "string"
+    },
+    "source": {
+      "default": null,
+      "description": "Optional source id to restrict the listing to",
+      "type": ["string", "null"]
+    },
+    "offset": {
+      "default": null,
+      "description": "Number of documents to skip before the first returned document (default: 0)",
+      "format": "int64",
+      "minimum": 0,
+      "type": ["integer", "null"]
+    },
+    "limit": {
+      "default": null,
+      "description": "Maximum number of documents to return (default: 50, max: 200)",
+      "format": "int64",
+      "maximum": 200,
+      "minimum": 1,
+      "type": ["integer", "null"]
+    }
+  },
+  "required": ["store"],
+  "type": "object"
+}
+```
+
+> Unlike `search`'s `stores` and `get_document`'s/`get_chunks`'s `store`, `store` here is
+> **required** — listing is inherently a single-store operation, so there is no "scan every
+> available store" default. An unknown store id/name returns `store_not_found`, resolved the same
+> way as `search`'s `stores` argument. An unknown `source` id is a pure filter — it yields an empty
+> `documents` list, not an error.
+
+**Example call:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "tools/call",
+  "params": {
+    "name": "list_documents",
+    "arguments": { "store": "notes" }
+  }
+}
+```
+
+**Example result:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "result": {
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"store\": {\n    \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n    \"name\": \"notes\"\n  },\n  \"total\": 1,\n  \"offset\": 0,\n  \"limit\": 50,\n  \"returned\": 1,\n  \"documents\": [\n    {\n      \"store_id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n      \"id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n      \"source_id\": \"01KTVH6AY4DC84HWW7M2PP4F0X\",\n      \"ingestor_kind\": \"file\",\n      \"uri\": \"file:///home/user/notes/meeting.txt\",\n      \"title\": null,\n      \"mime\": \"text/plain\",\n      \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n      \"fetched_at\": \"2026-06-11T14:17:30Z\",\n      \"origin_store\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n      \"policy_version\": \"...\",\n      \"metadata\": { \"kind\": \"document\", \"format\": \"text/plain\", \"...\": \"...\" }\n    }\n  ]\n}"
+      }
+    ]
+  }
+}
+```
+
+Each entry in `documents` is the document registry row (`DocumentInfo`) serialized verbatim — the
+same shape `GET /v1/stores/{name}/documents` returns per item (see
+[docs/http-api.md](http-api.md#get-v1storesnamedocuments)) — not the `get_document` tool's shape
+(which adds `chunk_count`/`text` and omits `mime`/`ingestor_kind`/`origin_store`/`policy_version`).
+
+---
+
+## Error model
+
+MCP failures split into exactly two tiers, by whether the request could be _routed_ to a tool at
+all. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)
+§4.3 for the full rationale — this section shows what each tier actually looks like on the wire.
+
+**Tool-level** (`result.isError: true`) — everything you're likely to hit in practice: a missing or
+malformed argument, an unknown store name, a not-found lookup, an out-of-range `limit`/`offset`.
+This includes cases you might expect to be protocol-level, like a missing required argument:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "content": [
+      { "type": "text", "text": "failed to deserialize parameters: missing field `query`" }
+    ],
+    "isError": true
+  }
+}
 ```
 
 Business-logic errors (unknown store, not-found document, etc.) carry a structured
-`{"error": {"code", "message"}}` JSON body as their text content instead of a plain
-string, e.g. `{"error": {"code": "store_not_found", "message": "no store named 'x'"}}`.
+`{"error": {"code", "message"}}` JSON body as their text content instead of a plain string, e.g.
+`{"error": {"code": "store_not_found", "message": "no store named 'x'"}}`.
 
-**Protocol-level** (a JSON-RPC error, no `result` field) — only one case: calling a
-tool name that doesn't exist at all.
+**Protocol-level** (a JSON-RPC error, no `result` field) — only one case: calling a tool name that
+doesn't exist at all.
 
 ```json
-{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"tool not found"}}
+{ "jsonrpc": "2.0", "id": 5, "error": { "code": -32602, "message": "tool not found" } }
 ```
 
-In proxied stdio mode (see [Daemon-proxied stdio](#daemon-proxied-stdio) above), both
-tiers pass through from the daemon's `/mcp` route unchanged. A failure of the proxy
-hop itself (daemon unreachable, connection dropped mid-request) is a distinct case
-with no upstream answer to relay a tier from — the CLI reports this as
-`daemon_unreachable` (exit code 5).
+In proxied stdio mode (see [Daemon-proxied stdio](#daemon-proxied-stdio) above), both tiers pass
+through from the daemon's `/mcp` route unchanged. A failure of the proxy hop itself (daemon
+unreachable, connection dropped mid-request) is a distinct case with no upstream answer to relay a
+tier from — the CLI reports this as `daemon_unreachable` (exit code 5).
 
 ---
 
 ## Embedded mode
 
-When no daemon is running, `localdb mcp` opens the store databases in-process
-(embedded mode). This is the normal operating mode and requires no prior setup
-beyond having run `localdb index`.
+When no daemon is running, `localdb mcp` opens the store databases in-process (embedded mode). This
+is the normal operating mode and requires no prior setup beyond having run `localdb index`.
 
-If a daemon *is* running, see [Daemon-proxied stdio](#daemon-proxied-stdio) above —
-`localdb mcp` proxies to it automatically rather than conflicting with it.
+If a daemon _is_ running, see [Daemon-proxied stdio](#daemon-proxied-stdio) above — `localdb mcp`
+proxies to it automatically rather than conflicting with it.
 
 ---
 
 ## Troubleshooting
 
+### Diagnosing a rejected connection
+
+`localdb serve` and `localdb mcp` log rejected/failed connections at `warn` level: a 4xx/5xx
+response from any daemon route (`/v1/*` or the nested `/mcp` mount — including rmcp's own
+Host-header check, see below) is logged with method, path, status, and the request's `Host` header;
+a failed proxy connect from `localdb mcp` to the daemon (stale `LOCALDB_DAEMON_URL`, or the daemon
+going away between the initial probe and the actual connect) is logged with the daemon URL and the
+underlying transport error.
+
+Both surface on stderr **by default**, no `RUST_LOG` needed — `localdb`'s default log filter is
+`warn,pdf_oxide=off` (set in `localdb/src/main.rs`), which passes `warn`-level events through. Set
+`RUST_LOG=debug` (or `RUST_LOG=localdb=debug`) for more detail.
+
 ### `daemon is unreachable` (exit 5) / stale socket
 
-If the daemon was killed with `SIGKILL` (or crashed), it may leave a stale
-`daemon.sock` file in the data directory. Remove it:
+If the daemon was killed with `SIGKILL` (or crashed), it may leave a stale `daemon.sock` file in the
+data directory. Remove it:
 
 ```
 rm <data_dir>/daemon.sock
 ```
 
-After removing the socket, `localdb status` should report `daemon: not running
-(embedded mode)` and the MCP server will start normally.
+After removing the socket, `localdb status` should report `daemon: not running (embedded mode)` and
+the MCP server will start normally.
 
 ### A remote HTTP MCP client reports "needs authentication"
 
-This isn't an auth prompt — it's almost always `rmcp`'s DNS-rebinding `Host`-header
-check rejecting the request with `403 Forbidden: Host header is not allowed`, which
-some MCP clients surface as a generic auth failure. As of this release, localdb
-automatically allow-lists the daemon's own bind address (see
-[Remote / HTTP](#remote-http-connecting-from-another-machine) above), so this
-should no longer happen for a supported (non-wildcard) bind — if you still hit it,
-confirm the daemon's `config.yaml` `server.bind` matches the address/port you're
-actually connecting to, and that you've restarted `localdb serve` after changing it.
+This isn't an auth prompt — it's almost always `rmcp`'s DNS-rebinding `Host`-header check rejecting
+the request with `403 Forbidden: Host header is not allowed`, which some MCP clients surface as a
+generic auth failure. As of this release, localdb automatically allow-lists the daemon's own bind
+address (see [Remote / HTTP](#remote--http--connecting-from-another-machine) above), so this should
+no longer happen for a supported (non-wildcard) bind — if you still hit it, confirm the daemon's
+`config.yaml` `server.bind` matches the address/port you're actually connecting to, and that you've
+restarted `localdb serve` after changing it.

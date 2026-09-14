@@ -1,0 +1,20 @@
+# Shared lychee (https://github.com/lycheeverse/lychee) configuration.
+#
+# lychee auto-detects this file from the working directory, so neither
+# `.github/workflows/ci.yml`'s offline `link-check` job nor
+# `.github/workflows/pages.yml`'s built-site check need a `--config` flag.
+#
+# Deliberately does NOT set `offline` or `include-fragments` here: those
+# differ per job (offline+fragments for the doc-source pass, online for the
+# built-site pass) and are passed as CLI flags in each workflow instead — this
+# file only holds excludes shared by both.
+
+exclude = [
+  # localhost/127.0.0.1 are never reachable from a CI runner, and any doc
+  # that links to them is already wrong regardless of network access.
+  '^https?://localhost([:/]|$)',
+  '^https?://127\.0\.0\.1([:/]|$)',
+
+  # Add rate-limited domains here as they're discovered from real CI runs,
+  # e.g.: '^https://example\.com/some-rate-limited-path',
+]

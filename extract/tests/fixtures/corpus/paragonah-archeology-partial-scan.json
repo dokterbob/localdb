@@ -1,0 +1,73 @@
+{
+  "file": "paragonah-archeology-partial-scan.pdf",
+  "expect": "ok",
+  "pages": 30,
+  "forbid_substrings": [
+    "�"
+  ],
+  "title_contains": "PARAGONAH",
+  "notes": "Real Internet Archive scan (Smithsonian Miscellaneous Collections, Vol. 70, No. 3, 1919, Neil M. Judd, 'Archeological Investigations at Paragonah, Utah') with a genuinely PARTIAL text layer, trimmed from the full 52-page IA derivative to 30 pages to stay under the size cap. Page 1 is a University of California bookplate (sparse OCR text, ~85 chars); pages 2-3 are blank flyleaves/title-page duplicates with 0 extracted characters; pages 8-29 are dense running body text (printed pages 1-22 of the monograph, ~1500-2900 chars each) with a genuine running header that alternates between 'NO. 3 ARCHEOLOGICAL INVESTIGATIONS AT PARAGONAH—JUDD' (odd printed pages) and 'SMITHSONIAN MISCELLANEOUS COLLECTIONS VOL. 70' (even printed pages), plus an arabic page-number folio in the corner opposite the header on every body page. Page 30 is Plate I, a rotated full-page line-drawing site map ('THE BIG MOUND PARAGONAH, UTAH EXCAVATED 1917') with 0 extracted text — the positive case for defect D (a genuine image-only page an extractor must not choke on or hallucinate text for) sitting directly after 22 consecutive pages of clean OCR body text, and the running headers/folios are the positive case for defect A. Ground truth was transcribed by reading pypdfium2 renders of the pages at ~144 DPI, independent of the PDF's own (Tesseract 5.3.0) OCR text layer. Because the trimmed file has 30 pages, phrase-recall is exempt per corpus.rs's phrase_recall_applies (pages<=12); only the no-panic, anti-mojibake, and page-count/ordering checks are unconditional here. Public domain: published 1919 by the Smithsonian Institution (author Neil M. Judd, a U.S. federal employee, contributed within scope of a Smithsonian/Bureau of American Ethnology-sponsored expedition), well past any copyright term; Internet Archive metadata records possible-copyright-status NOT_IN_COPYRIGHT and no access restriction.",
+  "expect_textless_pages": 4,
+  "page_phrases": {
+    "8": [
+      "The remains of ancient habitations now visible near Paragonah",
+      "leaving a bare half-dozen large elevations in the fields already",
+      "comprise but a small remnant of the total number"
+    ],
+    "9": [
+      "The present paper finds its origin in a joint expedition undertaken",
+      "with the cordial cooperation of President John A. Widtsoe",
+      "indebted to Mrs. Martha Jane Openshaw and Mr. Isaac Bozarth"
+    ],
+    "10": [
+      "Paragonah was reached early in July and the party at once",
+      "measuring approximately 225 feet in diameter and 10 feet high",
+      "The ragged blanket of sage-brush which covered the mound"
+    ],
+    "11": [
+      "Early in the course of the excavations it became evident",
+      "Reference to the ground plan (pl. 1) of the mound under consideration",
+      "The fireplaces in the areas contiguous to the rectangular rooms"
+    ],
+    "14": [
+      "the occurrence of superposed dwellings in mounds excavated at Beaver",
+      "Rooms 16-19, for example, occur in three distinct levels",
+      "Number 8 was constructed subsequently to Room 10"
+    ],
+    "15": [
+      "Room 12 was erected at the same time and on the same level",
+      "Plate 3 illustrates the relationship between the outer west walls",
+      "Room 31, a third-level house, almost entirely destroyed"
+    ],
+    "19": [
+      "Structures of this type, like the smaller shelters, were essentially",
+      "Among the structures concealed by the big mound were three circular rooms",
+      "so inseparably connected with prehistoric Pueblo dwellings"
+    ],
+    "20": [
+      "The kivas in the big mound at Paragonah were circular in form",
+      "Architecturally, the Paragonah kivas were constructed in a very simple manner",
+      "the fire screen or the wall recesses in prehistoric kivas"
+    ],
+    "24": [
+      "Objects of bone collected by the 1917 expedition were important",
+      "Grooved axes and mauls seem to have been wholly unknown",
+      "a crude basalt hammer, notched for hafting"
+    ],
+    "25": [
+      "Most of the metates, or stones on which corn, etc., was crushed",
+      "Traces of red paint on both metates and mullers illustrate",
+      "corrugated vessels were evidently less common than in ruins farther north"
+    ],
+    "28": [
+      "Two or three small masses of sulphur were also found",
+      "Implements and ornaments of metal are entirely unknown among the Utah ruins",
+      "Certainly the chief result of the recent Smithsonian Institution"
+    ],
+    "29": [
+      "domestic activities. The shelters seemingly were erected",
+      "Ceremonial chambers adjacent to the secular structures",
+      "Large numbers of artifacts were recovered from the refuse heaps"
+    ]
+  }
+}

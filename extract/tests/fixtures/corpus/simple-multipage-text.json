@@ -1,0 +1,14 @@
+{
+  "file": "simple-multipage-text.pdf",
+  "expect": "ok",
+  "pages": 4,
+  "page_phrases": {
+    "1": ["Better-PDF Sample Document", "ground-truth expectations can be written unambiguously"],
+    "2": ["Sphinx of black quartz, judge my vow.", "Item B: bananas"],
+    "3": ["First numbered item", "Third numbered item"],
+    "4": ["END OF DOCUMENT", "text extraction and page ordering are both working."]
+  },
+  "forbid_substrings": ["�"],
+  "title_contains": null,
+  "notes": "Plain ASCII control document, one short block of body text per page plus a page header line ('Page N of 4 -- <Section>'). No ligatures, tables, or non-Latin scripts; used as the baseline sanity check for page ordering and page-level text extraction."
+}

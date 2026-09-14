@@ -1,6 +1,5 @@
 //! PDF parser: chain-of-responsibility wrapper around `crate::pdf::extract_pdf`.
 
-use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
@@ -26,17 +25,21 @@ impl Parser for PdfParser {
             return Ok(None);
         }
 
-        let (markdown, title) = crate::pdf::extract_pdf(probe.bytes())?;
+        let extracted = crate::pdf::extract_pdf(probe.bytes())?;
 
-        let mut dc = DublinCoreMetadata::default();
+        // Dublin Core comes from the document itself (Info dict + XMP);
+        // `format` is the one field the *probe* owns, not the document.
+        let mut metadata = extracted.metadata;
         if let Some(mime) = probe.sniffed_mime {
-            dc.format = Some(mime.to_string());
+            metadata.format = Some(mime.to_string());
         }
+        let title = metadata.title.clone();
 
         Ok(Some(ParsedDocument {
-            markdown,
+            markdown: extracted.markdown,
             title,
-            metadata: dc,
+            metadata,
+            page_starts: extracted.page_starts,
         }))
     }
 }

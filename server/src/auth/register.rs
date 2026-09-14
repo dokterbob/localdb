@@ -15,18 +15,18 @@
 //! same reasoning that keeps `/authorize`/`/token`/`/revoke` public (T4).
 
 use axum::{
+    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
 use localdb_core::auth::{
+    MAX_REGISTRATION_CLIENT_NAME_LEN, MAX_REGISTRATION_REDIRECT_URI_LEN,
+    MAX_REGISTRATION_REDIRECT_URIS, SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
     registration_client_name_within_bounds, registration_redirect_uris_within_bounds,
-    validate_registration_redirect_uri, MAX_REGISTRATION_CLIENT_NAME_LEN,
-    MAX_REGISTRATION_REDIRECT_URIS, MAX_REGISTRATION_REDIRECT_URI_LEN, SUPPORTED_GRANT_TYPES,
-    SUPPORTED_RESPONSE_TYPES,
+    validate_registration_redirect_uri,
 };
 
 use crate::state::AppState;

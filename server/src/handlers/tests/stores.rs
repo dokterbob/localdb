@@ -208,6 +208,28 @@ async fn pagination_cursor_works() {
 }
 
 #[tokio::test]
+async fn list_stores_cursor_and_limit_near_usize_max_does_not_panic() {
+    // Regression for issue #187 review, finding G3: `PaginatedList::new`
+    // used to compute `offset + limit` unchecked. A cursor this large used
+    // to panic the request (debug) or wrap silently (release); it must now
+    // resolve cleanly to an empty, terminal page.
+    let (_dir, app) = make_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/stores?cursor=18446744073709551615&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert!(body["next_cursor"].is_null());
+}
+
+#[tokio::test]
 async fn list_stores_invalid_cursor_returns_400() {
     let (_dir, app) = make_app().await;
     let resp = app

@@ -1,14 +1,16 @@
+use super::{readable_store_names, require_principal};
 use axum::{
     extract::{Path, State},
     Extension, Json,
 };
-use serde::Serialize;
-
+use axum_extra::extract::Query;
 use localdb_core::auth::Principal;
-use localdb_core::metadata::Metadata;
-use localdb_core::Error as CoreError;
+use serde::{Deserialize, Serialize};
 
-use super::require_principal;
+use localdb_core::metadata::Metadata;
+use localdb_core::DocumentInfo;
+
+use super::{default_limit, parse_cursor, parse_limit, PaginatedList};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -24,77 +26,53 @@ pub struct DocumentRecord {
     pub fetched_at: String,
     pub normalized_text: String,
     pub metadata: Metadata,
+    pub date_original: Option<String>,
+    pub date_parsed: Option<String>,
+    pub index_updated_at: Option<String>,
 }
 
-/// `GET /v1/documents/{id}`: readable like its owning store (D7). A
-/// document in a store the caller cannot read is masked as
-/// `resource_not_found` when the *document itself* is unknown, but as
-/// `forbidden` (403) when it exists in a store the caller cannot read —
-/// same 403-over-404 consistency point as `handlers::stores::get_store`.
+/// `GET /v1/documents/{id}` query params: a repeatable `?store=` scopes the
+/// lookup to specific stores, same idiom as `?store=` on `GET /v1/status`
+/// (`server/src/handlers/status.rs`) — `Vec<String>` + `#[serde(default)]`
+/// via `axum_extra::extract::Query`, which correctly handles zero, one, or
+/// many repeated params of the same name.
+#[derive(Debug, Deserialize)]
+pub struct GetDocumentQuery {
+    #[serde(default)]
+    pub store: Vec<String>,
+}
+
 pub async fn get_document(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     Path(doc_id): Path<String>,
+    Query(query): Query<GetDocumentQuery>,
 ) -> Result<Json<DocumentRecord>, ApiError> {
     let principal = require_principal(principal)?;
-    let info = state
-        .backend()
-        .find_document(&doc_id)
-        .await
-        .map_err(ApiError)?
-        .ok_or(ApiError(CoreError::ResourceNotFound { id: doc_id.clone() }))?;
-
-    // A dangling `store_id` (no owning store row) is not expected in
-    // practice — cascade deletes remove documents with their store — but if
-    // it ever happens, fail open to serving the document rather than
-    // panicking: there is no visibility to check against.
-    if let Some(store) = state
-        .backend()
-        .get_store(&info.store_id)
-        .await
-        .map_err(ApiError)?
-    {
-        if !principal.can_read_store(&store.name, store.visibility.clone()) {
-            return Err(ApiError(CoreError::Forbidden {
-                message: format!("user '{}' cannot read document '{doc_id}'", principal.name),
-            }));
-        }
-    }
-
-    let handle = state
-        .backend()
-        .retrieval_store(&info.store_id)
-        .await
-        .map_err(ApiError)?;
-    let chunks = handle
-        .get_chunks_for_resource(&info.id)
-        .await
-        .map_err(ApiError)?;
-    let blocks = handle
-        .get_blocks_for_resource(&info.id)
-        .await
-        .map_err(ApiError)?;
-    // Reconstruct from `blocks` when available: each block's canonical text
-    // is persisted exactly once, so joining these avoids duplicating the
-    // header/separator row that the table chunker (spec 04 §3, intentional)
-    // re-emits in every chunk of a multi-chunk table. Falls back to the
-    // legacy chunk-text join when `blocks` is empty (rows indexed before the
-    // Resource/Block architecture existed never persisted blocks). Joined
-    // with "\n\n", matching the blank-line separation Markdown extraction
-    // strips out between sibling blocks.
-    let normalized_text = if blocks.is_empty() {
-        chunks
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+    let names = readable_store_names(&state, &principal, &query.store).await?;
+    let detail = if names.is_empty() {
+        Err(localdb_core::Error::ResourceNotFound { id: doc_id.clone() })
     } else {
-        blocks
-            .iter()
-            .map(|b| b.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        state.get_document(&doc_id, &names).await
     };
+    let detail = match detail {
+        Err(localdb_core::Error::ResourceNotFound { .. }) if query.store.is_empty() => {
+            for store in state.backend().list_stores().await? {
+                if !principal.can_read_store(&store.name, store.visibility.clone())
+                    && state
+                        .backend()
+                        .find_document(&doc_id, Some(&store.id))
+                        .await?
+                        .is_some()
+                {
+                    principal.require_read_store(&store.name, store.visibility)?;
+                }
+            }
+            return Err(localdb_core::Error::ResourceNotFound { id: doc_id }.into());
+        }
+        result => result?,
+    };
+    let info = detail.info;
     Ok(Json(DocumentRecord {
         id: info.id,
         uri: info.uri,
@@ -103,7 +81,48 @@ pub async fn get_document(
         source_id: info.source_id,
         content_hash: info.content_hash,
         fetched_at: info.fetched_at,
-        normalized_text,
+        normalized_text: detail.text.unwrap_or_default(),
         metadata: info.metadata,
+        date_original: info.date_original,
+        date_parsed: info.date_parsed,
+        index_updated_at: info.index_updated_at,
     }))
+}
+
+/// `GET /v1/stores/{name}/documents` query params: cursor/limit pagination
+/// (same idiom as `GET /v1/stores/{name}/sources`'s `PaginationParams`) plus
+/// an optional `?source=` filter. A dedicated struct rather than reusing
+/// `PaginationParams` directly — `source` isn't a pagination concern, and
+/// flattening two `Deserialize` structs together doesn't play well with
+/// `serde_urlencoded` (the wire format `axum::extract::Query` parses).
+#[derive(Debug, Deserialize)]
+pub struct ListDocumentsQuery {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+pub async fn list_documents(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(store_name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ListDocumentsQuery>,
+) -> Result<Json<PaginatedList<DocumentInfo>>, ApiError> {
+    let principal = require_principal(principal)?;
+    readable_store_names(&state, &principal, std::slice::from_ref(&store_name)).await?;
+    let offset = parse_cursor(query.cursor.as_deref())?;
+    let limit = parse_limit(query.limit)?;
+
+    let (page, total) = state
+        .list_documents(&store_name, query.source.as_deref(), Some(limit), offset)
+        .await?;
+    Ok(Json(PaginatedList::new(
+        page,
+        offset,
+        limit,
+        total as usize,
+    )))
 }

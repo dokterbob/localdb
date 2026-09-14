@@ -10,28 +10,79 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# The toolchain, its components, and its cross-compile targets all come from
+# `rust-toolchain.toml`. Runners ship with rustup, which reads that file and
+# provisions on demand, so no job installs a toolchain of its own — a job that
+# did would pin a *second*, different compiler and silently reintroduce the
+# drift the file exists to prevent. `rustup show active-toolchain` is a
+# named, cacheable step purely so provisioning failures and timings are legible
+# in the log rather than folded into the first cargo command.
+
 jobs:
+  # Detects whether a pull request touches anything besides docs/specs/markdown.
+  # `code` is true iff at least one changed file falls outside that set — the
+  # gated cargo jobs below skip when it's false, and a skipped required job
+  # reports "skipped" to branch protection, which counts as passing. This only
+  # narrows `pull_request` runs: push events (main, ticket/**) always run
+  # every job, gated or not, since `github.event_name != 'pull_request'` short-
+  # circuits the `if:` on push before `needs.changes.outputs.code` is read.
+  # The docs-ish path list below is conceptually the mirror image of
+  # pages.yml's `paths:` trigger (docs/specs/markdown vs. docs-only) — no
+  # shared source, keep the two in sync by hand.
+  changes:
+    name: Detect changed files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      test_inputs: ${{ steps.filter.outputs.test_inputs }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          predicate-quantifier: every
+          # `code`: true when any changed file lies outside the docs-ish set.
+          # Only root-level `*.md` is excluded — markdown elsewhere (e.g.
+          # `extract/tests/fixtures/*.md`) is baked into test binaries via
+          # `include_bytes!` and must count as code.
+          # `test_inputs`: spec files that tests read at runtime
+          # (mcp/tests/spec_conformance.rs reads specs/05-surfaces.md), so a
+          # change to them must still run the Tests job even though `specs/**`
+          # is otherwise docs-only.
+          filters: |
+            code:
+              - '!docs/**'
+              - '!specs/**'
+              - '!*.md'
+              - '!lychee.toml'
+            test_inputs:
+              - 'specs/05-surfaces.md'
+
   fmt:
     name: Formatting
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with rustfmt
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
       - name: Check formatting
         run: cargo fmt --all --check
 
   clippy:
     name: Clippy
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with clippy
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -44,19 +95,33 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          # The toolchain hash sits in the restore-key *prefix*, ahead of the
+          # lockfile hash. A `target/` built by another compiler is unusable,
+          # so a channel bump has to miss the prefix too — putting both hashes
+          # in the exact key alone would still let the broad prefix restore the
+          # previous compiler's artifacts. A lockfile change still restores
+          # partially, within the same toolchain.
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Run clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Tests
+    needs: changes
+    if: >-
+      github.event_name != 'pull_request' ||
+      needs.changes.outputs.code == 'true' ||
+      needs.changes.outputs.test_inputs == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC for the Qlty coverage upload (no token secret)
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -69,78 +134,32 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          # Toolchain hash in the prefix — see the clippy job.
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-
-      - name: Build workspace
-        run: cargo build --workspace
-      - name: Run tests
-        run: cargo test --workspace
-
-  coverage:
-    name: Coverage gates
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable with llvm-tools
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-coverage-
+            ${{ runner.os }}-cargo-coverage-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run coverage (all tests)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - name: Check coverage gates
-        # Gate: ≥80% line coverage across the workspace.
-        # Data-modifying paths should hit ≥90% but this workspace-level gate
-        # is enforced at 80%; per-crate gates are checked per ticket via the
-        # summary report.
-        run: |
-          cargo llvm-cov report --summary-only
-          # Fail if line coverage drops below 80%.
-          COVERAGE=$(cargo llvm-cov report --summary-only 2>/dev/null \
-            | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
-          echo "Workspace line coverage: ${COVERAGE}%"
-          if [ -z "$COVERAGE" ]; then
-            echo "ERROR: Could not parse coverage output."
-            exit 1
-          fi
-          if [ "$(echo "$COVERAGE < 80" | bc -l)" = "1" ]; then
-            echo "ERROR: Coverage ${COVERAGE}% is below the 80% gate."
-            exit 1
-          fi
-      - name: Upload coverage to Codecov (informational)
-        uses: codecov/codecov-action@v4
-        if: github.event_name == 'pull_request'
+      - name: Upload coverage to Qlty
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: qltysh/qlty-action/coverage@v2
         with:
+          oidc: true
           files: lcov.info
-          fail_ci_if_error: false
 
   coreml:
     name: CoreML backend (macOS)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with clippy
-        # @stable satisfies the local-coreml MSRV of Rust 1.85.
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install the pinned toolchain
+        # `rust-toolchain.toml`'s channel also has to satisfy the local-coreml
+        # MSRV of Rust 1.85, which is above the workspace MSRV.
+        run: rustup show active-toolchain
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -149,24 +168,54 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('**/Cargo.lock') }}
+          # Toolchain hash in the prefix — see the clippy job.
+          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-coreml-
+            ${{ runner.os }}-cargo-coreml-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Build embed with local-coreml
-        run: cargo build -p embed --features local-coreml
+        run: cargo build -p localdb-embed --features local-coreml
       - name: Run embed tests with local-coreml
         # Pure logic/unit tests run without a model. Device/network/parity tests
         # are #[ignore]d, so plain `cargo test` does not hit the network or load a
         # CoreML bundle; run those manually against a cached bundle.
-        run: cargo test -p embed --features local-coreml
+        run: cargo test -p localdb-embed --features local-coreml
       - name: Run clippy with local-coreml (deny warnings)
-        run: cargo clippy -p embed --features local-coreml --all-targets -- -D warnings
+        run: cargo clippy -p localdb-embed --features local-coreml --all-targets -- -D warnings
+
+  link-check:
+    name: Check links (docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # `--offline` alone never checks fragment anchors — `--include-fragments`
+          # (bare, so it defaults to anchor-only) is what validates `file.md#anchor`
+          # targets, both GitHub-style heading slugs and raw `<a id="...">` HTML
+          # anchors. Both offline and deterministic, so this can gate PRs.
+          #
+          # docs/index.md and docs/_layouts/** are excluded: they contain raw
+          # Liquid `{{ ... | relative_url }}` hrefs that are only real links once
+          # Jekyll renders them, which would all be false positives here. The
+          # built-site pass in pages.yml covers those instead.
+          #
+          # Shared excludes (e.g. localhost) live in ./lychee.toml, which lychee
+          # auto-detects from the working directory — no --config flag needed.
+          args: >-
+            --offline --include-fragments --no-progress
+            --exclude-path docs/index.md
+            --exclude-path docs/_layouts
+            README.md CLAUDE.md CONTRIBUTING.md
+            'docs/**/*.md' 'specs/**/*.md'
 
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
   # If tests are removed, coverage will drop and the coverage job will fail.
   build-all-platforms:
     name: Cross-compile check (${{ matrix.target }})
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -184,10 +233,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install the pinned toolchain
+        # Every target in this matrix is declared in `rust-toolchain.toml`, so
+        # rustup provisions them here; adding a target to the matrix without
+        # adding it there fails this step.
+        run: rustup show active-toolchain
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -204,6 +254,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+          # No toolchain hash here, unlike the jobs above: this caches only
+          # downloaded sources, never `target/`, and those are the same bytes
+          # whichever compiler consumes them.
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-

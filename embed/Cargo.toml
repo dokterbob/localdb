@@ -1,10 +1,17 @@
 [package]
-name = "embed"
+name = "localdb-embed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Embedder implementations: local ONNX, OpenAI-compatible, and contextualized providers"
+
+[lib]
+# Keep the short crate name in code (`use embed::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "embed"
 
 [features]
 default = []
@@ -14,7 +21,7 @@ local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 local-coreml = ["dep:objc2", "dep:objc2-core-ml", "dep:objc2-foundation", "dep:half", "dep:tokenizers", "dep:hf-hub", "dep:block2"]
 
 [dependencies]
-localdb-core = { path = "../core" }
+localdb-core = { path = "../core", version = "0.2.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -24,6 +31,13 @@ async-trait = "0.1"
 
 # HTTP client for hosted providers
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Shared outgoing-HTTP layer (issue #207): user agent, retry/backoff/jitter,
+# and Retry-After handling for hosted-provider requests. `fetch` depends only
+# on `localdb-core`, so pulling it in here does not create a dependency
+# cycle — see `fetch/Cargo.toml`.
+localdb-fetch = { workspace = true }
+backon = { workspace = true }
 
 # Local ONNX inference (optional)
 # hf-hub-rustls-tls enables model downloading via HuggingFace Hub (includes hf-hub + rustls)

@@ -8,7 +8,7 @@ const TOKEN_COLUMNS: &str = "id, user_id, kind, secret_hash, expires_at, last_us
     revoked_at, created_at, family_id, rotated_from";
 
 pub(crate) async fn insert_token(db: &LibsqlDb, token: &AuthTokenRow) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "INSERT INTO auth_tokens
             (id, user_id, kind, secret_hash, expires_at, last_used_at, revoked_at,
@@ -36,7 +36,7 @@ pub(crate) async fn find_token_by_hash(
     db: &LibsqlDb,
     secret_hash: &str,
 ) -> Result<Option<AuthTokenRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {TOKEN_COLUMNS} FROM auth_tokens WHERE secret_hash = ?"),
@@ -51,7 +51,7 @@ pub(crate) async fn find_token_by_hash(
 }
 
 pub(crate) async fn find_token(db: &LibsqlDb, id: &str) -> Result<Option<AuthTokenRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {TOKEN_COLUMNS} FROM auth_tokens WHERE id = ?"),
@@ -66,7 +66,7 @@ pub(crate) async fn find_token(db: &LibsqlDb, id: &str) -> Result<Option<AuthTok
 }
 
 pub(crate) async fn revoke_token(db: &LibsqlDb, id: &str, revoked_at: &str) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE auth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
@@ -82,7 +82,7 @@ pub(crate) async fn revoke_token_family(
     family_id: &str,
     revoked_at: &str,
 ) -> Result<u64, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE auth_tokens SET revoked_at = ? \
@@ -95,7 +95,7 @@ pub(crate) async fn revoke_token_family(
 }
 
 pub(crate) async fn mark_token_used(db: &LibsqlDb, id: &str, used_at: &str) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "UPDATE auth_tokens SET last_used_at = ? WHERE id = ?",
         libsql::params![used_at.to_string(), id.to_string()],
@@ -109,7 +109,7 @@ pub(crate) async fn list_tokens_for_user(
     db: &LibsqlDb,
     user_id: &str,
 ) -> Result<Vec<AuthTokenRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!(

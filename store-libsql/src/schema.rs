@@ -1,7 +1,7 @@
 use libsql::Connection;
 use localdb_core::VectorEncoding;
 
-use crate::vectors::embedding_column_type;
+use crate::vectors::{embedding_column_type, vector_index_ddl};
 
 /// Run the full DDL for the unified database.
 ///
@@ -51,6 +51,16 @@ async fn create_stores(conn: &Connection) -> Result<(), libsql::Error> {
 }
 
 async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
+    // `feed_etag`, `feed_last_modified` and `feed_inputs_digest` are
+    // appended after `config_json`
+    // (and before the CHECK/UNIQUE table-level constraints) rather than
+    // grouped with the source's own columns above: schema v8 adds them via
+    // plain `ALTER TABLE sources ADD COLUMN`, which SQLite always appends
+    // after the last existing column definition and before any table-level
+    // constraints. This literal must stay byte-for-byte identical to that or
+    // the drift-guard test
+    // (`migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`)
+    // fails (write-twice rule, docs/migrations.md).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sources (
             id          TEXT PRIMARY KEY NOT NULL,
@@ -63,7 +73,7 @@ async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
             preset      TEXT NOT NULL DEFAULT 'prose',
             refresh     TEXT,
             created_at  TEXT NOT NULL,
-            config_json TEXT,
+            config_json TEXT, feed_etag TEXT, feed_last_modified TEXT, feed_inputs_digest TEXT,
             CHECK (
                 (kind = 'path' AND root IS NOT NULL)
                 OR (kind = 'url'  AND url  IS NOT NULL)
@@ -99,6 +109,24 @@ async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
 }
 
 async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
+    // `modified_at` and `index_updated_at` are both appended after
+    // `extractor_version` rather than `modified_at` staying grouped with
+    // `added_at` above: schema v7 relaxes `modified_at`'s `NOT NULL` via a
+    // column-level add/copy/drop/rename dance (no `ALTER COLUMN` in SQLite,
+    // and no table rebuild — chunks/blocks' foreign keys to resources make
+    // that unsafe inside a migration transaction), which SQLite implements by
+    // dropping the original column and re-adding it under the final name;
+    // `index_updated_at` then lands via a plain `ALTER TABLE resources ADD
+    // COLUMN` on top of that. SQLite always appends `ADD COLUMN` after the
+    // last existing column definition, so both end up here, in application
+    // order, in place of `modified_at`'s original position — verified
+    // empirically. `external_last_modified` and `last_checked_at` (schema v8)
+    // are two further plain `ALTER TABLE ... ADD COLUMN`s on top of that, so
+    // they land last, in the order their migration statements run. This
+    // literal must stay byte-for-byte identical to the result or the
+    // drift-guard test
+    // (`migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`)
+    // fails (write-twice rule, docs/migrations.md).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS resources (
             rowid             INTEGER PRIMARY KEY,
@@ -117,7 +145,6 @@ async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
             date_original     TEXT,
             date_parsed       TEXT,
             added_at          TEXT NOT NULL,
-            modified_at       TEXT NOT NULL,
             thread_id         TEXT,
             channel           TEXT,
             participants      TEXT DEFAULT '[]',
@@ -125,7 +152,7 @@ async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
             origin_store      TEXT NOT NULL,
             policy_version    TEXT NOT NULL,
             share_path        TEXT,
-            extractor_version TEXT NOT NULL,
+            extractor_version TEXT NOT NULL, modified_at TEXT, index_updated_at TEXT, external_last_modified TEXT, last_checked_at TEXT,
             UNIQUE (store_id, id),
             FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id) ON DELETE CASCADE
         )",
@@ -211,14 +238,12 @@ async fn create_chunks(
     )
     .await?;
 
-    // DiskANN index. Tuning (max_neighbors=64, compress_neighbors=float8)
-    // matches PR #92 review feedback that landed on main.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks(\
-         libsql_vector_idx(embedding, 'metric=cosine', 'max_neighbors=64', 'compress_neighbors=float8'))",
-        (),
-    )
-    .await?;
+    // DiskANN index. Tuning is encoding-dependent and derived in one place —
+    // see `vectors::vector_index_params` for the block-size cost model and
+    // why a binary column must not carry float8 neighbors (issue #179).
+    // Schema v6 must keep emitting this byte-for-byte identically to the
+    // chain migration; both call the same helper for exactly that reason.
+    conn.execute(&vector_index_ddl(encoding), ()).await?;
 
     Ok(())
 }
@@ -568,12 +593,12 @@ mod tests {
 
     async fn index_names(conn: &Connection) -> HashSet<String> {
         let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name",
-                (),
-            )
-            .await
-            .unwrap();
+        .query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name",
+            (),
+        )
+        .await
+        .unwrap();
         let mut names = HashSet::new();
         while let Some(row) = rows.next().await.unwrap() {
             names.insert(row.get::<String>(0).unwrap());
@@ -763,8 +788,8 @@ mod tests {
             conn.execute(
                 &format!(
                     "INSERT INTO stores \
-                     (id, name, indexing_policy, policy_version, created_at) \
-                     VALUES ('{id}', '{name}', '{{}}', '1', '2024-01-01T00:00:00Z')"
+                 (id, name, indexing_policy, policy_version, created_at) \
+                 VALUES ('{id}', '{name}', '{{}}', '1', '2024-01-01T00:00:00Z')"
                 ),
                 (),
             )
@@ -778,7 +803,7 @@ mod tests {
             conn.execute(
                 &format!(
                     "INSERT INTO sources (id, store_id, kind, root, created_at) \
-                     VALUES ('{id}', '{store_id}', 'path', '{root}', '2024-01-01T00:00:00Z')"
+                 VALUES ('{id}', '{store_id}', 'path', '{root}', '2024-01-01T00:00:00Z')"
                 ),
                 (),
             )
@@ -808,13 +833,13 @@ mod tests {
         let result = conn
             .execute(
                 "INSERT INTO resources \
-                 (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
-                  content_hash, added_at, modified_at, origin_store, policy_version, \
-                  metadata_json, extractor_version) \
-                 VALUES \
-                 ('store-a', 'res-x', 'src-b', 'path', 'file', 'file:///doc.md', \
-                  'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
-                  '{}', '1')",
+             (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
+              content_hash, added_at, modified_at, origin_store, policy_version, \
+              metadata_json, extractor_version) \
+             VALUES \
+             ('store-a', 'res-x', 'src-b', 'path', 'file', 'file:///doc.md', \
+              'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
+              '{}', '1')",
                 (),
             )
             .await;
@@ -822,7 +847,7 @@ mod tests {
         assert!(
             result.is_err(),
             "inserting a resource in store-a that references a source in store-b \
-             should be rejected by the composite FK constraint"
+         should be rejected by the composite FK constraint"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -844,13 +869,13 @@ mod tests {
         // Insert a resource in store-a that references store-a's own source.
         conn.execute(
             "INSERT INTO resources \
-             (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
-              content_hash, added_at, modified_at, origin_store, policy_version, \
-              metadata_json, extractor_version) \
-             VALUES \
-             ('store-a', 'res-1', 'src-a', 'path', 'file', 'file:///doc.md', \
-              'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
-              '{}', '1')",
+         (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
+          content_hash, added_at, modified_at, origin_store, policy_version, \
+          metadata_json, extractor_version) \
+         VALUES \
+         ('store-a', 'res-1', 'src-a', 'path', 'file', 'file:///doc.md', \
+          'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
+          '{}', '1')",
             (),
         )
         .await

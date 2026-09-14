@@ -10,7 +10,7 @@ const INVITE_COLUMNS: &str = "id, token_hash, mode, store_grants, max_uses, uses
     expires_at, revoked_at, created_by, created_at";
 
 pub(crate) async fn create_invite(db: &LibsqlDb, invite: &InviteRow) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let store_grants_json =
         serde_json::to_string(&invite.store_grants).map_err(|e| Error::Internal {
             message: format!("failed to serialize invite.store_grants: {e}"),
@@ -40,7 +40,7 @@ pub(crate) async fn find_invite_by_hash(
     db: &LibsqlDb,
     token_hash: &str,
 ) -> Result<Option<InviteRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {INVITE_COLUMNS} FROM invites WHERE token_hash = ?"),
@@ -55,7 +55,7 @@ pub(crate) async fn find_invite_by_hash(
 }
 
 pub(crate) async fn find_invite(db: &LibsqlDb, id: &str) -> Result<Option<InviteRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {INVITE_COLUMNS} FROM invites WHERE id = ?"),
@@ -70,7 +70,7 @@ pub(crate) async fn find_invite(db: &LibsqlDb, id: &str) -> Result<Option<Invite
 }
 
 pub(crate) async fn list_invites(db: &LibsqlDb) -> Result<Vec<InviteRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {INVITE_COLUMNS} FROM invites ORDER BY created_at"),
@@ -90,7 +90,7 @@ pub(crate) async fn revoke_invite(
     id: &str,
     revoked_at: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE invites SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
@@ -107,7 +107,7 @@ pub(crate) async fn revoke_invite(
 /// concurrent callers racing the same invite can never together push `uses`
 /// past `max_uses`.
 pub(crate) async fn try_consume_invite_use(db: &LibsqlDb, id: &str) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses",
@@ -123,7 +123,7 @@ pub(crate) async fn try_consume_invite_use(db: &LibsqlDb, id: &str) -> Result<bo
 /// guard is defensive — it keeps a double-release from ever driving the
 /// counter negative.
 pub(crate) async fn release_invite_use(db: &LibsqlDb, id: &str) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "UPDATE invites SET uses = uses - 1 WHERE id = ? AND uses > 0",
         libsql::params![id.to_string()],
@@ -140,7 +140,7 @@ pub(crate) async fn create_access_request(
     db: &LibsqlDb,
     req: &AccessRequestRow,
 ) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         &format!(
             "INSERT INTO access_requests ({ACCESS_REQUEST_COLUMNS}) \
@@ -167,7 +167,7 @@ pub(crate) async fn find_access_request(
     db: &LibsqlDb,
     id: &str,
 ) -> Result<Option<AccessRequestRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {ACCESS_REQUEST_COLUMNS} FROM access_requests WHERE id = ?"),
@@ -185,7 +185,7 @@ pub(crate) async fn list_access_requests_for_invite(
     db: &LibsqlDb,
     invite_id: &str,
 ) -> Result<Vec<AccessRequestRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!(
@@ -204,7 +204,7 @@ pub(crate) async fn list_access_requests_for_invite(
 }
 
 pub(crate) async fn list_access_requests(db: &LibsqlDb) -> Result<Vec<AccessRequestRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let mut rows = conn
         .query(
             &format!("SELECT {ACCESS_REQUEST_COLUMNS} FROM access_requests ORDER BY created_at"),
@@ -228,7 +228,7 @@ pub(crate) async fn mark_access_request_collected(
     id: &str,
     collected_at: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE access_requests SET collected_at = ? \
@@ -254,7 +254,7 @@ pub(crate) async fn try_decide_access_request(
     resulting_user_id: Option<&str>,
     decided_at: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE access_requests \

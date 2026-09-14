@@ -5,7 +5,7 @@ use super::sql::row_to_store_grant;
 use crate::connection::{map_libsql_err, LibsqlDb};
 
 pub(crate) async fn grant_store(db: &LibsqlDb, grant: &StoreGrantRow) -> Result<(), Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     conn.execute(
         "INSERT INTO store_grants (store_name, user_id, granted_by, created_at)
          VALUES (?, ?, ?, ?)
@@ -29,7 +29,7 @@ pub(crate) async fn revoke_store_grant(
     store_name: &str,
     user_id: &str,
 ) -> Result<bool, Error> {
-    let conn = db.conn().await;
+    let conn = db.writer().await;
     let n = conn
         .execute(
             "DELETE FROM store_grants WHERE store_name = ? AND user_id = ?",
@@ -44,7 +44,7 @@ pub(crate) async fn list_grants_for_user(
     db: &LibsqlDb,
     user_id: &str,
 ) -> Result<Vec<StoreGrantRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT store_name, user_id, granted_by, created_at \
@@ -64,7 +64,7 @@ pub(crate) async fn list_grants_for_store(
     db: &LibsqlDb,
     store_name: &str,
 ) -> Result<Vec<StoreGrantRow>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             "SELECT store_name, user_id, granted_by, created_at \
