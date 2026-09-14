@@ -38,7 +38,7 @@ pub use cmds::auth::{
     run_key_create, run_key_list, run_key_revoke, run_user_add, run_user_list, run_user_remove,
     run_user_set_role,
 };
-pub use cmds::completions::{Shell, run_completions};
+pub use cmds::completions::{run_completions, Shell};
 pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status, run_db_vacuum};
 pub use cmds::document::{run_document_get, run_document_list};
 pub use cmds::index::run_index;
@@ -57,39 +57,11 @@ pub use cmds::store::{
     run_store_add, run_store_grant, run_store_list, run_store_remove, run_store_revoke,
 };
 pub use cmds::surface::{run_mcp, run_serve};
-pub use daemon_client::{CliContext, DaemonState, probe_daemon};
+pub use daemon_client::{probe_daemon, CliContext, DaemonState};
 pub use localdb_core::SearchFilters;
 pub use normalize::{
     classify_source, confirm_destructive, exit_err, source_row_to_core_source, validate_store_name,
 };
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn public_cli_context_can_be_constructed() {
-        let ctx = CliContext {
-            config: None,
-            json: false,
-            stores: vec![],
-            yes: false,
-            daemon_url: None,
-            config_env: None,
-            api_key: None,
-        };
-        assert!(!ctx.json);
-    }
-
-    pub(crate) fn context() -> CliContext {
-        CliContext {
-            config: None,
-            json: false,
-            stores: vec![],
-            yes: false,
-            daemon_url: None,
-            config_env: None,
-            api_key: None,
-        }
-    }
-}
+mod tests;

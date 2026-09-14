@@ -7,10 +7,10 @@ mod invites;
 
 use std::sync::Arc;
 
-use crate::Error;
 use crate::ids::new_ulid;
 use crate::ingestion::now_rfc3339;
 use crate::types::StoreVisibility;
+use crate::Error;
 
 use super::client;
 use super::principal::{Principal, Role, StoreAccess};
@@ -19,8 +19,8 @@ use super::store::{
     InviteRow, OAuthClientRow, StoreGrantRow, TokenKind, UserRow,
 };
 use super::token::{
-    ACCESS_TOKEN_TTL_SECS, AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS, hash_secret, is_expired,
-    mint_secret, rfc3339_from_now, verify_pkce_s256, verify_secret,
+    hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256, verify_secret,
+    ACCESS_TOKEN_TTL_SECS, AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS,
 };
 
 /// A newly minted bearer token: the persisted row plus the plaintext secret
@@ -641,41 +641,4 @@ pub enum PollOutcome {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::client::LOCALDB_CLI_CLIENT_ID;
-    use crate::auth::store::FakeAuthStore;
-    use crate::auth::token::TOKEN_PREFIX;
-
-    fn service() -> AuthService<FakeAuthStore> {
-        AuthService::new(Arc::new(FakeAuthStore::new()))
-    }
-
-    async fn make_open_invite(svc: &AuthService<FakeAuthStore>, max_uses: u32) -> IssuedInvite {
-        svc.create_invite(
-            InviteMode::Open,
-            &[("docs".to_string(), StoreVisibility::Shared)],
-            max_uses,
-            None,
-            "admin-1",
-        )
-        .await
-        .unwrap()
-    }
-
-    async fn make_closed_invite(svc: &AuthService<FakeAuthStore>, max_uses: u32) -> IssuedInvite {
-        svc.create_invite(
-            InviteMode::Closed,
-            &[("docs".to_string(), StoreVisibility::Shared)],
-            max_uses,
-            None,
-            "admin-1",
-        )
-        .await
-        .unwrap()
-    }
-
-    mod invites;
-    mod tokens;
-    mod users_and_grants;
-}
+mod tests;
