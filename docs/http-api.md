@@ -63,8 +63,8 @@ The daemon binds `127.0.0.1` by default. Whether requests need a bearer token is
 Binding to a specific non-loopback address is a deliberate trust decision and is accepted (auth
 enforced automatically under the default `auto`). Binding to `0.0.0.0`/`::` (all interfaces)
 additionally logs a startup warning, since that's reachable from every network the machine is on.
-See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the full binding and auth-mode decision
-matrix.
+See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3
+for the full binding and auth-mode decision matrix.
 
 **When auth is Open:** every request runs as an implicit admin principal
 (`Principal::local_trust()`) — the same trust boundary as the CLI and embedded MCP: anything that
@@ -76,8 +76,9 @@ can reach the bind address is as trusted as the files themselves.
 [OAuth discovery](#oauth-discovery--dynamic-client-registration) below). A request from an
 authenticated principal who lacks permission for the resource gets `403`. Members (as opposed to
 admins) only see/search `shared`-visibility stores they hold an explicit grant for
-(`localdb store grant`) — see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.1 for the D7
-authorization model.
+(`localdb store grant`) — see
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.1 for
+the D7 authorization model.
 
 **One-time setup code.** The first time `localdb serve` starts with auth enforced and zero users
 exist yet, it prints a one-time setup code to stderr:

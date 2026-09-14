@@ -217,8 +217,9 @@ The daemon's HTTP surface (`/v1/*` and `/mcp`) is bearer-token authenticated onc
 — controlled by `server.auth: auto | required | off` (default `auto`, which enforces iff the daemon
 is bound to a non-loopback address). A loopback-bound daemon under `auto`, and every daemonless
 CLI/embedded-MCP invocation, remain unauthenticated by design: the same trust boundary as the
-on-disk files themselves. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3/§3.1 for the full
-decision matrix.
+on-disk files themselves. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3/§3.1
+for the full decision matrix.
 
 **Bootstrap.** The first `localdb serve` with auth enforced and no admin yet prints a one-time setup
 code to stderr. Paste it into the browser consent page `/authorize` opens (or pass it via
@@ -243,10 +244,10 @@ authorization-server metadata document (RFC 8414, `/.well-known/oauth-authorizat
 advertises `/register`, `/authorize`, and `/token`; `POST /register` (RFC 7591 Dynamic Client
 Registration) mints the client a `client_id` it then uses to run the ordinary code+PKCE flow.
 `<base>` is `server.public_url` when configured (set this behind a TLS-terminating reverse proxy —
-see [specs/03-config.md](../specs/03-config.md) §1) or, otherwise, derived from the request's own
-`Host` header after strict sanitization (`server::auth::base_url`) — the header is
-attacker-influencable on these unauthenticated routes, so a malformed one is rejected rather than
-ever echoed back.
+see [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §1) or,
+otherwise, derived from the request's own `Host` header after strict sanitization
+(`server::auth::base_url`) — the header is attacker-influencable on these unauthenticated routes, so
+a malformed one is rejected rather than ever echoed back.
 
 Client redirect-uri policy differs by origin: the built-in `localdb-cli` client keeps the RFC 8252
 §7.3 loopback-any-port exception (`http://127.0.0.1:<any port>/...` /
@@ -267,21 +268,24 @@ credential is minted.
 
 **CLI identity.** `localdb login` drives the browser OAuth flow (`--invite <token>` redeems an
 invite instead — no browser round trip) and caches the resulting bearer in `credentials.json` next
-to `config.yaml` ([specs/03-config.md](../specs/03-config.md) §6); `localdb logout` revokes it and
-clears the cache. `localdb status` shows the caller's identity and cached token expiry once
-authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached credential for a
-single invocation. Exit code `6` (new) is reserved for `unauthorized`/`forbidden`.
+to `config.yaml`
+([specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §6);
+`localdb logout` revokes it and clears the cache. `localdb status` shows the caller's identity and
+cached token expiry once authenticated. The `LOCALDB_API_KEY` environment variable overrides the
+cached credential for a single invocation. Exit code `6` (new) is reserved for
+`unauthorized`/`forbidden`.
 
 **Behavior changes worth flagging to anyone tracking this branch:**
 
 - **Config hot-reload was removed.** Earlier builds re-read `config.yaml` on file change while the
   daemon ran; as of the auth work, config is read once at process startup only
-  ([specs/03-config.md](../specs/03-config.md) §5) — a change to the file takes effect on the next
-  restart, not live.
+  ([specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §5) — a
+  change to the file takes effect on the next restart, not live.
 - **Pre-migration-list unified databases now hard-error at startup** instead of being silently
   reinitialized: a database whose schema version has no migration path gets `invalid_config`
   instructing the operator to recreate it or restore from backup, and the file is left completely
-  untouched before that error is raised ([specs/02-domain-model.md](../specs/02-domain-model.md)
+  untouched before that error is raised
+  ([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
   §9).
 
 ---

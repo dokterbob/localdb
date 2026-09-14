@@ -112,8 +112,8 @@ server reachable over Tailscale, or a NAS on your LAN.
 
 1. Start the daemon bound to an address reachable from the client machine (not just `127.0.0.1`).
    Binding to a specific non-loopback address — a Tailscale IP, a LAN IP — is a deliberate,
-   supported trust decision; see [docs/http-api.md](http-api.md#trust-model) for the full trust
-   model and how to configure it in `config.yaml`.
+   supported trust decision; see [docs/http-api.md](http-api.md#trust-model-and-authentication) for
+   the full trust model and how to configure it in `config.yaml`.
 
    ```yaml
    server:
