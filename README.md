@@ -107,10 +107,24 @@ for the detailed rundown.
 
 ## MCP hookup
 
+An MCP client is the AI app that connects to localdb to retrieve information for your conversation:
+for example, Claude Desktop, Claude Code, Codex, or LM Studio. For a local model setup, see
+[Chat with your notes locally using LM Studio](docs/lm-studio.md).
+
 `localdb mcp` exposes five read-only tools (`search`, `list_stores`, `get_document`, `get_chunks`,
 `list_documents`) over stdio, or over HTTP at `/mcp` via `localdb serve` — including from another
 machine over Tailscale/LAN. See [docs/mcp.md](docs/mcp.md) for full tool schemas, transports, and
 example calls.
+
+> **Privacy boundary:** with a local embedding provider, localdb indexes, embeds, and searches your
+> data locally, but MCP results are delivered to the MCP client. If that client uses a cloud-hosted
+> model, retrieved excerpts or full
+> documents may be sent to that provider under its data-handling policy. To minimize data exposure,
+> use a local/self-hosted model and the stdio transport, and expose only the required stores with
+> `--store`. Preventing data egress also requires independently reviewing and restricting the client's
+> outbound networking, including telemetry, cloud memory, and plugins. Store scoping reduces what the
+> client can retrieve; neither it nor stdio controls what the client does with returned data.
+> See [docs/mcp.md](docs/mcp.md#data-and-model-privacy).
 
 ## Experimental HTTP daemon
 

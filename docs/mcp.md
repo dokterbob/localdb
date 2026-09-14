@@ -1,7 +1,11 @@
 # MCP Server
 
-localdb ships an MCP server that exposes your indexed stores to any MCP-capable AI agent (Claude
-Desktop, Claude Code, custom agents). It's built on the official [`rmcp`](https://docs.rs/rmcp) SDK
+localdb ships an MCP server that exposes your indexed stores to an AI app such as Claude Desktop,
+Claude Code, Codex, or LM Studio. That app is the **MCP client**: it calls localdb's tools and passes
+the results to the model answering your questions. For a local model walkthrough, see
+[Chat with your notes locally using LM Studio](lm-studio.md).
+
+The server is built on the official [`rmcp`](https://docs.rs/rmcp) SDK
 and speaks the [MCP 2025-06-18 protocol](https://modelcontextprotocol.io/). Two transports are
 available, both serving the same five read-only tools:
 
@@ -22,6 +26,29 @@ skill-capable agent (Claude Code, Cursor, Codex, and others) can install it with
 ```bash
 npx skills add dokterbob/localdb
 ```
+
+---
+
+## Data and model privacy
+
+With a local embedding provider, localdb performs indexing, embedding, storage, and search locally.
+Hosted embedding providers send text to their configured service. MCP is an interface to the indexed
+data, not an end-to-end privacy boundary: every result returned by `search`, `get_document`, or
+`get_chunks` is handed to the MCP client. A client backed by a cloud-hosted model may transmit that
+content to its provider, regardless of whether localdb itself runs over local stdio. Retention,
+training, logging, and access policies beyond that point belong to the client and model provider;
+localdb cannot enforce them.
+
+If indexed data must not leave the machine or an approved private environment:
+
+- use an MCP client backed by a local or approved self-hosted model;
+- prefer stdio and do not expose the HTTP daemon beyond the required trust boundary;
+- use `--store` to expose only the stores needed for the task; and
+- review the client's telemetry, logging, memory, and network-egress settings independently.
+
+`--store` is data minimization, not leak prevention after a result has been returned. Likewise,
+read-only tools prevent the client from modifying localdb; they do not prevent it from reading or
+forwarding the content those tools return.
 
 ---
 
