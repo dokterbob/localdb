@@ -6,6 +6,13 @@ use crate::connection::{map_libsql_err, LibsqlDb};
 
 pub(crate) async fn grant_store(db: &LibsqlDb, grant: &StoreGrantRow) -> Result<(), Error> {
     let conn = db.writer().await;
+    grant_store_on(&conn, grant).await
+}
+
+pub(super) async fn grant_store_on(
+    conn: &libsql::Connection,
+    grant: &StoreGrantRow,
+) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO store_grants (store_name, user_id, granted_by, created_at)
          VALUES (?, ?, ?, ?)

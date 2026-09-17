@@ -349,7 +349,7 @@ async fn expired_authorization_code_is_invalid_grant() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn setup_code_bootstraps_first_admin_and_is_single_use() {
+async fn setup_code_is_retired_after_authenticated_request() {
     let (_dir, state, app) = make_enforced_app().await;
     assert_eq!(state.auth_store().count_users().await.unwrap(), 0);
     let setup_code = server::auth::generate_setup_code_if_needed(&state)
@@ -382,6 +382,17 @@ async fn setup_code_bootstraps_first_admin_and_is_single_use() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
+    let tokens = json_body(resp.into_body()).await;
+    let response = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        "/v1/auth/me",
+        None,
+        tokens["access_token"].as_str(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // Successful protected authentication retires setup, not token issuance.
     // Second use of the same setup code must not succeed.
     let (_verifier2, challenge2) = localdb_core::auth::generate_pkce_pair();
     let second = post_form(
@@ -555,5 +566,156 @@ async fn public_oauth_routes_reachable_without_bearer_but_v1_still_401() {
         v1_resp.status(),
         StatusCode::UNAUTHORIZED,
         "non-oauth /v1 routes must still require a bearer token"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_bootstrap_reuses_admin_until_credential_is_used() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let setup = server::auth::generate_setup_code_if_needed(&state)
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, challenge) = localdb_core::auth::generate_pkce_pair();
+    // Dropped callback: the first code is never exchanged.
+    do_authorize(app.clone(), REDIRECT_URI, "interrupted", &challenge, &setup).await;
+    let admin = state.auth_store().list_users().await.unwrap().remove(0);
+    let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
+    let (code, _) = do_authorize(app.clone(), REDIRECT_URI, "retry", &challenge, &setup).await;
+    assert_eq!(state.auth_store().count_users().await.unwrap(), 1);
+    let response = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // A lost token response also leaves setup recoverable.
+    assert!(state.auth().bootstrap_needed().await.unwrap());
+    let tokens = json_body(response.into_body()).await;
+    let response = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        "/v1/auth/me",
+        None,
+        tokens["access_token"].as_str(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!state.auth().bootstrap_needed().await.unwrap());
+    assert_eq!(
+        state
+            .auth_store()
+            .get_user(&admin.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        Role::Admin
+    );
+}
+
+#[tokio::test]
+async fn invalid_pkce_challenges_are_rejected_before_rendering_consent() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    for challenge in ["short".to_string(), "!".repeat(43), "a".repeat(44)] {
+        assert_eq!(
+            get(
+                app.clone(),
+                &authorize_query("state", &challenge, REDIRECT_URI)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+async fn auth_fault_connection(dir: &tempfile::TempDir) -> libsql::Connection {
+    libsql::Builder::new_local(dir.path().join("localdb.db"))
+        .build()
+        .await
+        .unwrap()
+        .connect()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn bootstrap_retries_after_code_persistence_failure_and_expiry() {
+    let (dir, state, app) = make_enforced_app().await;
+    let conn = auth_fault_connection(&dir).await;
+    let setup = server::auth::generate_setup_code_if_needed(&state)
+        .await
+        .unwrap()
+        .unwrap();
+    let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
+    let params = [
+        ("response_type", "code"),
+        ("client_id", CLIENT_ID),
+        ("redirect_uri", REDIRECT_URI),
+        ("state", "s"),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("credential", &setup),
+    ];
+    conn.execute("CREATE TRIGGER fail_code BEFORE INSERT ON auth_codes BEGIN SELECT RAISE(FAIL, 'injected'); END", ()).await.unwrap();
+    let failed = post_form(app.clone(), "/authorize", &params).await;
+    assert!(!failed.status().is_redirection());
+    conn.execute("DROP TRIGGER fail_code", ()).await.unwrap();
+    let (code, _) = do_authorize(app.clone(), REDIRECT_URI, "retry", &challenge, &setup).await;
+    conn.execute(
+        "UPDATE auth_codes SET expires_at = '2000-01-01T00:00:00Z'",
+        (),
+    )
+    .await
+    .unwrap();
+    let response = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    do_authorize(app, REDIRECT_URI, "retry-again", &challenge, &setup).await;
+    assert_eq!(state.auth_store().count_users().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn revocation_store_failure_returns_server_error_and_retry_revokes() {
+    let (dir, state, app) = make_enforced_app().await;
+    let key = seed_admin_with_key(&state, "admin").await;
+    let conn = auth_fault_connection(&dir).await;
+    conn.execute("CREATE TRIGGER fail_revoke BEFORE UPDATE OF revoked_at ON auth_tokens BEGIN SELECT RAISE(FAIL, 'private storage detail'); END", ()).await.unwrap();
+    let response = post_form(app.clone(), "/revoke", &[("token", &key)]).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body_string(response.into_body())
+        .await
+        .contains("private storage detail"));
+    assert!(state.auth().authenticate(&key).await.is_ok());
+    conn.execute("DROP TRIGGER fail_revoke", ()).await.unwrap();
+    assert_eq!(
+        post_form(app.clone(), "/revoke", &[("token", &key)])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(state.auth().authenticate(&key).await.is_err());
+    assert_eq!(
+        post_form(app, "/revoke", &[("token", "unknown")])
+            .await
+            .status(),
+        StatusCode::OK
     );
 }

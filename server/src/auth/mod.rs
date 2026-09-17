@@ -11,10 +11,7 @@ pub mod middleware;
 pub mod oauth;
 pub mod register;
 
-use localdb_core::{
-    auth::{mint_secret, AuthStore as _},
-    Error,
-};
+use localdb_core::{auth::mint_secret, Error};
 
 use crate::state::AppState;
 
@@ -67,23 +64,15 @@ pub enum AuthMode {
 /// (re)started daemon.
 pub type ServerAuthService = localdb_core::auth::AuthService<store_libsql::LibsqlAuthStore>;
 
-/// D3b bootstrap: when auth is enforced and no admin exists yet, mint a
-/// one-time setup code. Its blake3 hash is held in `AppState` (the T4 seam:
-/// `/authorize` will verify a presented code against
-/// `AppState::setup_code_hash` and mint the first admin user); the plaintext
-/// is returned so `start_daemon` can print it to stderr exactly once.
-///
-/// Finding #5: this keys off `AuthStore::admin_exists`, not "any user
-/// exists" — a first user created without `--admin` (e.g. direct `localdb
-/// user add bob`) is a `Role::Member`, and the old `count_users() > 0` check
-/// would suppress the setup code in that case, starting the daemon
-/// auth-enforced with zero admins and no way to create one via the API
-/// (every admin-management route requires an admin principal already).
+/// Issue a setup code for first-admin creation or recovery of pending setup.
+/// Only its hash lives in AppState. Restart rotates the code while the persisted
+/// pending-admin marker keeps onboarding recoverable. The caller presents the
+/// plaintext once (currently stderr; native presentation can use the same result).
 pub async fn generate_setup_code_if_needed(state: &AppState) -> Result<Option<String>, Error> {
     if state.auth_mode() != AuthMode::Enforced {
         return Ok(None);
     }
-    if state.auth_store().admin_exists().await? {
+    if !state.auth().bootstrap_needed().await? {
         return Ok(None);
     }
     let minted = mint_secret();

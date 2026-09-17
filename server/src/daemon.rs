@@ -335,6 +335,7 @@ pub fn build_router(
             "/v1/invites/requests/{id}",
             get(handlers::poll_access_request),
         )
+        .layer(middleware::from_fn(auth::middleware::protect_auth_response))
         .with_state(state);
 
     public

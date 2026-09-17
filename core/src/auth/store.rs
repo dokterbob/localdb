@@ -198,6 +198,12 @@ pub trait AuthStore: Send + Sync + 'static {
     /// auth-enforced with zero admins and no way to create one via the API
     /// (every admin-management route requires an admin principal already).
     async fn admin_exists(&self) -> Result<bool, Error>;
+    /// Pending first-admin setup; absence never implies an established admin needs recovery.
+    async fn pending_bootstrap_user(&self) -> Result<Option<UserRow>, Error>;
+    /// Atomically reuse the pending admin or create the first admin and its recovery marker.
+    /// Reject when an established admin already exists.
+    async fn begin_bootstrap(&self, user: &UserRow) -> Result<UserRow, Error>;
+    async fn complete_bootstrap(&self, user_id: &str) -> Result<(), Error>;
     /// Atomically delete `id` unless it is currently the *sole* admin (D7's
     /// last-admin lockout guard): a single conditional `DELETE ... WHERE id
     /// = ? AND (role <> 'admin' OR (admin count) > 1)`, so two concurrent
@@ -221,6 +227,14 @@ pub trait AuthStore: Send + Sync + 'static {
     // Tokens
     // ------------------------------------------------------------------
     async fn insert_token(&self, token: &AuthTokenRow) -> Result<(), Error>;
+    /// Consume the old refresh token and insert both replacements atomically.
+    /// False means the token is no longer eligible; errors leave all three rows unchanged.
+    async fn rotate_tokens(
+        &self,
+        old_id: &str,
+        access: &AuthTokenRow,
+        refresh: &AuthTokenRow,
+    ) -> Result<bool, Error>;
     async fn find_token_by_hash(&self, secret_hash: &str) -> Result<Option<AuthTokenRow>, Error>;
     /// Look up a token by its own ID (not its secret hash) — used by
     /// `DELETE /v1/keys/{id}` to resolve the owning user before checking
@@ -269,9 +283,9 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn revoke_invite(&self, id: &str) -> Result<bool, Error>;
     /// Atomically reserve one use against `max_uses` (T6, D9): the
     /// conditional update `UPDATE invites SET uses = uses + 1 WHERE id = ?
-    /// AND uses < max_uses`. Returns `true` iff this call reserved a slot
+    /// AND uses < max_uses AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)`. Returns `true` iff this call reserved a slot
     /// (mirrors `consume_auth_code`'s "consume iff eligible" convention);
-    /// `false` means the invite has no remaining uses.
+    /// `false` means the invite is no longer eligible.
     ///
     /// `AuthService::redeem_invite` calls this to RESERVE a use *before*
     /// attempting the mint (user-create / access-request-file) — the atomic
@@ -285,6 +299,13 @@ pub trait AuthStore: Send + Sync + 'static {
     /// zero).
     async fn release_invite_use(&self, id: &str) -> Result<(), Error>;
 
+    /// Create the user, apply grants, and approve a still-pending request in one transaction.
+    async fn approve_access_request(
+        &self,
+        id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+    ) -> Result<bool, Error>;
     async fn create_access_request(&self, req: &AccessRequestRow) -> Result<(), Error>;
     async fn find_access_request(&self, id: &str) -> Result<Option<AccessRequestRow>, Error>;
     async fn list_access_requests_for_invite(

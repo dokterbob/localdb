@@ -1,0 +1,40 @@
+<p id="request-status" role="status">Waiting for an administrator to approve your access…</p>
+<button id="retry" type="button" hidden>Retry</button>
+<noscript>Enable JavaScript to check approval and finish signing in.</noscript>
+<script>
+(() => {
+  const status = document.getElementById('request-status');
+  const retry = document.getElementById('retry');
+  const form = document.querySelector('form');
+  const { requestId, requestSecret } = document.body.dataset;
+  const url = window.location.pathname.replace(/\/authorize$/, '/v1/invites/requests/') + encodeURIComponent(requestId) + '?secret=' + encodeURIComponent(requestSecret);
+  async function poll() {
+    retry.hidden = true;
+    try {
+      const response = await fetch(url, { cache: 'no-store', referrerPolicy: 'no-referrer' });
+      if (!response.ok) throw new Error('Could not check approval. Please retry.');
+      const result = await response.json();
+      if (result.state === 'pending') {
+        status.textContent = 'Waiting for an administrator to approve your access…';
+        setTimeout(poll, 1000);
+      } else if (result.state === 'approved' && result.api_key) {
+        status.textContent = 'Approved. Finishing sign-in…';
+        form.elements.credential.value = result.api_key;
+        form.submit();
+      } else if (result.state === 'denied') {
+        status.textContent = 'Your access request was declined. Contact your administrator.';
+      } else if (result.state === 'collected') {
+        status.textContent = 'This request has already been collected. Use your existing credential to sign in.';
+      } else {
+        throw new Error('Unexpected approval response. Please retry.');
+      }
+    } catch (error) {
+      status.textContent = error.message;
+      retry.hidden = false;
+    }
+  }
+  retry.addEventListener('click', poll);
+  poll();
+})();
+</script>
+</body>

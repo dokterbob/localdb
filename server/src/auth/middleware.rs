@@ -47,6 +47,19 @@ use crate::{error::ApiError, state::AppState};
 
 use super::{base_url::resolve_base_url, AuthMode};
 
+/// OAuth and invite responses can contain credentials, codes, or poll secrets.
+pub async fn protect_auth_response(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 /// Extract the bearer secret from an `Authorization` header value.
 ///
 /// Scheme matching is case-insensitive per RFC 7235; surrounding whitespace
@@ -91,6 +104,9 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
                     return response;
                 }
             };
+            if let Err(error) = state.auth().complete_bootstrap(&principal).await {
+                return ApiError(error).into_response();
+            }
             // T5: no wholesale role gate here — every authenticated
             // principal passes; per-resource authorization (store-grant
             // scoping, admin-only management routes) is enforced by the

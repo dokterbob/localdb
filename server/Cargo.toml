@@ -50,6 +50,7 @@ url = { workspace = true }
 notify-debouncer-mini = "0.4"
 
 [dev-dependencies]
+libsql = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

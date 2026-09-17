@@ -503,3 +503,21 @@ async fn validate_client_redirect_uri_builtin_keeps_loopback_any_port() {
         .await
         .unwrap());
 }
+
+#[tokio::test]
+async fn failed_rotation_keeps_original_refresh_usable() {
+    let svc = service();
+    let user = svc.create_user("rotation", Role::Member).await.unwrap();
+    let refresh = svc.issue_refresh_token(&user.id).await.unwrap();
+    svc.store.poison_next_insert_token().await;
+    assert!(svc.rotate_refresh_token(&refresh.secret).await.is_err());
+    assert_eq!(
+        svc.store
+            .list_tokens_for_user(&user.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(svc.rotate_refresh_token(&refresh.secret).await.is_ok());
+}

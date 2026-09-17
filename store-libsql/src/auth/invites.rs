@@ -101,7 +101,7 @@ pub(crate) async fn revoke_invite(
     Ok(n > 0)
 }
 
-/// Atomic "reserve a use iff one remains" (mirrors `mark_access_request_collected`'s
+/// Atomic "reserve a use iff eligible and one remains" (mirrors `mark_access_request_collected`'s
 /// and `consume_auth_code`'s single-condition-in-the-WHERE-clause convention):
 /// a single UPDATE with the eligibility check baked into the WHERE clause, so
 /// concurrent callers racing the same invite can never together push `uses`
@@ -110,8 +110,8 @@ pub(crate) async fn try_consume_invite_use(db: &LibsqlDb, id: &str) -> Result<bo
     let conn = db.writer().await;
     let n = conn
         .execute(
-            "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses",
-            libsql::params![id.to_string()],
+            "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+            libsql::params![id.to_string(), localdb_core::auth::rfc3339_from_now(0)],
         )
         .await
         .map_err(map_libsql_err)?;

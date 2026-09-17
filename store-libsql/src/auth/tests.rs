@@ -79,3 +79,5 @@ mod grants;
 mod invites;
 mod tokens;
 mod users;
+
+mod atomic;

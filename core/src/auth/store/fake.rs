@@ -2,6 +2,7 @@ use super::*;
 #[derive(Default)]
 struct FakeAuthStoreInner {
     users: Vec<UserRow>,
+    pending_bootstrap: Option<String>,
     tokens: Vec<AuthTokenRow>,
     auth_codes: Vec<AuthCodeRow>,
     oauth_clients: Vec<OAuthClientRow>,
@@ -109,6 +110,9 @@ fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
     inner.users.retain(|u| u.id != id);
     let deleted = inner.users.len() != before;
     if deleted {
+        if inner.pending_bootstrap.as_deref() == Some(id) {
+            inner.pending_bootstrap = None;
+        }
         inner.tokens.retain(|t| t.user_id != id);
         inner.grants.retain(|g| g.user_id != id);
         for r in inner.access_requests.iter_mut() {
@@ -122,6 +126,104 @@ fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
 
 #[async_trait]
 impl AuthStore for FakeAuthStore {
+    async fn pending_bootstrap_user(&self) -> Result<Option<UserRow>, Error> {
+        let inner = self.inner.read().await;
+        Ok(inner
+            .users
+            .iter()
+            .find(|u| Some(&u.id) == inner.pending_bootstrap.as_ref() && u.role == Role::Admin)
+            .cloned())
+    }
+    async fn begin_bootstrap(&self, user: &UserRow) -> Result<UserRow, Error> {
+        let mut inner = self.inner.write().await;
+        if let Some(pending) = inner
+            .users
+            .iter()
+            .find(|u| Some(&u.id) == inner.pending_bootstrap.as_ref() && u.role == Role::Admin)
+        {
+            return Ok(pending.clone());
+        }
+        if inner.users.iter().any(|u| u.role == Role::Admin) {
+            return Err(Error::Unauthorized {
+                message: "setup is already complete".into(),
+            });
+        }
+        if inner.users.iter().any(|u| u.name == user.name) {
+            return Err(Error::InvalidRequest {
+                message: format!("user '{}' already exists", user.name),
+            });
+        }
+        inner.users.push(user.clone());
+        inner.pending_bootstrap = Some(user.id.clone());
+        Ok(user.clone())
+    }
+    async fn complete_bootstrap(&self, user_id: &str) -> Result<(), Error> {
+        let mut inner = self.inner.write().await;
+        if inner.pending_bootstrap.as_deref() == Some(user_id) {
+            inner.pending_bootstrap = None;
+        }
+        Ok(())
+    }
+    async fn rotate_tokens(
+        &self,
+        old_id: &str,
+        access: &AuthTokenRow,
+        refresh: &AuthTokenRow,
+    ) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        if inner.poisoned_revokes.remove(old_id) {
+            return Ok(false);
+        }
+        let Some(index) = inner.tokens.iter().position(|t| {
+            t.id == old_id
+                && t.kind == TokenKind::Refresh
+                && t.revoked_at.is_none()
+                && !t.expires_at.as_deref().is_some_and(crate::auth::is_expired)
+        }) else {
+            return Ok(false);
+        };
+        if inner.poison_next_insert_token {
+            inner.poison_next_insert_token = false;
+            return Err(Error::Internal {
+                message: "simulated token insert failure".into(),
+                correlation_id: "fake_rotate_tokens".into(),
+            });
+        }
+        inner.tokens[index].revoked_at = Some(crate::auth::rfc3339_from_now(0));
+        inner.tokens.extend([refresh.clone(), access.clone()]);
+        Ok(true)
+    }
+    async fn approve_access_request(
+        &self,
+        id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+    ) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        if inner.poisoned_decides.remove(id) {
+            return Ok(false);
+        }
+        let Some(index) = inner
+            .access_requests
+            .iter()
+            .position(|r| r.id == id && r.state == AccessRequestState::Pending)
+        else {
+            return Ok(false);
+        };
+        if inner.users.iter().any(|u| u.name == user.name) {
+            return Err(Error::InvalidRequest {
+                message: format!("user '{}' already exists", user.name),
+            });
+        }
+        inner.users.push(user.clone());
+        inner.grants.extend_from_slice(grants);
+        let request = &mut inner.access_requests[index];
+        request.state = AccessRequestState::Approved;
+        request.resulting_user_id = Some(user.id.clone());
+        request.decided_at = Some(user.created_at.clone());
+        Ok(true)
+    }
+
     async fn create_user(&self, user: &UserRow) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
         if inner.users.iter().any(|u| u.name == user.name) {
@@ -437,7 +539,11 @@ impl AuthStore for FakeAuthStore {
     async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
         match inner.invites.iter_mut().find(|i| i.id == id) {
-            Some(i) if i.uses < i.max_uses => {
+            Some(i)
+                if i.uses < i.max_uses
+                    && i.revoked_at.is_none()
+                    && !i.expires_at.as_deref().is_some_and(crate::auth::is_expired) =>
+            {
                 i.uses += 1;
                 Ok(true)
             }

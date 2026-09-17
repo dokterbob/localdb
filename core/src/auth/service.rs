@@ -59,6 +59,32 @@ impl<S: AuthStore> AuthService<S> {
         Self { store }
     }
 
+    /// Whether a presentation layer should offer initial setup or resume interrupted setup.
+    pub async fn bootstrap_needed(&self) -> Result<bool, Error> {
+        Ok(self.store.pending_bootstrap_user().await?.is_some()
+            || !self.store.admin_exists().await?)
+    }
+
+    /// Called only after the presentation layer verifies its local setup code.
+    pub async fn begin_bootstrap(&self) -> Result<UserRow, Error> {
+        self.store
+            .begin_bootstrap(&UserRow {
+                id: new_ulid(),
+                name: "admin".into(),
+                role: Role::Admin,
+                created_at: now_rfc3339(),
+            })
+            .await
+    }
+
+    /// An authenticated protected request proves the bootstrap credential was received.
+    pub async fn complete_bootstrap(&self, principal: &Principal) -> Result<(), Error> {
+        if principal.role == Role::Admin {
+            self.store.complete_bootstrap(&principal.user_id).await?;
+        }
+        Ok(())
+    }
+
     /// Create a new user. No passwords (D1) — callers mint a token
     /// (`issue_api_key` / `issue_access_token`) separately.
     pub async fn create_user(&self, name: &str, role: Role) -> Result<UserRow, Error> {
@@ -117,6 +143,18 @@ impl<S: AuthStore> AuthService<S> {
         family_id: Option<String>,
         rotated_from: Option<String>,
     ) -> Result<IssuedToken, Error> {
+        let issued = Self::prepare_token(user_id, kind, expires_at, family_id, rotated_from);
+        self.store.insert_token(&issued.row).await?;
+        Ok(issued)
+    }
+
+    fn prepare_token(
+        user_id: &str,
+        kind: TokenKind,
+        expires_at: Option<String>,
+        family_id: Option<String>,
+        rotated_from: Option<String>,
+    ) -> IssuedToken {
         let minted = mint_secret();
         let row = AuthTokenRow {
             id: new_ulid(),
@@ -130,11 +168,10 @@ impl<S: AuthStore> AuthService<S> {
             family_id,
             rotated_from,
         };
-        self.store.insert_token(&row).await?;
-        Ok(IssuedToken {
+        IssuedToken {
             row,
             secret: minted.secret,
-        })
+        }
     }
 
     /// Resolve a bearer secret to a `Principal`: validates the hash,
@@ -252,34 +289,31 @@ impl<S: AuthStore> AuthService<S> {
             }
         }
 
-        // `revoke_token` is an atomic "revoke iff not already revoked"
-        // conditional update. If it returns `false`, we lost a race against
-        // another concurrent rotation of this same refresh token — that
-        // other caller already rotated it away, so minting a fresh pair
-        // here too would produce two live refresh tokens in the same
-        // family, defeating reuse detection. Treat this exactly like the
-        // reuse-of-an-already-rotated-token branch above: burn the whole
-        // family and fail closed.
-        if !self.store.revoke_token(&token.id).await? {
-            if let Some(family) = &token.family_id {
-                self.store.revoke_token_family(family).await?;
-            }
+        let family = token.family_id.clone().unwrap_or_else(new_ulid);
+        let new_refresh = Self::prepare_token(
+            &token.user_id,
+            TokenKind::Refresh,
+            Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
+            Some(family.clone()),
+            Some(token.id.clone()),
+        );
+        let new_access = Self::prepare_token(
+            &token.user_id,
+            TokenKind::Access,
+            Some(rfc3339_from_now(ACCESS_TOKEN_TTL_SECS)),
+            None,
+            None,
+        );
+        if !self
+            .store
+            .rotate_tokens(&token.id, &new_access.row, &new_refresh.row)
+            .await?
+        {
+            self.store.revoke_token_family(&family).await?;
             return Err(Error::Unauthorized {
-                message: "refresh token reuse detected; session revoked".to_string(),
+                message: "refresh token reuse detected; session revoked".into(),
             });
         }
-
-        let family = token.family_id.clone().unwrap_or_else(new_ulid);
-        let new_refresh = self
-            .issue_token(
-                &token.user_id,
-                TokenKind::Refresh,
-                Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
-                Some(family),
-                Some(token.id.clone()),
-            )
-            .await?;
-        let new_access = self.issue_access_token(&token.user_id).await?;
 
         Ok((new_access, new_refresh))
     }

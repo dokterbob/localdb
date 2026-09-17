@@ -6,6 +6,10 @@ use crate::connection::{map_libsql_err, LibsqlDb};
 
 pub(crate) async fn create_user(db: &LibsqlDb, user: &UserRow) -> Result<(), Error> {
     let conn = db.writer().await;
+    create_user_on(&conn, user).await
+}
+
+pub(super) async fn create_user_on(conn: &libsql::Connection, user: &UserRow) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO users (id, name, role, created_at) VALUES (?, ?, ?, ?)",
         libsql::params![

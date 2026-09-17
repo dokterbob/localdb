@@ -22,7 +22,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use localdb_core::auth::{self, AuthStore as _, RedeemOutcome, Role};
+use localdb_core::auth::{self, RedeemOutcome};
 use localdb_core::Error as CoreError;
 
 use crate::state::AppState;
@@ -153,8 +153,13 @@ async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
         ));
     }
     let code_challenge = code_challenge
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| OAuthError::new("invalid_request", "code_challenge is required"))?;
+        .filter(|s| auth::valid_pkce_challenge(s))
+        .ok_or_else(|| {
+            OAuthError::new(
+                "invalid_request",
+                "code_challenge must be a base64url S256 digest",
+            )
+        })?;
 
     Ok(ValidParams {
         client_id: client_id.to_string(),
@@ -238,7 +243,7 @@ button {{ margin-top: 20px; padding: 8px 20px; font-size: 1rem; }}
 <h1>Authorize &ldquo;{client_id}&rdquo;</h1>
 <p>This application is requesting access to your localdb data.</p>
 {error_html}
-<form method="post" action="/authorize">
+<form method="post" action="">
 <input type="hidden" name="response_type" value="code">
 <input type="hidden" name="client_id" value="{client_id}">
 <input type="hidden" name="redirect_uri" value="{redirect_uri}">
@@ -253,23 +258,23 @@ button {{ margin-top: 20px; padding: 8px 20px; font-size: 1rem; }}
     ))
 }
 
-/// The closed-mode invite consent-page landing page (T6): no OAuth code is
-/// issued here (the CLI's poll loop, not the browser, drives closed-mode
-/// approval — see `cli::cmds::login`'s doc comment for why that path is
-/// primary). This is deliberately a static, unparameterized page: the
-/// request id/secret already went to the requester in the JSON-API path;
-/// there is nothing untrusted to interpolate here, so no escaping is
-/// needed.
-fn render_request_submitted_page() -> Html<String> {
+/// The browser uses the same collection endpoint as CLI login, then resumes
+/// the original authorization with the new credential (no second invite redemption).
+fn render_request_submitted_page(
+    params: &ValidParams,
+    request_id: &str,
+    request_secret: &str,
+) -> Html<String> {
+    let page = render_consent_page(params, "", None, None).0;
+    let body = format!(
+        "<body data-request-id=\"{}\" data-request-secret=\"{}\">",
+        escape_html(request_id),
+        escape_html(request_secret)
+    );
     Html(
-        r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>Request submitted</title>
-<style>body { font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; }</style>
-</head><body>
-<h1>Request submitted</h1>
-<p>Your access request has been submitted. An administrator needs to approve it before you can sign in — ask them to run <code>localdb invite approve</code>, then try again.</p>
-</body></html>"#
-            .to_string(),
+        page.replace("<body>", &body)
+            .replace("<form method=", "<form hidden method=")
+            .replace("</body>", include_str!("invite_wait.html")),
     )
 }
 
@@ -387,7 +392,10 @@ async fn handle_invite_authorize(
         Ok(RedeemOutcome::Open { user, .. }) => {
             issue_code_and_continue(state, params, &user.id).await
         }
-        Ok(RedeemOutcome::Closed { .. }) => render_request_submitted_page().into_response(),
+        Ok(RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        }) => render_request_submitted_page(params, &request_id, &request_secret).into_response(),
         Err(e) => render_consent_page(params, "", Some(invite_token), Some(&e.to_string()))
             .into_response(),
     }
@@ -463,35 +471,13 @@ code {{ font-size: 1.1rem; user-select: all; background: #f0f0f0; padding: 4px 8
 /// *new* user the way the setup code identifies the *first* one.
 async fn resolve_credential(state: &AppState, credential: &str) -> Result<String, String> {
     let presented_hash = auth::hash_secret(credential);
-    if state.consume_setup_code_if_matches(&presented_hash) {
-        // Defense in depth: the setup code is only minted at startup when
-        // no admin exists yet (`AuthStore::admin_exists`, finding #5), but
-        // an admin could have been created via a different path (break-glass
-        // CLI, or a concurrent redemption) since then. Guard again here so
-        // the bootstrap path can never create a second implicit admin.
-        //
-        // This deliberately checks `admin_exists`, not "any user exists":
-        // finding #5's whole point is that a first user created without
-        // `--admin` (a plain `Role::Member`) must NOT block the setup code
-        // from minting the first *admin* — checking `count_users() > 0`
-        // here would immediately re-break that fix by rejecting the very
-        // code just minted for that scenario.
-        let admin_already_exists = state
-            .auth_store()
-            .admin_exists()
-            .await
-            .map_err(|e| e.to_string())?;
-        if admin_already_exists {
-            return Err(
-                "setup code is no longer valid; an admin account already exists".to_string(),
-            );
-        }
-        let user = state
+    if state.setup_code_hash().as_deref() == Some(&presented_hash) {
+        return state
             .auth()
-            .create_user("admin", Role::Admin)
+            .begin_bootstrap()
             .await
-            .map_err(|e| e.to_string())?;
-        return Ok(user.id);
+            .map(|user| user.id)
+            .map_err(|e| e.to_string());
     }
 
     match state.auth().authenticate(credential).await {
@@ -704,11 +690,14 @@ pub struct RevokeForm {
     pub token_type_hint: Option<String>,
 }
 
-/// `POST /revoke` — always `200`, even for an unknown token (RFC 7009 §2.2:
-/// revocation must never leak whether a presented token existed).
+/// `POST /revoke` — `200` for unknown/already revoked tokens (RFC 7009 §2.2:
+/// revocation must never leak whether a presented token existed). Storage failures
+/// return a generic server error so clients can retry rather than forget a live token.
 pub async fn post_revoke(State(state): State<AppState>, Form(form): Form<RevokeForm>) -> Response {
     if let Some(token) = form.token.filter(|t| !t.is_empty()) {
-        let _ = state.auth().revoke_by_secret(&token).await;
+        if let Err(error) = state.auth().revoke_by_secret(&token).await {
+            return token_error_for_failure(error, "revocation failed; retry the request");
+        }
     }
     StatusCode::OK.into_response()
 }

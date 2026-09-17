@@ -178,7 +178,7 @@ async fn validate_authorize_params_happy_path() {
         Some("localdb-cli"),
         Some("http://127.0.0.1:1234/callback"),
         Some("xyz"),
-        Some("challenge-value"),
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
         Some("S256"),
     )
     .await
@@ -196,7 +196,7 @@ async fn validate_authorize_params_rejects_bad_redirect_uri() {
         Some("localdb-cli"),
         Some("http://evil.example.com/callback"),
         None,
-        Some("c"),
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
         Some("S256"),
     )
     .await
@@ -230,7 +230,7 @@ async fn validate_authorize_params_rejects_plain_challenge_method() {
         Some("localdb-cli"),
         Some("http://127.0.0.1:1/callback"),
         None,
-        Some("c"),
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
         Some("plain"),
     )
     .await
@@ -247,7 +247,7 @@ async fn validate_authorize_params_rejects_unknown_client() {
         Some("some-other-client"),
         Some("http://127.0.0.1:1/callback"),
         None,
-        Some("c"),
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
         Some("S256"),
     )
     .await
@@ -268,7 +268,7 @@ async fn validate_authorize_params_accepts_registered_client_exact_redirect() {
         Some(&row.id),
         Some("https://app.example.com/cb"),
         None,
-        Some("c"),
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
         Some("S256"),
     )
     .await
@@ -292,7 +292,7 @@ async fn validate_authorize_params_rejects_registered_client_mismatched_redirect
         Some(&row.id),
         Some("https://app.example.com/other-path"),
         None,
-        Some("c"),
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
         Some("S256"),
     )
     .await

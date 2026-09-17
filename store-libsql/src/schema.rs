@@ -29,6 +29,7 @@ pub async fn create_schema(
     create_sync_state(conn).await?;
     create_credentials(conn).await?;
     create_auth_tables(conn).await?;
+    conn.execute("CREATE TABLE IF NOT EXISTS pending_bootstrap (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE)", ()).await?;
     Ok(())
 }
 

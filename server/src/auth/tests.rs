@@ -96,3 +96,49 @@ async fn setup_code_not_generated_in_open_mode() {
     assert!(code.is_none(), "open mode must not mint a setup code");
     assert!(state.setup_code_hash().is_none());
 }
+
+#[tokio::test]
+async fn pending_bootstrap_survives_restart_and_rotates_setup_code() {
+    let (_dir, state) = make_state(AuthMode::Enforced).await;
+    let first_code = generate_setup_code_if_needed(&state)
+        .await
+        .unwrap()
+        .unwrap();
+    let admin = state.auth().begin_bootstrap().await.unwrap();
+    // A new AppState uses the same persisted data but no in-memory setup hash.
+    let queue = crate::job_queue::JobQueue::new();
+    let mut config = RawConfig::default();
+    config.defaults.indexing.embedding.provider = "fake".into();
+    config.defaults.indexing.embedding.model = "default".into();
+    let restarted = AppState::new(
+        config,
+        _dir.path().to_path_buf(),
+        _dir.path().join("models"),
+        queue.clone(),
+        crate::scheduler::UrlRefreshScheduler::new(queue),
+        AuthMode::Enforced,
+    )
+    .await
+    .unwrap();
+    let new_code = generate_setup_code_if_needed(&restarted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first_code, new_code);
+    assert_eq!(restarted.setup_code_hash(), Some(hash_secret(&new_code)));
+    assert_eq!(
+        restarted.auth().begin_bootstrap().await.unwrap().id,
+        admin.id
+    );
+    let token = restarted.auth().issue_api_key(&admin.id).await.unwrap();
+    let principal = restarted.auth().authenticate(&token.secret).await.unwrap();
+    restarted
+        .auth()
+        .complete_bootstrap(&principal)
+        .await
+        .unwrap();
+    assert!(generate_setup_code_if_needed(&restarted)
+        .await
+        .unwrap()
+        .is_none());
+}

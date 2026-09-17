@@ -58,8 +58,23 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
 /// PKCE S256 verification (RFC 7636 §4.6): `challenge` must equal
 /// base64url(no-pad)(SHA-256(verifier)).
 pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
+    if !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-._~".contains(&c))
+    {
+        return false;
+    }
     let digest = Sha256::digest(verifier.as_bytes());
-    base64url_encode(&digest) == challenge
+    valid_pkce_challenge(challenge) && base64url_encode(&digest) == challenge
+}
+
+/// Unpadded base64url encoding of a 32-byte S256 digest.
+pub fn valid_pkce_challenge(challenge: &str) -> bool {
+    challenge.len() == 43
+        && challenge
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
 }
 
 /// Generate a fresh PKCE (RFC 7636) verifier/challenge pair: `verifier` is

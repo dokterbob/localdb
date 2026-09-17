@@ -572,7 +572,10 @@ fn authorize_query(invite_token: &str) -> String {
         ("client_id", CLIENT_ID),
         ("redirect_uri", REDIRECT_URI),
         ("state", "xyz"),
-        ("code_challenge", "challenge-value"),
+        (
+            "code_challenge",
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        ),
         ("code_challenge_method", "S256"),
         ("invite", invite_token),
     ])
@@ -611,7 +614,10 @@ async fn consent_page_open_invite_issues_oauth_code_as_new_user() {
             ("client_id", CLIENT_ID),
             ("redirect_uri", REDIRECT_URI),
             ("state", "xyz"),
-            ("code_challenge", "challenge-value"),
+            (
+                "code_challenge",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            ),
             ("code_challenge_method", "S256"),
             ("invite", &token),
             ("requested_name", "browser-newbie"),
@@ -666,7 +672,10 @@ async fn consent_page_closed_invite_shows_request_submitted_page() {
             ("client_id", CLIENT_ID),
             ("redirect_uri", REDIRECT_URI),
             ("state", "xyz"),
-            ("code_challenge", "challenge-value"),
+            (
+                "code_challenge",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            ),
             ("code_challenge_method", "S256"),
             ("invite", &token),
             ("requested_name", "closed-requester"),
@@ -679,7 +688,9 @@ async fn consent_page_closed_invite_shows_request_submitted_page() {
         "closed-mode invite must render a page, not redirect"
     );
     let html = body_string(resp.into_body()).await;
-    assert!(html.contains("Request submitted"));
+    assert!(html.contains("Waiting for an administrator"));
+    assert!(html.contains("data-request-secret="));
+    assert!(html.contains("form.submit()"));
 
     // No user was created and no OAuth code issued.
     let user = state
@@ -707,4 +718,94 @@ async fn consent_page_escapes_hostile_invite_token() {
         "hostile invite token must be HTML-escaped: {html}"
     );
     assert!(html.contains("&lt;script&gt;"));
+}
+
+#[tokio::test]
+async fn browser_closed_invite_retains_secret_and_resumes_original_oauth_flow() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin", Role::Admin).await;
+    let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
+    let token = created["token"].as_str().unwrap();
+    let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
+    let response = post_form(
+        app.clone(),
+        "/authorize",
+        &[
+            ("response_type", "code"),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", REDIRECT_URI),
+            ("state", "original-state"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("invite", token),
+            ("requested_name", "browser-reader"),
+        ],
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    let html = body_string(response.into_body()).await;
+    let attr = |name: &str| {
+        html.split(&format!("{name}=\""))
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let request_id = attr("data-request-id");
+    let secret = attr("data-request-secret");
+    assert!(html.contains("original-state"));
+    assert!(matches!(
+        state
+            .auth()
+            .poll_request(&request_id, &secret)
+            .await
+            .unwrap(),
+        localdb_core::auth::PollOutcome::Pending
+    ));
+    state.auth().approve_request(&request_id).await.unwrap();
+    let poll = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/invites/requests/{request_id}?secret={secret}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let credential = json_body(poll.into_body()).await;
+    let response = post_form(
+        app.clone(),
+        "/authorize",
+        &[
+            ("response_type", "code"),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", REDIRECT_URI),
+            ("state", "original-state"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("credential", credential["api_key"].as_str().unwrap()),
+        ],
+    )
+    .await;
+    let redirect = url::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+    let pairs: std::collections::HashMap<_, _> = redirect.query_pairs().into_owned().collect();
+    assert_eq!(pairs["state"], "original-state");
+    let response = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &pairs["code"]),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.auth_store().list_users().await.unwrap().len(), 2);
 }

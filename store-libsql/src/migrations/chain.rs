@@ -434,6 +434,16 @@ pub fn migrations() -> Vec<Migration> {
             down: Down::Sql(add_access_requests_collected_at_column_down),
             needs_reindex: false,
         },
+        Migration {
+            version: BASELINE_VERSION + 7,
+            name: "add_pending_bootstrap",
+            summary: "retain interrupted first-admin setup for recovery",
+            up: Up::Sql(|_| {
+                vec!["CREATE TABLE IF NOT EXISTS pending_bootstrap (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE)".into()]
+            }),
+            down: Down::Sql(|_| vec!["DROP TABLE pending_bootstrap".into()]),
+            needs_reindex: false,
+        },
     ]
 }
 

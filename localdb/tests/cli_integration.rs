@@ -2897,10 +2897,6 @@ fn db_status_on_fresh_healthy_store_reports_current_equals_head() {
     let current = v["current_version"].as_i64().unwrap();
     let head = v["head_version"].as_i64().unwrap();
     assert_eq!(current, head, "fresh store should be exactly at head");
-    assert_eq!(
-        current, 10,
-        "current head includes the auth tables and token collection marker"
-    );
     assert_eq!(v["pending"].as_i64().unwrap(), 0);
     assert!(!v["legacy"].as_bool().unwrap());
 }

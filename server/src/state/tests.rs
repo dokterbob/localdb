@@ -7,5 +7,3 @@ mod feed_sources;
 mod fetcher_cache;
 mod refresh_scheduling;
 mod stores_and_sources;
-
-mod auth;

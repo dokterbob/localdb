@@ -34,6 +34,18 @@ impl<S: AuthStore> AuthService<S> {
                 });
             }
         }
+        let expires_at = expires_at
+            .map(|value| {
+                chrono::DateTime::parse_from_rfc3339(&value)
+                    .map(|time| {
+                        time.with_timezone(&chrono::Utc)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    })
+                    .map_err(|_| Error::InvalidRequest {
+                        message: "expires_at must be an RFC 3339 timestamp".into(),
+                    })
+            })
+            .transpose()?;
         let minted = mint_secret();
         let row = InviteRow {
             id: new_ulid(),
@@ -58,16 +70,22 @@ impl<S: AuthStore> AuthService<S> {
     /// of the invite's own creator (`invite.created_by`) — shared by the
     /// `open`-mode immediate path (`redeem_invite`) and the `closed`-mode
     /// approval path (`approve_request`).
+    fn invite_grants(invite: &InviteRow, user_id: &str) -> Vec<StoreGrantRow> {
+        invite
+            .store_grants
+            .iter()
+            .map(|name| StoreGrantRow {
+                store_name: name.clone(),
+                user_id: user_id.to_string(),
+                granted_by: invite.created_by.clone(),
+                created_at: now_rfc3339(),
+            })
+            .collect()
+    }
+
     async fn apply_invite_grants(&self, invite: &InviteRow, user_id: &str) -> Result<(), Error> {
-        for store_name in &invite.store_grants {
-            self.store
-                .grant_store(&StoreGrantRow {
-                    store_name: store_name.clone(),
-                    user_id: user_id.to_string(),
-                    granted_by: invite.created_by.clone(),
-                    created_at: now_rfc3339(),
-                })
-                .await?;
+        for grant in Self::invite_grants(invite, user_id) {
+            self.store.grant_store(&grant).await?;
         }
         Ok(())
     }
@@ -249,24 +267,8 @@ impl<S: AuthStore> AuthService<S> {
     /// it, so the durable credential is born only once someone has actually
     /// picked it up — never merely by an admin approving in the abstract.
     ///
-    /// **Concurrency (finding #4 fix):** the initial `state != Pending`
-    /// check above is only a fast-path rejection — it cannot by itself
-    /// prevent two concurrent decisions (an `approve_request` racing a
-    /// `deny_request`, or either racing a duplicate call) from both passing
-    /// the check and then both writing. The actual guard is
-    /// `AuthStore::try_decide_access_request`, an atomic `UPDATE ... WHERE
-    /// state = 'pending'` performed *after* the user has been created and
-    /// granted: whichever caller's conditional update lands first wins the
-    /// decision, and the loser's `try_decide_access_request` reports
-    /// `false`. Because the user is created *before* claiming the decision
-    /// (there is no way to know its id otherwise), a losing `approve_request`
-    /// would otherwise leave a real user with live grants attached to a
-    /// request that ended up `denied` — so on `false` we best-effort
-    /// compensating-delete the user we just created (mirroring
-    /// `mint_open_invite_redemption`'s finding #6 cleanup) before surfacing
-    /// the conflict. This guarantees a denied request can never have a live
-    /// resulting user, and exactly one of a racing approve/deny pair takes
-    /// effect.
+    /// User creation, grants, and the conditional decision commit together.
+    /// A failed grant or a concurrent decision leaves no partial user behind.
     pub async fn approve_request(&self, request_id: &str) -> Result<UserRow, Error> {
         let request = self
             .store
@@ -293,29 +295,18 @@ impl<S: AuthStore> AuthService<S> {
                 correlation_id: "approve_request_missing_invite".to_string(),
             })?;
 
-        let user = self
-            .create_user(&request.requested_name, Role::Member)
-            .await?;
-        self.apply_invite_grants(&invite, &user.id).await?;
-
-        let decided = self
+        let user = UserRow {
+            id: new_ulid(),
+            name: request.requested_name.clone(),
+            role: Role::Member,
+            created_at: now_rfc3339(),
+        };
+        let grants = Self::invite_grants(&invite, &user.id);
+        if !self
             .store
-            .try_decide_access_request(
-                request_id,
-                AccessRequestState::Approved,
-                Some(&user.id),
-                &now_rfc3339(),
-            )
-            .await?;
-        if !decided {
-            // Lost the race: a concurrent approve/deny already decided this
-            // request first. Don't leave the user we just created (with
-            // grants already applied) dangling off a request that isn't
-            // `approved` — best-effort delete it, then surface the
-            // conflict. `self.store.delete_user` (not `self.delete_user`)
-            // is deliberate: this is a fresh `Role::Member` row, never
-            // subject to the last-admin guard.
-            let _ = self.store.delete_user(&user.id).await;
+            .approve_access_request(request_id, &user, &grants)
+            .await?
+        {
             return Err(Error::InvalidRequest {
                 message: format!("access request '{request_id}' is no longer pending"),
             });

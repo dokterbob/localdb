@@ -33,6 +33,7 @@ indicatif = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
 webbrowser = "1"
+fs2 = "0.4"
 percent-encoding = { workspace = true }
 # `bytes_stream()` on a `reqwest::Response` yields a `futures_util::Stream`
 # (re-exported by `futures`, already a pinned workspace dependency used by

@@ -82,3 +82,21 @@ fn generate_pkce_pair_differs_each_call() {
     let (v2, _) = generate_pkce_pair();
     assert_ne!(v1, v2);
 }
+
+#[test]
+fn pkce_rejects_invalid_verifier_even_with_matching_digest() {
+    for verifier in [
+        "a".into(),
+        "x".repeat(42),
+        "x".repeat(129),
+        " ".repeat(43),
+        "é".repeat(43),
+    ] {
+        let challenge = base64url_encode(&Sha256::digest(verifier.as_bytes()));
+        assert!(!verify_pkce_s256(&verifier, &challenge));
+    }
+    for verifier in ["x".repeat(43), "x".repeat(128), "a-._~".repeat(10)] {
+        let challenge = base64url_encode(&Sha256::digest(verifier.as_bytes()));
+        assert!(verify_pkce_s256(&verifier, &challenge));
+    }
+}

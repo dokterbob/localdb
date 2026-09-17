@@ -316,27 +316,6 @@ impl AppState {
             .clone()
     }
 
-    /// Atomically verify `presented_hash` (the blake3 hash of a caller-typed
-    /// setup code) against the held setup-code hash and, on an exact match,
-    /// consume it — clearing it so it can never be redeemed a second time.
-    /// Returns `true` only on a match; a non-matching guess leaves the held
-    /// hash untouched so a legitimate follow-up attempt still works. Used by
-    /// `POST /authorize`'s bootstrap path (`server::auth::oauth`).
-    pub fn consume_setup_code_if_matches(&self, presented_hash: &str) -> bool {
-        let mut guard = self
-            .inner
-            .auth_context
-            .setup_code_hash
-            .write()
-            .expect("setup_code_hash lock poisoned");
-        if guard.as_deref() == Some(presented_hash) {
-            *guard = None;
-            true
-        } else {
-            false
-        }
-    }
-
     pub fn auth_context(&self) -> AuthContext {
         self.inner.auth_context.clone()
     }

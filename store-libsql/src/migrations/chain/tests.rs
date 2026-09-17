@@ -82,9 +82,9 @@ fn head_version_current_matches_head_version_of_real_migrations() {
 }
 
 #[test]
-fn head_version_current_is_ten() {
+fn head_version_current_is_eleven() {
     // Pins the concrete number so a chain edit that silently drops or
     // duplicates an entry fails here, not just via the relative
     // assertions above.
-    assert_eq!(head_version_current(), 10);
+    assert_eq!(head_version_current(), 11);
 }

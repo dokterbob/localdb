@@ -9,6 +9,13 @@ const TOKEN_COLUMNS: &str = "id, user_id, kind, secret_hash, expires_at, last_us
 
 pub(crate) async fn insert_token(db: &LibsqlDb, token: &AuthTokenRow) -> Result<(), Error> {
     let conn = db.writer().await;
+    insert_token_on(&conn, token).await
+}
+
+pub(super) async fn insert_token_on(
+    conn: &libsql::Connection,
+    token: &AuthTokenRow,
+) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO auth_tokens
             (id, user_id, kind, secret_hash, expires_at, last_used_at, revoked_at,

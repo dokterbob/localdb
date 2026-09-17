@@ -14,6 +14,7 @@ use localdb_core::Error;
 
 use crate::connection::LibsqlDb;
 
+mod atomic;
 mod auth_codes;
 mod clients;
 mod grants;
@@ -43,6 +44,32 @@ impl LibsqlAuthStore {
 
 #[async_trait]
 impl AuthStore for LibsqlAuthStore {
+    async fn pending_bootstrap_user(&self) -> Result<Option<UserRow>, Error> {
+        atomic::pending_bootstrap_user(&self.conn.reader()).await
+    }
+    async fn begin_bootstrap(&self, user: &UserRow) -> Result<UserRow, Error> {
+        atomic::begin_bootstrap(&self.conn, user).await
+    }
+    async fn complete_bootstrap(&self, user_id: &str) -> Result<(), Error> {
+        atomic::complete_bootstrap(&self.conn, user_id).await
+    }
+    async fn rotate_tokens(
+        &self,
+        old_id: &str,
+        access: &AuthTokenRow,
+        refresh: &AuthTokenRow,
+    ) -> Result<bool, Error> {
+        atomic::rotate_tokens(&self.conn, old_id, access, refresh).await
+    }
+    async fn approve_access_request(
+        &self,
+        id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+    ) -> Result<bool, Error> {
+        atomic::approve_access_request(&self.conn, id, user, grants).await
+    }
+
     async fn create_user(&self, user: &UserRow) -> Result<(), Error> {
         users::create_user(&self.conn, user).await
     }

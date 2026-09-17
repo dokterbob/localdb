@@ -752,3 +752,29 @@ async fn create_invite_with_grants_on_shared_store_then_redeem_grants_access() {
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0].store_name, "docs");
 }
+
+#[tokio::test]
+async fn invite_expiry_is_validated_and_normalized() {
+    let svc = service();
+    for value in ["tomorrow", "2026-99-99T00:00:00Z", ""] {
+        assert!(matches!(
+            svc.create_invite(InviteMode::Open, &[], 1, Some(value.into()), "admin")
+                .await,
+            Err(Error::InvalidRequest { .. })
+        ));
+    }
+    let invite = svc
+        .create_invite(
+            InviteMode::Open,
+            &[],
+            1,
+            Some("2030-01-01T01:00:00+01:00".into()),
+            "admin",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        invite.row.expires_at.as_deref(),
+        Some("2030-01-01T00:00:00Z")
+    );
+}
