@@ -1,12 +1,20 @@
 use super::*;
 use crate::embedder::VectorEncoding;
-use crate::search::tests::make_chunk;
+use crate::search::tests::{make_chunk, ChunkFixture};
 use crate::store::StoredEmbeddingIdentity;
 use std::sync::Arc;
 
 fn entry(id: &str, text: &str, bytes: &[u8]) -> FusedChunkEntry {
     FusedChunkEntry {
-        chunk: make_chunk(id, id, "store", text, vec![], id, vec![]),
+        chunk: make_chunk(ChunkFixture {
+            id,
+            doc_id: id,
+            store_id: "store",
+            text,
+            heading_path: vec![],
+            uri: id,
+            embedding: vec![],
+        }),
         fused_score: 1.0,
         dense_score: Some(0.5),
         bm25_score: None,

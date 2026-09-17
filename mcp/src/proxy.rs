@@ -31,6 +31,8 @@
 //! agent from *accidentally* reading another project's docs; it does not
 //! contain a hostile one. See specs/05-surfaces.md §4.2.1.
 
+mod capabilities;
+
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
@@ -273,48 +275,6 @@ impl ProxyHandler {
                 allowed_ids,
             }),
         })
-    }
-
-    /// Discover on the authenticated session; cache only completed discovery.
-    async fn supports_search_dedup(&self) -> Result<bool, McpError> {
-        let mut cached = self.search_dedup_supported.lock().await;
-        if let Some(supported) = *cached {
-            return Ok(supported);
-        }
-        let mut cursor = None;
-        let mut seen = std::collections::HashSet::new();
-        loop {
-            let page = self
-                .upstream
-                .list_tools(
-                    cursor
-                        .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor))),
-                )
-                .await
-                .map_err(upstream_error_to_mcp)?;
-            if let Some(search) = page.tools.iter().find(|tool| tool.name == "search") {
-                let supported = search
-                    .input_schema
-                    .get("properties")
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|properties| properties.contains_key("dedup"));
-                *cached = Some(supported);
-                return Ok(supported);
-            }
-            match page.next_cursor {
-                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
-                Some(_) => {
-                    return Err(McpError::internal_error(
-                        "mcp proxy: repeated tools/list pagination cursor",
-                        None,
-                    ))
-                }
-                None => {
-                    *cached = Some(false);
-                    return Ok(false);
-                }
-            }
-        }
     }
 
     /// Relay a `tools/call` to the upstream unchanged.

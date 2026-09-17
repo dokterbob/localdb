@@ -11,17 +11,18 @@ use crate::{
     normalize::{exit_err, format_snippet, print_json, validate_store_name},
 };
 
+/// Retrieval and display options shared by both CLI search execution paths.
+pub struct SearchOptions {
+    pub limit: usize,
+    pub content_length: usize,
+    pub dedup: SearchDedup,
+    pub filters: SearchFilters,
+}
+
 /// `localdb search <query> [--limit N] [--content-length N] [filters...]`
-pub fn run_search(
-    ctx: &CliContext,
-    query: &str,
-    limit: usize,
-    content_length: usize,
-    dedup: SearchDedup,
-    filters: SearchFilters,
-) {
+pub fn run_search(ctx: &CliContext, query: &str, options: SearchOptions) {
     // F9: Reject --limit 0.
-    if limit == 0 {
+    if options.limit == 0 {
         exit_err(
             &Error::InvalidRequest {
                 message: "--limit must be at least 1".to_string(),
@@ -38,14 +39,7 @@ pub fn run_search(
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_search_async(
-        ctx,
-        query,
-        limit,
-        content_length,
-        dedup,
-        filters,
-    ));
+    rt.block_on(run_search_async(ctx, query, options));
 }
 
 /// `search`'s table entry (issue #187 stage 5). `Outcome` is `Vec<Citation>`
@@ -252,29 +246,22 @@ fn render_search_output(
     }
 }
 
-pub(crate) async fn run_search_async(
-    ctx: &CliContext,
-    query: &str,
-    limit: usize,
-    content_length: usize,
-    dedup: SearchDedup,
-    filters: SearchFilters,
-) {
+pub(crate) async fn run_search_async(ctx: &CliContext, query: &str, options: SearchOptions) {
     // F1-cli: use lenient loader so search works even with malformed config.
     let config_loader = load_config_lenient(ctx).await;
     let citations = dispatch(
         &SearchCmd {
             query,
-            limit,
-            filters,
-            dedup,
+            limit: options.limit,
+            filters: options.filters,
+            dedup: options.dedup,
         },
         ctx,
         &config_loader,
         || open_app_db_lenient_or_exit(ctx, &config_loader),
     )
     .await;
-    render_search_output(&citations, query, content_length, ctx.json);
+    render_search_output(&citations, query, options.content_length, ctx.json);
 }
 
 #[cfg(test)]

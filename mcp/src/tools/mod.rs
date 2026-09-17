@@ -294,16 +294,6 @@ pub async fn tool_search(
         Ok(handles) => handles,
         Err(result) => return result,
     };
-    if store_handles.is_empty() {
-        return search_to_tool_result(
-            QueryResponse {
-                citations: vec![],
-                total_candidates: 0,
-                total_results: 0,
-            },
-            content_length,
-        );
-    }
     let request = QueryRequest {
         query: args.query.clone(),
         dedup: args.dedup,

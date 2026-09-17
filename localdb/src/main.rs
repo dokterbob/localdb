@@ -881,10 +881,12 @@ fn main() {
             cli::run_search(
                 &ctx,
                 &query.join(" "),
-                *limit,
-                *content_length,
-                *dedup,
-                filters,
+                cli::SearchOptions {
+                    limit: *limit,
+                    content_length: *content_length,
+                    dedup: *dedup,
+                    filters,
+                },
             )
         }
         Command::Add {

@@ -50,7 +50,7 @@ pub use cmds::invite::{
 };
 pub use cmds::job::{run_job_cancel, run_job_list};
 pub use cmds::login::{run_login, run_logout};
-pub use cmds::search::run_search;
+pub use cmds::search::{run_search, SearchOptions};
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
 pub use cmds::status::run_status;
 pub use cmds::store::{

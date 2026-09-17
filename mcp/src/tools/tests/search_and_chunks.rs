@@ -554,7 +554,7 @@ fn render_citations_empty() {
 
 #[tokio::test]
 async fn empty_search_has_counts_and_normal_framing() {
-    let result = tool_search(&[], &FakeEmbedder::new(128), search_args("hello")).await;
+    let result = tool_search(&[], &UnexpectedEmbedder, search_args("hello")).await;
     let text = text_of(&result);
     let (json, human) = text.split_once("\n\n---\n").expect("normal search framing");
     let value: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -563,6 +563,26 @@ async fn empty_search_has_counts_and_normal_framing() {
         serde_json::json!({"citations":[], "total_candidates":0, "total_results":0})
     );
     assert_eq!(human, "No results found.");
+}
+
+struct UnexpectedEmbedder;
+
+#[async_trait::async_trait]
+impl localdb_core::Embedder for UnexpectedEmbedder {
+    async fn embed_documents(
+        &self,
+        _: Vec<localdb_core::embedder::DocumentChunks>,
+    ) -> Result<Vec<localdb_core::embedder::EmbeddedDocument>, localdb_core::Error> {
+        panic!("empty-store search must not call the embedder")
+    }
+
+    fn embedding_dim(&self) -> usize {
+        panic!("empty-store search must not inspect the embedder")
+    }
+
+    fn model_id(&self) -> &str {
+        panic!("empty-store search must not inspect the embedder")
+    }
 }
 
 #[test]

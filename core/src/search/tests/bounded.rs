@@ -80,15 +80,15 @@ async fn collapsed_results_do_not_refill_or_read_documents_and_filter_every_memb
         });
         let records = (0..160)
             .map(|i| {
-                let mut c = make_chunk(
-                    &format!("{i:03}"),
-                    "doc",
-                    "store",
-                    "same query passage",
-                    vec![],
-                    "uri",
-                    vec![1.0, 0.0],
-                );
+                let mut c = make_chunk(ChunkFixture {
+                    id: &format!("{i:03}"),
+                    doc_id: "doc",
+                    store_id: "store",
+                    text: "same query passage",
+                    heading_path: vec![],
+                    uri: "uri",
+                    embedding: vec![1.0, 0.0],
+                });
                 c.source_id = if i % 2 == 0 { "selected" } else { "excluded" }.into();
                 c
             })

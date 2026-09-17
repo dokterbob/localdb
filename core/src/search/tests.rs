@@ -7,15 +7,26 @@ use crate::types::Span;
 // Helper: make a ChunkRecord for tests
 // -----------------------------------------------------------------------
 
-pub(super) fn make_chunk(
-    id: &str,
-    doc_id: &str,
-    store_id: &str,
-    text: &str,
-    heading_path: Vec<String>,
-    uri: &str,
-    embedding: Vec<f32>,
-) -> ChunkRecord {
+pub(super) struct ChunkFixture<'a> {
+    pub id: &'a str,
+    pub doc_id: &'a str,
+    pub store_id: &'a str,
+    pub text: &'a str,
+    pub heading_path: Vec<String>,
+    pub uri: &'a str,
+    pub embedding: Vec<f32>,
+}
+
+pub(super) fn make_chunk(fixture: ChunkFixture<'_>) -> ChunkRecord {
+    let ChunkFixture {
+        id,
+        doc_id,
+        store_id,
+        text,
+        heading_path,
+        uri,
+        embedding,
+    } = fixture;
     ChunkRecord {
         id: id.to_string(),
         resource_id: doc_id.to_string(),
@@ -126,42 +137,42 @@ fn rrf_score_monotonically_decreasing() {
 /// chunk-D: rank 2 in BM25 only → 1/63
 #[test]
 fn rrf_fuse_global_hand_computed_scores_single_store() {
-    let chunk_a = make_chunk(
-        "A",
-        "doc-1",
-        "s1",
-        "text A",
-        vec![],
-        "file:///a.md",
-        vec![1.0, 0.0],
-    );
-    let chunk_b = make_chunk(
-        "B",
-        "doc-2",
-        "s1",
-        "text B",
-        vec![],
-        "file:///b.md",
-        vec![0.9, 0.1],
-    );
-    let chunk_c = make_chunk(
-        "C",
-        "doc-3",
-        "s1",
-        "text C",
-        vec![],
-        "file:///c.md",
-        vec![0.8, 0.2],
-    );
-    let chunk_d = make_chunk(
-        "D",
-        "doc-4",
-        "s1",
-        "text D",
-        vec![],
-        "file:///d.md",
-        vec![0.7, 0.3],
-    );
+    let chunk_a = make_chunk(ChunkFixture {
+        id: "A",
+        doc_id: "doc-1",
+        store_id: "s1",
+        text: "text A",
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: vec![1.0, 0.0],
+    });
+    let chunk_b = make_chunk(ChunkFixture {
+        id: "B",
+        doc_id: "doc-2",
+        store_id: "s1",
+        text: "text B",
+        heading_path: vec![],
+        uri: "file:///b.md",
+        embedding: vec![0.9, 0.1],
+    });
+    let chunk_c = make_chunk(ChunkFixture {
+        id: "C",
+        doc_id: "doc-3",
+        store_id: "s1",
+        text: "text C",
+        heading_path: vec![],
+        uri: "file:///c.md",
+        embedding: vec![0.8, 0.2],
+    });
+    let chunk_d = make_chunk(ChunkFixture {
+        id: "D",
+        doc_id: "doc-4",
+        store_id: "s1",
+        text: "text D",
+        heading_path: vec![],
+        uri: "file:///d.md",
+        embedding: vec![0.7, 0.3],
+    });
 
     let dense = vec![
         make_search_result(chunk_a.clone(), 0.99),
@@ -236,24 +247,24 @@ fn rrf_fuse_global_hand_computed_scores_single_store() {
 #[test]
 fn rrf_fuse_global_tie_ordering_is_deterministic() {
     // chunk-A in BM25 rank 0 only, chunk-Z in dense rank 0 only → both score 1/61
-    let chunk_a = make_chunk(
-        "A",
-        "doc-1",
-        "s1",
-        "text A",
-        vec![],
-        "file:///a.md",
-        vec![1.0],
-    );
-    let chunk_z = make_chunk(
-        "Z",
-        "doc-2",
-        "s1",
-        "text Z",
-        vec![],
-        "file:///z.md",
-        vec![0.5],
-    );
+    let chunk_a = make_chunk(ChunkFixture {
+        id: "A",
+        doc_id: "doc-1",
+        store_id: "s1",
+        text: "text A",
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: vec![1.0],
+    });
+    let chunk_z = make_chunk(ChunkFixture {
+        id: "Z",
+        doc_id: "doc-2",
+        store_id: "s1",
+        text: "text Z",
+        heading_path: vec![],
+        uri: "file:///z.md",
+        embedding: vec![0.5],
+    });
 
     let dense = vec![make_search_result(chunk_z.clone(), 0.9)];
     let bm25 = vec![make_search_result(chunk_a.clone(), 5.0)];
@@ -268,15 +279,15 @@ fn rrf_fuse_global_tie_ordering_is_deterministic() {
 /// Single-leg test: if only BM25 has results, they still appear in fused output.
 #[test]
 fn rrf_fuse_global_single_leg_only_bm25() {
-    let chunk = make_chunk(
-        "X",
-        "doc-1",
-        "s1",
-        "text X",
-        vec![],
-        "file:///x.md",
-        vec![1.0],
-    );
+    let chunk = make_chunk(ChunkFixture {
+        id: "X",
+        doc_id: "doc-1",
+        store_id: "s1",
+        text: "text X",
+        heading_path: vec![],
+        uri: "file:///x.md",
+        embedding: vec![1.0],
+    });
     let bm25 = vec![make_search_result(chunk.clone(), 7.5)];
     let fused = rrf_fuse_global(&[], &bm25, 60.0);
 
@@ -291,15 +302,15 @@ fn rrf_fuse_global_single_leg_only_bm25() {
 /// Single-leg test: if only dense has results, they still appear in fused output.
 #[test]
 fn rrf_fuse_global_single_leg_only_dense() {
-    let chunk = make_chunk(
-        "Y",
-        "doc-1",
-        "s1",
-        "text Y",
-        vec![],
-        "file:///y.md",
-        vec![1.0],
-    );
+    let chunk = make_chunk(ChunkFixture {
+        id: "Y",
+        doc_id: "doc-1",
+        store_id: "s1",
+        text: "text Y",
+        heading_path: vec![],
+        uri: "file:///y.md",
+        embedding: vec![1.0],
+    });
     let dense = vec![make_search_result(chunk.clone(), 0.85)];
     let fused = rrf_fuse_global(&dense, &[], 60.0);
 
@@ -319,15 +330,15 @@ fn rrf_fuse_global_empty_inputs() {
 /// Single result in each leg (same chunk) → fused score = 2/61.
 #[test]
 fn rrf_fuse_global_single_chunk_both_legs() {
-    let chunk = make_chunk(
-        "X",
-        "doc-1",
-        "s1",
-        "text",
-        vec![],
-        "file:///x.md",
-        vec![1.0],
-    );
+    let chunk = make_chunk(ChunkFixture {
+        id: "X",
+        doc_id: "doc-1",
+        store_id: "s1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///x.md",
+        embedding: vec![1.0],
+    });
     let dense = vec![make_search_result(chunk.clone(), 0.95)];
     let bm25 = vec![make_search_result(chunk.clone(), 9.0)];
     let fused = rrf_fuse_global(&dense, &bm25, 60.0);
@@ -347,15 +358,15 @@ fn rrf_fuse_global_multiple_results_ordering() {
     // chunks 0..4 created in ascending ID order
     let chunks: Vec<ChunkRecord> = (0..5)
         .map(|i| {
-            make_chunk(
-                &format!("{i}"),
-                "doc-1",
-                "s1",
-                &format!("text {i}"),
-                vec![],
-                &format!("file:///{i}.md"),
-                vec![1.0],
-            )
+            make_chunk(ChunkFixture {
+                id: &format!("{i}"),
+                doc_id: "doc-1",
+                store_id: "s1",
+                text: &format!("text {i}"),
+                heading_path: vec![],
+                uri: &format!("file:///{i}.md"),
+                embedding: vec![1.0],
+            })
         })
         .collect();
 
@@ -419,24 +430,24 @@ fn rrf_fuse_global_multiple_results_ordering() {
 /// approach to global fusion.
 #[test]
 fn rrf_fuse_global_same_chunk_id_in_two_stores_stay_distinct() {
-    let chunk_in_store_1 = make_chunk(
-        "shared-id",
-        "doc-1",
-        "store-1",
-        "text in store 1",
-        vec![],
-        "file:///store1/a.md",
-        vec![1.0],
-    );
-    let chunk_in_store_2 = make_chunk(
-        "shared-id",
-        "doc-2",
-        "store-2",
-        "text in store 2",
-        vec![],
-        "file:///store2/a.md",
-        vec![1.0],
-    );
+    let chunk_in_store_1 = make_chunk(ChunkFixture {
+        id: "shared-id",
+        doc_id: "doc-1",
+        store_id: "store-1",
+        text: "text in store 1",
+        heading_path: vec![],
+        uri: "file:///store1/a.md",
+        embedding: vec![1.0],
+    });
+    let chunk_in_store_2 = make_chunk(ChunkFixture {
+        id: "shared-id",
+        doc_id: "doc-2",
+        store_id: "store-2",
+        text: "text in store 2",
+        heading_path: vec![],
+        uri: "file:///store2/a.md",
+        embedding: vec![1.0],
+    });
 
     let dense = vec![make_search_result(chunk_in_store_1.clone(), 0.9)];
     let bm25 = vec![make_search_result(chunk_in_store_2.clone(), 5.0)];
@@ -486,42 +497,42 @@ fn rrf_fuse_global_same_chunk_id_in_two_stores_stay_distinct() {
 /// be identical to the single-store case.
 #[test]
 fn rrf_fuse_global_hand_computed_scores_across_stores() {
-    let chunk_a = make_chunk(
-        "A",
-        "doc-1",
-        "s1",
-        "text A",
-        vec![],
-        "file:///a.md",
-        vec![1.0, 0.0],
-    );
-    let chunk_b = make_chunk(
-        "B",
-        "doc-2",
-        "s2",
-        "text B",
-        vec![],
-        "file:///b.md",
-        vec![0.9, 0.1],
-    );
-    let chunk_c = make_chunk(
-        "C",
-        "doc-3",
-        "s1",
-        "text C",
-        vec![],
-        "file:///c.md",
-        vec![0.8, 0.2],
-    );
-    let chunk_d = make_chunk(
-        "D",
-        "doc-4",
-        "s2",
-        "text D",
-        vec![],
-        "file:///d.md",
-        vec![0.7, 0.3],
-    );
+    let chunk_a = make_chunk(ChunkFixture {
+        id: "A",
+        doc_id: "doc-1",
+        store_id: "s1",
+        text: "text A",
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: vec![1.0, 0.0],
+    });
+    let chunk_b = make_chunk(ChunkFixture {
+        id: "B",
+        doc_id: "doc-2",
+        store_id: "s2",
+        text: "text B",
+        heading_path: vec![],
+        uri: "file:///b.md",
+        embedding: vec![0.9, 0.1],
+    });
+    let chunk_c = make_chunk(ChunkFixture {
+        id: "C",
+        doc_id: "doc-3",
+        store_id: "s1",
+        text: "text C",
+        heading_path: vec![],
+        uri: "file:///c.md",
+        embedding: vec![0.8, 0.2],
+    });
+    let chunk_d = make_chunk(ChunkFixture {
+        id: "D",
+        doc_id: "doc-4",
+        store_id: "s2",
+        text: "text D",
+        heading_path: vec![],
+        uri: "file:///d.md",
+        embedding: vec![0.7, 0.3],
+    });
 
     let dense = vec![
         make_search_result(chunk_a.clone(), 0.99),
@@ -582,42 +593,42 @@ fn rrf_fuse_global_hand_computed_scores_across_stores() {
 /// chunk_id can't be the sole fusion/tiebreak key).
 #[test]
 fn rrf_fuse_global_tiebreak_orders_by_store_id_then_chunk_id() {
-    let chunk_store2_a = make_chunk(
-        "A",
-        "doc-1",
-        "store-2",
-        "text",
-        vec![],
-        "file:///1.md",
-        vec![1.0],
-    );
-    let chunk_store1_b = make_chunk(
-        "B",
-        "doc-2",
-        "store-1",
-        "text",
-        vec![],
-        "file:///2.md",
-        vec![1.0],
-    );
-    let chunk_store1_d = make_chunk(
-        "D",
-        "doc-3",
-        "store-1",
-        "text",
-        vec![],
-        "file:///3.md",
-        vec![1.0],
-    );
-    let chunk_store1_c = make_chunk(
-        "C",
-        "doc-4",
-        "store-1",
-        "text",
-        vec![],
-        "file:///4.md",
-        vec![1.0],
-    );
+    let chunk_store2_a = make_chunk(ChunkFixture {
+        id: "A",
+        doc_id: "doc-1",
+        store_id: "store-2",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///1.md",
+        embedding: vec![1.0],
+    });
+    let chunk_store1_b = make_chunk(ChunkFixture {
+        id: "B",
+        doc_id: "doc-2",
+        store_id: "store-1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///2.md",
+        embedding: vec![1.0],
+    });
+    let chunk_store1_d = make_chunk(ChunkFixture {
+        id: "D",
+        doc_id: "doc-3",
+        store_id: "store-1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///3.md",
+        embedding: vec![1.0],
+    });
+    let chunk_store1_c = make_chunk(ChunkFixture {
+        id: "C",
+        doc_id: "doc-4",
+        store_id: "store-1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///4.md",
+        embedding: vec![1.0],
+    });
 
     // dense rank0 = store-2/A (1/61), dense rank1 = store-1/D (1/62)
     let dense = vec![
@@ -671,65 +682,65 @@ fn rrf_fuse_global_tiebreak_orders_by_store_id_then_chunk_id() {
 #[test]
 fn pool_leg_results_orders_by_score_desc_then_store_id_then_chunk_id() {
     let high = make_search_result(
-        make_chunk(
-            "m",
-            "doc-1",
-            "store-1",
-            "text",
-            vec![],
-            "file:///m.md",
-            vec![1.0],
-        ),
+        make_chunk(ChunkFixture {
+            id: "m",
+            doc_id: "doc-1",
+            store_id: "store-1",
+            text: "text",
+            heading_path: vec![],
+            uri: "file:///m.md",
+            embedding: vec![1.0],
+        }),
         0.9,
     );
     // Equal score (0.5), different store_id AND different chunk_id.
     let tie_a_store2 = make_search_result(
-        make_chunk(
-            "b",
-            "doc-2",
-            "store-2",
-            "text",
-            vec![],
-            "file:///b.md",
-            vec![1.0],
-        ),
+        make_chunk(ChunkFixture {
+            id: "b",
+            doc_id: "doc-2",
+            store_id: "store-2",
+            text: "text",
+            heading_path: vec![],
+            uri: "file:///b.md",
+            embedding: vec![1.0],
+        }),
         0.5,
     );
     let tie_a_store1 = make_search_result(
-        make_chunk(
-            "c",
-            "doc-3",
-            "store-1",
-            "text",
-            vec![],
-            "file:///c.md",
-            vec![1.0],
-        ),
+        make_chunk(ChunkFixture {
+            id: "c",
+            doc_id: "doc-3",
+            store_id: "store-1",
+            text: "text",
+            heading_path: vec![],
+            uri: "file:///c.md",
+            embedding: vec![1.0],
+        }),
         0.5,
     );
     // Equal score (0.3) AND equal chunk_id, different store_id.
     let tie_b_store2 = make_search_result(
-        make_chunk(
-            "same-id",
-            "doc-4",
-            "store-2",
-            "text",
-            vec![],
-            "file:///s2.md",
-            vec![1.0],
-        ),
+        make_chunk(ChunkFixture {
+            id: "same-id",
+            doc_id: "doc-4",
+            store_id: "store-2",
+            text: "text",
+            heading_path: vec![],
+            uri: "file:///s2.md",
+            embedding: vec![1.0],
+        }),
         0.3,
     );
     let tie_b_store1 = make_search_result(
-        make_chunk(
-            "same-id",
-            "doc-5",
-            "store-1",
-            "text",
-            vec![],
-            "file:///s1.md",
-            vec![1.0],
-        ),
+        make_chunk(ChunkFixture {
+            id: "same-id",
+            doc_id: "doc-5",
+            store_id: "store-1",
+            text: "text",
+            heading_path: vec![],
+            uri: "file:///s1.md",
+            embedding: vec![1.0],
+        }),
         0.3,
     );
 
@@ -780,15 +791,39 @@ fn retain_own_chunks_drops_results_stamped_with_another_store_id() {
     };
 
     let mine_first = make_search_result(
-        make_chunk("a", "d1", "store-A", "t", vec![], "file:///a.md", vec![1.0]),
+        make_chunk(ChunkFixture {
+            id: "a",
+            doc_id: "d1",
+            store_id: "store-A",
+            text: "t",
+            heading_path: vec![],
+            uri: "file:///a.md",
+            embedding: vec![1.0],
+        }),
         0.9,
     );
     let foreign = make_search_result(
-        make_chunk("x", "d2", "store-B", "t", vec![], "file:///x.md", vec![1.0]),
+        make_chunk(ChunkFixture {
+            id: "x",
+            doc_id: "d2",
+            store_id: "store-B",
+            text: "t",
+            heading_path: vec![],
+            uri: "file:///x.md",
+            embedding: vec![1.0],
+        }),
         0.8,
     );
     let mine_last = make_search_result(
-        make_chunk("b", "d3", "store-A", "t", vec![], "file:///b.md", vec![1.0]),
+        make_chunk(ChunkFixture {
+            id: "b",
+            doc_id: "d3",
+            store_id: "store-A",
+            text: "t",
+            heading_path: vec![],
+            uri: "file:///b.md",
+            embedding: vec![1.0],
+        }),
         0.7,
     );
 
@@ -811,7 +846,15 @@ fn retain_own_chunks_drops_every_foreign_result() {
         store: Arc::new(FakeStore::new()),
     };
     let foreign = make_search_result(
-        make_chunk("x", "d1", "store-B", "t", vec![], "file:///x.md", vec![1.0]),
+        make_chunk(ChunkFixture {
+            id: "x",
+            doc_id: "d1",
+            store_id: "store-B",
+            text: "t",
+            heading_path: vec![],
+            uri: "file:///x.md",
+            embedding: vec![1.0],
+        }),
         0.8,
     );
 
@@ -843,44 +886,44 @@ fn retain_own_chunks_drops_every_foreign_result() {
 #[test]
 fn query_multi_store_true_global_rrf_demotes_weak_stores_rank0_chunk() {
     // `rel`: three strong chunks, dense + BM25 scores strictly decreasing.
-    let r0 = make_chunk(
-        "r0",
-        "doc-r0",
-        "rel",
-        "text r0",
-        vec![],
-        "file:///r0.md",
-        vec![1.0],
-    );
-    let r1 = make_chunk(
-        "r1",
-        "doc-r1",
-        "rel",
-        "text r1",
-        vec![],
-        "file:///r1.md",
-        vec![1.0],
-    );
-    let r2 = make_chunk(
-        "r2",
-        "doc-r2",
-        "rel",
-        "text r2",
-        vec![],
-        "file:///r2.md",
-        vec![1.0],
-    );
+    let r0 = make_chunk(ChunkFixture {
+        id: "r0",
+        doc_id: "doc-r0",
+        store_id: "rel",
+        text: "text r0",
+        heading_path: vec![],
+        uri: "file:///r0.md",
+        embedding: vec![1.0],
+    });
+    let r1 = make_chunk(ChunkFixture {
+        id: "r1",
+        doc_id: "doc-r1",
+        store_id: "rel",
+        text: "text r1",
+        heading_path: vec![],
+        uri: "file:///r1.md",
+        embedding: vec![1.0],
+    });
+    let r2 = make_chunk(ChunkFixture {
+        id: "r2",
+        doc_id: "doc-r2",
+        store_id: "rel",
+        text: "text r2",
+        heading_path: vec![],
+        uri: "file:///r2.md",
+        embedding: vec![1.0],
+    });
     // `weak`: one mediocre chunk, alone in its store — local rank-0 by
     // default, purely because it has no competition within its own store.
-    let w0 = make_chunk(
-        "w0",
-        "doc-w0",
-        "weak",
-        "text w0",
-        vec![],
-        "file:///w0.md",
-        vec![1.0],
-    );
+    let w0 = make_chunk(ChunkFixture {
+        id: "w0",
+        doc_id: "doc-w0",
+        store_id: "weak",
+        text: "text w0",
+        heading_path: vec![],
+        uri: "file:///w0.md",
+        embedding: vec![1.0],
+    });
 
     // -------------------------------------------------------------
     // OLD topology: fuse per store, then merge (documents the bug).
@@ -981,15 +1024,15 @@ fn query_multi_store_true_global_rrf_demotes_weak_stores_rank0_chunk() {
 
 #[test]
 fn shape_citation_carries_correct_fields() {
-    let chunk = make_chunk(
-        "chunk-1",
-        "doc-1",
-        "store-A",
-        "The quick brown fox",
-        vec!["Overview".to_string(), "Details".to_string()],
-        "file:///docs/guide.md",
-        vec![0.5, 0.5],
-    );
+    let chunk = make_chunk(ChunkFixture {
+        id: "chunk-1",
+        doc_id: "doc-1",
+        store_id: "store-A",
+        text: "The quick brown fox",
+        heading_path: vec!["Overview".to_string(), "Details".to_string()],
+        uri: "file:///docs/guide.md",
+        embedding: vec![0.5, 0.5],
+    });
     let entry = FusedChunkEntry {
         embedding_identity: None,
         chunk,
@@ -1031,15 +1074,15 @@ fn shape_citation_carries_correct_fields() {
 /// §6): a message-window chunk with non-default values everywhere.
 #[test]
 fn shape_citation_carries_block_and_window_fields() {
-    let mut chunk = make_chunk(
-        "chunk-2",
-        "doc-1",
-        "store-A",
-        "window chunk text",
-        vec![],
-        "file:///thread.md",
-        vec![0.1, 0.2],
-    );
+    let mut chunk = make_chunk(ChunkFixture {
+        id: "chunk-2",
+        doc_id: "doc-1",
+        store_id: "store-A",
+        text: "window chunk text",
+        heading_path: vec![],
+        uri: "file:///thread.md",
+        embedding: vec![0.1, 0.2],
+    });
     chunk.block_seq = 5;
     chunk.seq_in_block = 2;
     chunk.block_kind = Some("message".to_string());
@@ -1063,7 +1106,15 @@ fn shape_citation_carries_block_and_window_fields() {
 
 #[test]
 fn shape_citation_single_leg_scores_preserved() {
-    let chunk = make_chunk("c1", "d1", "s1", "text", vec![], "file:///a.md", vec![1.0]);
+    let chunk = make_chunk(ChunkFixture {
+        id: "c1",
+        doc_id: "d1",
+        store_id: "s1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: vec![1.0],
+    });
     let entry = FusedChunkEntry {
         embedding_identity: None,
         chunk,
@@ -1079,15 +1130,15 @@ fn shape_citation_single_leg_scores_preserved() {
 
 #[test]
 fn shape_citation_serializes_to_canonical_json() {
-    let chunk = make_chunk(
-        "cid",
-        "did",
-        "sid",
-        "snippet text",
-        vec!["H1".to_string()],
-        "file:///x.md",
-        vec![1.0],
-    );
+    let chunk = make_chunk(ChunkFixture {
+        id: "cid",
+        doc_id: "did",
+        store_id: "sid",
+        text: "snippet text",
+        heading_path: vec!["H1".to_string()],
+        uri: "file:///x.md",
+        embedding: vec![1.0],
+    });
     let entry = FusedChunkEntry {
         embedding_identity: None,
         chunk,
@@ -1121,7 +1172,15 @@ fn shape_citation_serializes_to_canonical_json() {
 
 #[test]
 fn shape_citation_carries_metadata() {
-    let mut chunk = make_chunk("c1", "d1", "s1", "text", vec![], "file:///a.md", vec![1.0]);
+    let mut chunk = make_chunk(ChunkFixture {
+        id: "c1",
+        doc_id: "d1",
+        store_id: "s1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: vec![1.0],
+    });
     chunk.metadata = crate::metadata::Metadata::Document(crate::metadata::DocumentMetadata {
         dublin_core: crate::metadata::DublinCoreMetadata {
             title: Some("My Title".to_string()),
@@ -1177,15 +1236,15 @@ async fn query_single_store_returns_citations() {
     let store = FakeStore::new();
 
     let text = "The quick brown fox jumps over the lazy dog";
-    let chunk = make_chunk(
-        "chunk-1",
-        "doc-1",
-        "store-A",
+    let chunk = make_chunk(ChunkFixture {
+        id: "chunk-1",
+        doc_id: "doc-1",
+        store_id: "store-A",
         text,
-        vec!["Animals".to_string()],
-        "file:///docs/animals.md",
-        embed_text(&embedder, text).await,
-    );
+        heading_path: vec!["Animals".to_string()],
+        uri: "file:///docs/animals.md",
+        embedding: embed_text(&embedder, text).await,
+    });
     store.upsert_chunks(vec![chunk]).await.unwrap();
 
     let handle = StoreHandle {
@@ -1245,38 +1304,38 @@ async fn query_multi_store_global_ordering() {
 
     let text_a1 = "rust programming language performance";
     let store_a = FakeStore::new();
-    let chunk_a1 = make_chunk(
-        "a1",
-        "doc-a1",
-        "store-A",
-        text_a1,
-        vec![],
-        "file:///a1.md",
-        embed_text(&embedder, text_a1).await,
-    );
+    let chunk_a1 = make_chunk(ChunkFixture {
+        id: "a1",
+        doc_id: "doc-a1",
+        store_id: "store-A",
+        text: text_a1,
+        heading_path: vec![],
+        uri: "file:///a1.md",
+        embedding: embed_text(&embedder, text_a1).await,
+    });
     store_a.upsert_chunks(vec![chunk_a1]).await.unwrap();
 
     let text_b1 = "python web framework django";
     let text_b2 = "rust memory safety ownership";
     let store_b = FakeStore::new();
-    let chunk_b1 = make_chunk(
-        "b1",
-        "doc-b1",
-        "store-B",
-        text_b1,
-        vec![],
-        "file:///b1.md",
-        embed_text(&embedder, text_b1).await,
-    );
-    let chunk_b2 = make_chunk(
-        "b2",
-        "doc-b2",
-        "store-B",
-        text_b2,
-        vec![],
-        "file:///b2.md",
-        embed_text(&embedder, text_b2).await,
-    );
+    let chunk_b1 = make_chunk(ChunkFixture {
+        id: "b1",
+        doc_id: "doc-b1",
+        store_id: "store-B",
+        text: text_b1,
+        heading_path: vec![],
+        uri: "file:///b1.md",
+        embedding: embed_text(&embedder, text_b1).await,
+    });
+    let chunk_b2 = make_chunk(ChunkFixture {
+        id: "b2",
+        doc_id: "doc-b2",
+        store_id: "store-B",
+        text: text_b2,
+        heading_path: vec![],
+        uri: "file:///b2.md",
+        embedding: embed_text(&embedder, text_b2).await,
+    });
     store_b
         .upsert_chunks(vec![chunk_b1, chunk_b2])
         .await
@@ -1366,27 +1425,27 @@ async fn query_same_chunk_id_present_in_two_stores_both_survive_with_correct_att
     let embedding = embed_text(&embedder, text).await;
 
     let store_a = FakeStore::new();
-    let chunk_a = make_chunk(
-        "shared-chunk-id",
-        "doc-a",
-        "store-A",
+    let chunk_a = make_chunk(ChunkFixture {
+        id: "shared-chunk-id",
+        doc_id: "doc-a",
+        store_id: "store-A",
         text,
-        vec![],
-        "file:///a.md",
-        embedding.clone(),
-    );
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: embedding.clone(),
+    });
     store_a.upsert_chunks(vec![chunk_a]).await.unwrap();
 
     let store_b = FakeStore::new();
-    let chunk_b = make_chunk(
-        "shared-chunk-id",
-        "doc-b",
-        "store-B",
+    let chunk_b = make_chunk(ChunkFixture {
+        id: "shared-chunk-id",
+        doc_id: "doc-b",
+        store_id: "store-B",
         text,
-        vec![],
-        "file:///b.md",
+        heading_path: vec![],
+        uri: "file:///b.md",
         embedding,
-    );
+    });
     store_b.upsert_chunks(vec![chunk_b]).await.unwrap();
 
     let handles = vec![
@@ -1449,15 +1508,15 @@ async fn query_top_n_respected() {
     for i in 0..20usize {
         let text = format!("search term content chunk number {i}");
         let emb = embed_text(&embedder, &text).await;
-        chunks.push(make_chunk(
-            &format!("chunk-{i}"),
-            &format!("doc-{i}"),
-            "store-A",
-            &text,
-            vec![],
-            &format!("file:///doc{i}.md"),
-            emb,
-        ));
+        chunks.push(make_chunk(ChunkFixture {
+            id: &format!("chunk-{i}"),
+            doc_id: &format!("doc-{i}"),
+            store_id: "store-A",
+            text: &text,
+            heading_path: vec![],
+            uri: &format!("file:///doc{i}.md"),
+            embedding: emb,
+        }));
     }
     store.upsert_chunks(chunks).await.unwrap();
 
@@ -1492,27 +1551,27 @@ async fn query_with_metadata_filter() {
     let store = FakeStore::new();
 
     let md_text = "markdown documentation content";
-    let mut chunk_md = make_chunk(
-        "md-chunk",
-        "doc-md",
-        "store-A",
-        md_text,
-        vec![],
-        "file:///docs/guide.md",
-        embed_text(&embedder, md_text).await,
-    );
+    let mut chunk_md = make_chunk(ChunkFixture {
+        id: "md-chunk",
+        doc_id: "doc-md",
+        store_id: "store-A",
+        text: md_text,
+        heading_path: vec![],
+        uri: "file:///docs/guide.md",
+        embedding: embed_text(&embedder, md_text).await,
+    });
     chunk_md.mime = Some("text/markdown".to_string());
 
     let py_text = "python documentation content";
-    let mut chunk_py = make_chunk(
-        "py-chunk",
-        "doc-py",
-        "store-A",
-        py_text,
-        vec![],
-        "file:///docs/guide.py",
-        embed_text(&embedder, py_text).await,
-    );
+    let mut chunk_py = make_chunk(ChunkFixture {
+        id: "py-chunk",
+        doc_id: "doc-py",
+        store_id: "store-A",
+        text: py_text,
+        heading_path: vec![],
+        uri: "file:///docs/guide.py",
+        embedding: embed_text(&embedder, py_text).await,
+    });
     chunk_py.mime = Some("text/x-python".to_string());
 
     store.upsert_chunks(vec![chunk_md, chunk_py]).await.unwrap();
@@ -1550,15 +1609,15 @@ async fn query_citations_have_correct_span_and_heading_path() {
     let store = FakeStore::new();
 
     let text = "Important content here";
-    let mut chunk = make_chunk(
-        "span-chunk",
-        "doc-1",
-        "store-A",
+    let mut chunk = make_chunk(ChunkFixture {
+        id: "span-chunk",
+        doc_id: "doc-1",
+        store_id: "store-A",
         text,
-        vec!["Chapter 1".to_string(), "Section 2".to_string()],
-        "file:///book.md",
-        embed_text(&embedder, text).await,
-    );
+        heading_path: vec!["Chapter 1".to_string(), "Section 2".to_string()],
+        uri: "file:///book.md",
+        embedding: embed_text(&embedder, text).await,
+    });
     chunk.span = Span::new(42, 64);
 
     store.upsert_chunks(vec![chunk]).await.unwrap();
@@ -1610,51 +1669,51 @@ async fn relevance_smoke_test_known_query_in_top_3() {
     let irrelevant4 = "CSS flexbox layout and grid systems";
 
     let chunks = vec![
-        make_chunk(
-            "irrelevant-1",
-            "d1",
-            "s",
-            irrelevant1,
-            vec![],
-            "file:///1.md",
-            embed_text(&embedder, irrelevant1).await,
-        ),
-        make_chunk(
-            "irrelevant-2",
-            "d2",
-            "s",
-            irrelevant2,
-            vec![],
-            "file:///2.md",
-            embed_text(&embedder, irrelevant2).await,
-        ),
-        make_chunk(
-            "relevant",
-            "d3",
-            "s",
-            relevant_text,
-            vec![],
-            "file:///relevant.md",
-            embed_text(&embedder, relevant_text).await,
-        ),
-        make_chunk(
-            "irrelevant-3",
-            "d4",
-            "s",
-            irrelevant3,
-            vec![],
-            "file:///3.md",
-            embed_text(&embedder, irrelevant3).await,
-        ),
-        make_chunk(
-            "irrelevant-4",
-            "d5",
-            "s",
-            irrelevant4,
-            vec![],
-            "file:///4.md",
-            embed_text(&embedder, irrelevant4).await,
-        ),
+        make_chunk(ChunkFixture {
+            id: "irrelevant-1",
+            doc_id: "d1",
+            store_id: "s",
+            text: irrelevant1,
+            heading_path: vec![],
+            uri: "file:///1.md",
+            embedding: embed_text(&embedder, irrelevant1).await,
+        }),
+        make_chunk(ChunkFixture {
+            id: "irrelevant-2",
+            doc_id: "d2",
+            store_id: "s",
+            text: irrelevant2,
+            heading_path: vec![],
+            uri: "file:///2.md",
+            embedding: embed_text(&embedder, irrelevant2).await,
+        }),
+        make_chunk(ChunkFixture {
+            id: "relevant",
+            doc_id: "d3",
+            store_id: "s",
+            text: relevant_text,
+            heading_path: vec![],
+            uri: "file:///relevant.md",
+            embedding: embed_text(&embedder, relevant_text).await,
+        }),
+        make_chunk(ChunkFixture {
+            id: "irrelevant-3",
+            doc_id: "d4",
+            store_id: "s",
+            text: irrelevant3,
+            heading_path: vec![],
+            uri: "file:///3.md",
+            embedding: embed_text(&embedder, irrelevant3).await,
+        }),
+        make_chunk(ChunkFixture {
+            id: "irrelevant-4",
+            doc_id: "d5",
+            store_id: "s",
+            text: irrelevant4,
+            heading_path: vec![],
+            uri: "file:///4.md",
+            embedding: embed_text(&embedder, irrelevant4).await,
+        }),
     ];
     store.upsert_chunks(chunks).await.unwrap();
 
@@ -1695,7 +1754,15 @@ async fn relevance_smoke_test_known_query_in_top_3() {
 
 #[test]
 fn rerank_noop_preserves_order() {
-    let chunk = make_chunk("c1", "d1", "s1", "text", vec![], "file:///a.md", vec![1.0]);
+    let chunk = make_chunk(ChunkFixture {
+        id: "c1",
+        doc_id: "d1",
+        store_id: "s1",
+        text: "text",
+        heading_path: vec![],
+        uri: "file:///a.md",
+        embedding: vec![1.0],
+    });
     let entries = vec![
         FusedChunkEntry {
             embedding_identity: None,
@@ -1750,7 +1817,15 @@ fn identity(bytes: &[u8]) -> crate::store::StoredEmbeddingIdentity {
 
 #[test]
 fn fusion_preserves_either_leg_identity_and_conflicts_are_sticky() {
-    let c = make_chunk("a", "doc", "store", "text", vec![], "uri", vec![]);
+    let c = make_chunk(ChunkFixture {
+        id: "a",
+        doc_id: "doc",
+        store_id: "store",
+        text: "text",
+        heading_path: vec![],
+        uri: "uri",
+        embedding: vec![],
+    });
     let absent = make_search_result(c, 1.0);
     let mut p = absent.clone();
     p.embedding_identity = Some(identity(&[1]));
@@ -1780,7 +1855,15 @@ fn fusion_preserves_either_leg_identity_and_conflicts_are_sticky() {
 #[test]
 fn search_identity_is_neither_serialized_nor_accepted_from_json() {
     let mut result = make_search_result(
-        make_chunk("a", "doc", "store", "text", vec![], "uri", vec![]),
+        make_chunk(ChunkFixture {
+            id: "a",
+            doc_id: "doc",
+            store_id: "store",
+            text: "text",
+            heading_path: vec![],
+            uri: "uri",
+            embedding: vec![],
+        }),
         1.0,
     );
     result.embedding_identity = Some(identity(&[1]));
@@ -1833,15 +1916,15 @@ async fn default_grouping_spans_stores_preserves_positions_and_members_beyond_to
             ("2", "distinct passage"),
             ("3", "same passage"),
         ] {
-            let mut c = make_chunk(
+            let mut c = make_chunk(ChunkFixture {
                 id,
-                "same-doc",
+                doc_id: "same-doc",
                 store_id,
                 text,
-                vec![],
-                &format!("file:///{store_id}"),
-                vec![1.0, id.parse::<f32>().unwrap(), 0.0, 0.0],
-            );
+                heading_path: vec![],
+                uri: &format!("file:///{store_id}"),
+                embedding: vec![1.0, id.parse::<f32>().unwrap(), 0.0, 0.0],
+            });
             c.block_seq = id.parse().unwrap();
             c.seq_in_block = id.parse().unwrap();
             c.policy_version = format!("policy-{store_id}-{id}");
@@ -1900,7 +1983,18 @@ async fn default_grouping_spans_stores_preserves_positions_and_members_beyond_to
 #[test]
 fn rrf_interleaving_does_not_hide_text_duplicates() {
     let make = |id: &str, text: &str| {
-        make_search_result(make_chunk(id, id, "s", text, vec![], id, vec![]), 1.0)
+        make_search_result(
+            make_chunk(ChunkFixture {
+                id,
+                doc_id: id,
+                store_id: "s",
+                text,
+                heading_path: vec![],
+                uri: id,
+                embedding: vec![],
+            }),
+            1.0,
+        )
     };
     let mut dense: Vec<_> = (0..42)
         .map(|i| make(&format!("dense-{i}"), &format!("dense text {i}")))
