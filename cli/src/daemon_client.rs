@@ -259,70 +259,65 @@ async fn redeem_refresh_token(
 /// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
 /// statically configured bearer isn't part of the login token-pair rotation
 /// model, so there is nothing to refresh.
-async fn try_refresh_and_persist(ctx: &CliContext, url: &str) -> Option<String> {
-    if ctx.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
-        return None;
-    }
+async fn try_refresh_and_persist(
+    ctx: &CliContext,
+    url: &str,
+    rejected: Option<&str>,
+) -> Option<String> {
     let base_url = base_url_of(url)?;
-    let config_file = resolved_config_file(ctx)?;
-    let credentials_file = crate::credentials::credentials_path(&config_file);
-    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)?;
-    let refresh_token = entry.refresh_token?;
-
-    let (access_token, new_entry) = redeem_refresh_token(&base_url, &refresh_token).await?;
-    crate::credentials::write_entry(&credentials_file, &base_url, new_entry).ok()?;
-
-    Some(access_token)
+    refresh_cached_bearer(ctx, &base_url, rejected).await
 }
 
-/// Resolve a currently-valid bearer for `base_url`, refreshing proactively
-/// when the cached access token is expired and a refresh token is on hand.
-///
-/// This exists for callers that open a long-lived connection up front and
-/// can't cheaply retry mid-stream on a 401 the way `daemon_request_async`
-/// does (the MCP daemon-proxy handshake in `cmds::surface::run_mcp_async`).
-/// Resolution order mirrors `bearer_for_request`/`resolve_bearer`:
-/// 1. `ctx.api_key` (`LOCALDB_API_KEY`) wins outright, returned verbatim
-///    without touching `credentials.json` — API keys aren't part of the
-///    login token-pair rotation model, so there's nothing to refresh.
-/// 2. Otherwise, the `credentials.json` entry for `base_url`: if it carries
-///    an `access_token` whose `access_expires_at` has passed and a
-///    `refresh_token` is present, redeem the refresh token and persist the
-///    rotated pair, returning the fresh access token.
-/// 3. Otherwise (including a failed refresh attempt, or an entry with no
-///    expiry info) the cached secret (`access_token` or legacy `secret`) is
-///    returned as-is — best effort, matching today's non-refreshing
-///    behavior; a stale-but-still-cached token still gets a chance against
-///    the daemon rather than sending no bearer at all.
-pub(crate) async fn ensure_fresh_bearer(ctx: &CliContext, base_url: &str) -> Option<String> {
-    if let Some(key) = ctx.api_key.as_deref() {
-        if !key.is_empty() {
-            return Some(key.to_string());
-        }
+/// One serialized path for reactive HTTP refresh and proactive MCP refresh.
+/// `rejected` is the bearer sent by the failed request, not a new cache lookup.
+async fn refresh_cached_bearer(
+    ctx: &CliContext,
+    base_url: &str,
+    rejected: Option<&str>,
+) -> Option<String> {
+    if let Some(key) = ctx.api_key.as_deref().filter(|key| !key.is_empty()) {
+        return if rejected.is_none() {
+            Some(key.to_string())
+        } else {
+            None
+        };
     }
     let config_file = resolved_config_file(ctx)?;
-    let credentials_file = crate::credentials::credentials_path(&config_file);
-    let entry = crate::credentials::lookup_entry(&credentials_file, base_url)?;
+    let path = crate::credentials::credentials_path(&config_file);
+    let needs_refresh = |entry: &crate::credentials::CredentialEntry| {
+        let current = entry.access_token.as_deref().or(entry.secret.as_deref());
+        let expired = entry.access_token.is_some()
+            && entry
+                .access_expires_at
+                .as_deref()
+                .is_some_and(localdb_core::auth::is_expired);
+        expired || rejected.is_some_and(|old| current == Some(old))
+    };
+    // Ordinary reads need no writable directory or lock: rename makes them atomic.
+    let entry = crate::credentials::lookup_entry(&path, base_url)?;
+    if !needs_refresh(&entry) {
+        return entry.access_token.or(entry.secret);
+    }
+    let lock = crate::credentials::CredentialLock::acquire(&path)
+        .await
+        .ok()?;
+    let entry = lock.lookup(base_url)?;
     let current = entry.access_token.clone().or_else(|| entry.secret.clone());
-
-    let is_expired_access_token = entry.access_token.is_some()
-        && entry
-            .access_expires_at
-            .as_deref()
-            .is_some_and(localdb_core::auth::is_expired);
-
-    if is_expired_access_token {
-        if let Some(refresh_token) = entry.refresh_token.clone() {
-            if let Some((access_token, new_entry)) =
-                redeem_refresh_token(base_url, &refresh_token).await
-            {
-                let _ = crate::credentials::write_entry(&credentials_file, base_url, new_entry);
-                return Some(access_token);
+    // A process that waited for the lock must recheck the replacement entry.
+    if needs_refresh(&entry) {
+        if let Some(refresh) = entry.refresh_token {
+            if let Some((access, updated)) = redeem_refresh_token(base_url, &refresh).await {
+                lock.write(base_url, updated).ok()?;
+                return Some(access);
             }
         }
+        return if rejected.is_none() { current } else { None };
     }
-
     current
+}
+
+pub(crate) async fn ensure_fresh_bearer(ctx: &CliContext, base_url: &str) -> Option<String> {
+    refresh_cached_bearer(ctx, base_url, None).await
 }
 
 pub(crate) async fn daemon_request_async(
@@ -343,22 +338,13 @@ pub(crate) async fn daemon_request_async(
     .await?;
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        if let Some(new_access) = try_refresh_and_persist(ctx, url).await {
+        if let Some(new_access) = try_refresh_and_persist(ctx, url, bearer.as_deref()).await {
             let (status2, json2) =
                 send_once(&client, method, url, body.as_ref(), Some(&new_access)).await?;
             return if status2.is_success() {
                 Ok(json2)
             } else {
-                let code = json2
-                    .get("code")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("internal");
-                let msg = json2
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("daemon error")
-                    .to_string();
-                Err(decode_daemon_error(code, msg, status2))
+                Err(daemon_response_error(status2, &json2))
             };
         }
         return Err(Error::Unauthorized {
@@ -370,19 +356,7 @@ pub(crate) async fn daemon_request_async(
     if status.is_success() {
         Ok(json)
     } else {
-        // Map HTTP error codes to our error types.
-        // The server's error body uses {code, message} (see server/src/error.rs).
-        let code = json
-            .get("code")
-            .and_then(|e| e.as_str())
-            .unwrap_or("internal");
-        let msg = json
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("daemon error")
-            .to_string();
-
-        Err(decode_daemon_error(code, msg, status))
+        Err(daemon_response_error(status, &json))
     }
 }
 
@@ -398,6 +372,22 @@ pub(crate) async fn daemon_request_async(
 /// which round-trip through a single message string) is specific to this
 /// call site: it folds the HTTP status into the message, which `from_code`
 /// has no access to.
+pub(crate) fn daemon_response_error(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> Error {
+    decode_daemon_error(
+        body.get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("internal"),
+        body.get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon error")
+            .to_string(),
+        status,
+    )
+}
+
 fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> Error {
     Error::from_code(code, msg.clone()).unwrap_or_else(|| Error::Internal {
         message: format!("daemon returned {}: {}", status.as_u16(), msg),

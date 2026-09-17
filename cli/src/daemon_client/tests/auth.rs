@@ -454,3 +454,148 @@ async fn ensure_fresh_bearer_falls_back_to_stale_token_when_refresh_fails() {
              (best effort) rather than nothing at all"
     );
 }
+
+// Invoked in separate OS processes by the test below; ordinary test runs do nothing.
+#[test]
+fn refresh_process_worker() {
+    let Ok(config) = std::env::var("LOCALDB_TEST_REFRESH_CONFIG") else {
+        return;
+    };
+    let base = std::env::var("LOCALDB_TEST_REFRESH_URL").unwrap();
+    let ctx = ctx_with_config(std::path::Path::new(&config));
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        if std::env::var("LOCALDB_TEST_REFRESH_PROACTIVE").is_ok() {
+            assert_eq!(
+                ensure_fresh_bearer(&ctx, &base).await.as_deref(),
+                Some("new_access")
+            );
+        } else {
+            daemon_request_async(
+                &ctx,
+                reqwest::Method::GET,
+                &format!("{base}/v1/status"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    });
+}
+
+#[tokio::test]
+async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let rotations = Arc::new(AtomicUsize::new(0));
+    let counter = rotations.clone();
+    let app = axum::Router::new()
+        .route("/token", axum::routing::post(move || {
+            let counter = counter.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let count = counter.fetch_add(1, Ordering::SeqCst);
+                let status = if count == 0 { axum::http::StatusCode::OK } else { axum::http::StatusCode::BAD_REQUEST };
+                (status, axum::Json(serde_json::json!({"access_token":"new_access", "refresh_token":"new_refresh", "expires_in":3600})))
+            }
+        }))
+        .route("/v1/status", axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            let status = if headers.get("authorization").and_then(|h| h.to_str().ok()) == Some("Bearer new_access") { axum::http::StatusCode::OK } else { axum::http::StatusCode::UNAUTHORIZED };
+            (status, axum::Json(serde_json::json!({})))
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.yaml");
+    let path = crate::credentials::credentials_path(&config);
+    crate::credentials::write_entry(
+        &path,
+        &base,
+        crate::credentials::CredentialEntry {
+            access_token: Some("old_access".into()),
+            refresh_token: Some("old_refresh".into()),
+            access_expires_at: Some("2000-01-01T00:00:00Z".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::credentials::write_entry(
+        &path,
+        "https://other.example",
+        crate::credentials::CredentialEntry {
+            secret: Some("keep".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut children = Vec::new();
+    for proactive in [false, true] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "daemon_client::tests::auth::refresh_process_worker",
+                "--nocapture",
+            ])
+            .env("LOCALDB_TEST_REFRESH_CONFIG", &config)
+            .env("LOCALDB_TEST_REFRESH_URL", &base)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if proactive {
+            command.env("LOCALDB_TEST_REFRESH_PROACTIVE", "1");
+        }
+        children.push(command.spawn().unwrap());
+    }
+    for child in children {
+        let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(rotations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        crate::credentials::lookup_secret(&path, "https://other.example").as_deref(),
+        Some("keep")
+    );
+    assert_eq!(
+        ensure_fresh_bearer(&ctx_with_config(&config), &base)
+            .await
+            .as_deref(),
+        Some("new_access")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn valid_cached_credentials_do_not_require_a_writable_lock_file() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.yaml");
+    let path = crate::credentials::credentials_path(&config);
+    let base = "https://daemon.example";
+    crate::credentials::write_entry(
+        &path,
+        base,
+        crate::credentials::CredentialEntry {
+            secret: Some("read-only-key".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Deterministically prevent opening a lock file, even when tests run as root.
+    std::fs::create_dir(dir.path().join("credentials.lock")).unwrap();
+    assert_eq!(
+        ensure_fresh_bearer(&ctx_with_config(&config), base)
+            .await
+            .as_deref(),
+        Some("read-only-key")
+    );
+}

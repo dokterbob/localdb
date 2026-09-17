@@ -177,7 +177,7 @@ async fn perform_invite_login(
                 message: "redeem response is missing api_key".to_string(),
                 correlation_id: "login_invite_open_response".to_string(),
             })?;
-        persist_api_key(ctx, base_url, api_key)?;
+        persist_api_key(ctx, base_url, api_key).await?;
         return Ok(requested_name);
     }
 
@@ -214,16 +214,11 @@ async fn perform_invite_login(
             poll_interval,
         )
         .await?;
-        persist_api_key(ctx, base_url, &api_key)?;
+        persist_api_key(ctx, base_url, &api_key).await?;
         return Ok(requested_name);
     }
 
-    let message = body
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("invite redemption failed")
-        .to_string();
-    Err(Error::Unauthorized { message })
+    Err(crate::daemon_client::daemon_response_error(status, &body))
 }
 
 /// Poll `GET /v1/invites/requests/{id}?secret=...` every `poll_interval`
@@ -245,7 +240,11 @@ async fn poll_until_decided(
             .send()
             .await
             .map_err(|_| Error::DaemonUnreachable)?;
+        let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            return Err(crate::daemon_client::daemon_response_error(status, &body));
+        }
         match body.get("state").and_then(|v| v.as_str()) {
             Some("approved") => {
                 return body
@@ -270,8 +269,12 @@ async fn poll_until_decided(
                     correlation_id: "login_invite_poll_already_collected".to_string(),
                 });
             }
+            Some("pending") => tokio::time::sleep(poll_interval).await,
             _ => {
-                tokio::time::sleep(poll_interval).await;
+                return Err(Error::Internal {
+                    message: "invalid approval response".into(),
+                    correlation_id: "login_invite_poll_response".into(),
+                })
             }
         }
     }
@@ -280,7 +283,7 @@ async fn poll_until_decided(
 /// Persist a redeemed invite's API key into `credentials.json` under the
 /// legacy `secret` shape (D1: API keys have no default expiry, unlike the
 /// OAuth access/refresh pair `perform_login` writes).
-fn persist_api_key(ctx: &CliContext, base_url: &str, api_key: &str) -> Result<(), Error> {
+async fn persist_api_key(ctx: &CliContext, base_url: &str, api_key: &str) -> Result<(), Error> {
     let config_file = resolved_config_file(ctx).ok_or_else(|| Error::InvalidConfig {
         message: "cannot resolve the config file path to write credentials.json".to_string(),
     })?;
@@ -291,12 +294,22 @@ fn persist_api_key(ctx: &CliContext, base_url: &str, api_key: &str) -> Result<()
         refresh_token: None,
         access_expires_at: None,
     };
-    crate::credentials::write_entry(&credentials_file, base_url, entry).map_err(|e| {
-        Error::Internal {
+    write_credential(&credentials_file, base_url, entry)
+        .await
+        .map_err(|e| Error::Internal {
             message: format!("failed to write credentials.json: {e}"),
             correlation_id: "login_invite_persist_write".to_string(),
-        }
-    })
+        })
+}
+
+async fn write_credential(
+    path: &std::path::Path,
+    base_url: &str,
+    entry: CredentialEntry,
+) -> std::io::Result<()> {
+    crate::credentials::CredentialLock::acquire(path)
+        .await?
+        .write(base_url, entry)
 }
 
 /// `localdb logout [--url <base>]`
@@ -318,29 +331,10 @@ pub(crate) async fn run_logout_async(ctx: &CliContext, url: Option<&str>) {
     };
     let credentials_file = crate::credentials::credentials_path(&config_file);
 
-    if let Some(entry) = crate::credentials::lookup_entry(&credentials_file, &base_url) {
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            for secret in [
-                entry.access_token.as_deref(),
-                entry.refresh_token.as_deref(),
-                entry.secret.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let _ = client
-                    .post(format!("{base_url}/revoke"))
-                    .form(&[("token", secret)])
-                    .send()
-                    .await;
-            }
-        }
-    }
-
-    let removed = crate::credentials::remove_entry(&credentials_file, &base_url).unwrap_or(false);
+    let removed = match revoke_and_remove(&credentials_file, &base_url).await {
+        Ok(removed) => removed,
+        Err(error) => exit_err(&error, ctx.json),
+    };
     if ctx.json {
         print_json(&json!({ "status": "ok", "base_url": base_url, "removed": removed }));
     } else if removed {
@@ -348,6 +342,44 @@ pub(crate) async fn run_logout_async(ctx: &CliContext, url: Option<&str>) {
     } else {
         println!("No cached credentials found for {base_url}.");
     }
+}
+
+async fn revoke_and_remove(path: &std::path::Path, base_url: &str) -> Result<bool, Error> {
+    let storage_error = |e: std::io::Error| Error::Internal {
+        message: format!("credential cache: {e}"),
+        correlation_id: "logout_cache".into(),
+    };
+    let lock = crate::credentials::CredentialLock::acquire(path)
+        .await
+        .map_err(storage_error)?;
+    if let Some(entry) = lock.lookup(base_url) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| Error::Internal {
+                message: e.to_string(),
+                correlation_id: "logout_client".into(),
+            })?;
+        for secret in [entry.access_token, entry.refresh_token, entry.secret]
+            .into_iter()
+            .flatten()
+        {
+            let response = client
+                .post(format!("{base_url}/revoke"))
+                .form(&[("token", secret)])
+                .send()
+                .await
+                .map_err(|_| Error::DaemonUnreachable)?;
+            if !response.status().is_success() {
+                return Err(Error::Internal {
+                    message: "logout could not revoke credentials; cache retained, retry logout"
+                        .into(),
+                    correlation_id: "logout_revoke".into(),
+                });
+            }
+        }
+    }
+    lock.remove(base_url).map_err(storage_error)
 }
 
 /// Resolve the daemon base URL to log in/out against: `--url` wins; else
@@ -466,12 +498,12 @@ async fn perform_login(
         refresh_token,
         access_expires_at: Some(localdb_core::auth::rfc3339_from_now(expires_in)),
     };
-    crate::credentials::write_entry(&credentials_file, base_url, entry).map_err(|e| {
-        Error::Internal {
+    write_credential(&credentials_file, base_url, entry)
+        .await
+        .map_err(|e| Error::Internal {
             message: format!("failed to write credentials.json: {e}"),
             correlation_id: "login_persist_write".to_string(),
-        }
-    })?;
+        })?;
 
     Ok(LoginSummary {
         base_url: base_url.to_string(),

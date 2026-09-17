@@ -300,3 +300,45 @@ fn legacy_secret_only_file_still_reads_via_lookup_entry() {
     assert_eq!(entry.secret.as_deref(), Some("ldb_legacy"));
     assert!(entry.access_token.is_none());
 }
+
+#[tokio::test]
+async fn locked_mutations_preserve_concurrent_origins_and_release_on_drop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials.json");
+    let held = CredentialLock::acquire(&path).await.unwrap();
+    let other_path = path.clone();
+    let waiting = tokio::spawn(async move {
+        let lock = CredentialLock::acquire(&other_path).await.unwrap();
+        lock.write(
+            "https://second.example",
+            CredentialEntry {
+                secret: Some("second".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    });
+    held.write(
+        "https://first.example",
+        CredentialEntry {
+            secret: Some("first".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lookup_secret(&path, "https://first.example").as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        lookup_secret(&path, "https://second.example").as_deref(),
+        Some("second")
+    );
+}

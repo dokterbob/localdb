@@ -399,3 +399,100 @@ async fn perform_invite_login_closed_mode_denied_fails_with_clear_error() {
     let err = result.expect_err("a denied request must surface as an error");
     assert!(matches!(err, Error::Unauthorized { .. }));
 }
+
+#[tokio::test]
+async fn invite_duplicate_name_preserves_invalid_request() {
+    let (dir, state, base) = spawn_test_daemon().await;
+    state
+        .auth()
+        .create_user("taken", Role::Member)
+        .await
+        .unwrap();
+    let invite = state
+        .auth()
+        .create_invite(localdb_core::auth::InviteMode::Open, &[], 1, None, "admin")
+        .await
+        .unwrap();
+    let error = perform_invite_login(
+        &ctx_for(&dir),
+        &base,
+        &invite.secret,
+        Some("taken"),
+        std::time::Duration::from_millis(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidRequest { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn polling_stops_on_http_errors_and_malformed_success() {
+    for (status, body) in [
+        (
+            400,
+            serde_json::json!({"code":"invalid_request","message":"bad request"}),
+        ),
+        (
+            500,
+            serde_json::json!({"code":"internal","message":"unavailable"}),
+        ),
+        (200, serde_json::json!({"unexpected":true})),
+    ] {
+        let app = axum::Router::new().fallback(move || async move {
+            (
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                axum::Json(body),
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            poll_until_decided(
+                &reqwest::Client::new(),
+                &base,
+                "id",
+                "secret",
+                std::time::Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("poll must terminate");
+        assert!(result.is_err());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn failed_logout_keeps_cache_for_retry() {
+    let dir = TempDir::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app =
+        axum::Router::new().fallback(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let path = dir.path().join("credentials.json");
+    write_credential(
+        &path,
+        &base,
+        CredentialEntry {
+            secret: Some("key".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(revoke_and_remove(&path, &base).await.is_err());
+    assert_eq!(
+        crate::credentials::lookup_secret(&path, &base).as_deref(),
+        Some("key")
+    );
+    server.abort();
+    assert!(revoke_and_remove(&path, &base).await.is_err());
+    assert!(crate::credentials::lookup_entry(&path, &base).is_some());
+}

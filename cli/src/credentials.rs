@@ -127,6 +127,55 @@ pub(crate) fn resolve_bearer(
     lookup_secret(&credentials_path(config_file), base_url)
 }
 
+/// A stable sibling lock survives replacement of credentials.json. Hold it across
+/// read/refresh/write, and across logout, so all processes observe one mutation order.
+/// Independent file handles also serialize tasks within one process.
+pub(crate) struct CredentialLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl CredentialLock {
+    pub(crate) async fn acquire(path: &Path) -> std::io::Result<Self> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path.with_file_name("credentials.lock"))?;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: path.to_owned(),
+                        _file: file,
+                    })
+                }
+                Err(error)
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn lookup(&self, base_url: &str) -> Option<CredentialEntry> {
+        lookup_entry(&self.path, base_url)
+    }
+    pub(crate) fn write(&self, base_url: &str, entry: CredentialEntry) -> std::io::Result<()> {
+        write_entry(&self.path, base_url, entry)
+    }
+    pub(crate) fn remove(&self, base_url: &str) -> std::io::Result<bool> {
+        remove_entry(&self.path, base_url)
+    }
+}
+
 /// Atomically insert/replace the entry for `base_url`: read-modify-write via
 /// a temp file in the same directory followed by a rename (atomic on the
 /// same filesystem), with `0600` permissions set on the temp file before

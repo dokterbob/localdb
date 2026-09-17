@@ -838,28 +838,28 @@ fn member_key_against_mock_daemon_admin_op_exits_6() {
 }
 
 #[test]
-fn logout_url_flag_bypasses_daemon_probing() {
-    // `--url` is honored even when no daemon is detected via the socket —
-    // logout should not require a live daemon to clear a local credential.
+fn logout_url_flag_reports_failed_revocation_and_retains_cache() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
-    std::fs::write(
-        dir.path().join("credentials.json"),
-        r#"{"version":1,"credentials":{"http://127.0.0.1:19999":{"secret":"ldb_stale"}}}"#,
-    )
-    .unwrap();
-
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let path = dir.path().join("credentials.json");
+    let credentials =
+        serde_json::json!({"version":1,"credentials":{base.clone():{"secret":"ldb_stale"}}});
+    std::fs::write(&path, credentials.to_string()).unwrap();
     let output = cmd_with_dir(&dir)
-        .args(["logout", "--url", "http://127.0.0.1:19999"])
+        .args(["logout", "--url", &base])
         .output()
         .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.to_lowercase().contains("logged out"));
-
-    let contents = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
-    assert!(
-        !contents.contains("ldb_stale"),
-        "the cached credential must be removed: {contents}"
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout)
+        .to_lowercase()
+        .contains("logged out"));
+    let retained: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        retained, credentials,
+        "failed revocation must remain retryable"
     );
 }
