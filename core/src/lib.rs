@@ -44,7 +44,9 @@ pub use block::{
 pub use blocking::run_blocking;
 pub use chunker::{chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
-pub use citation::Citation;
+pub use citation::{
+    Citation, CitationChunkRef, CitationDuplicate, CitationOccurrence, DuplicateReason,
+};
 pub use diagnostics::{bytes_per_chunk, compute_db_file_size, format_bytes, DbFileSize};
 pub use documents::{
     get_document_detail, get_document_detail_scoped, reconstruct_document_text, DocumentDetail,
@@ -71,7 +73,7 @@ pub use parser::{ChainParser, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
     clamp_search_limit, rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry,
-    QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle, SEARCH_MAX_LIMIT,
+    QueryRequest, QueryResponse, SearchDedup, SearchOrchestrator, StoreHandle, SEARCH_MAX_LIMIT,
 };
 pub use search_filters::SearchFilters;
 pub use snippet::truncate_snippet;
@@ -80,7 +82,7 @@ pub use source::source_row_to_source;
 pub use store::FakeStore;
 pub use store::{
     ChunkRecord, DateAxis, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult,
-    StaleFeedResource, StoreStats,
+    StaleFeedResource, StoreStats, StoredEmbeddingIdentity,
 };
 pub use types::{
     validate_dc_meta_key, validate_msg_meta_key, BackendConfig, Chunk, ChunkingConfig, Document,

@@ -19,3 +19,24 @@ fn resolve_page_end_rejects_overflow_as_invalid_request() {
         other => panic!("expected InvalidRequest, got {other:?}"),
     }
 }
+
+#[test]
+fn search_dedup_request_default_modes_and_invalid_values() {
+    let default: SearchRequest = serde_json::from_value(serde_json::json!({"query":"x"})).unwrap();
+    assert_eq!(default.dedup, localdb_core::SearchDedup::TextAndVector);
+    for mode in ["off", "text", "text_and_vector"] {
+        let request: SearchRequest =
+            serde_json::from_value(serde_json::json!({"query":"x", "dedup":mode})).unwrap();
+        assert_eq!(request.dedup.to_string(), mode);
+    }
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(false),
+        serde_json::json!("approximate"),
+    ] {
+        assert!(serde_json::from_value::<SearchRequest>(
+            serde_json::json!({"query":"x", "dedup":invalid})
+        )
+        .is_err());
+    }
+}

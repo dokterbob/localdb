@@ -167,7 +167,10 @@ appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mcp`, `st
  │  single RRF fusion (k=60; key = store_id+chunk_id)      │
  │       │                                                 │
  │       ▼                                                 │
- │  top-N Citations (fused + per-leg scores)               │
+ │  rerank seam → exact passage grouping                  │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  top-N compact Citations (scores + occurrences)         │
  └─────────────────────────────────────────────────────────┘
 ```
 
@@ -178,6 +181,19 @@ from whitespace-normalization tweaks) without the chunk's actual membership chan
 otherwise needlessly churn IDs. See
 [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
 §3.
+
+Grouping follows fusion and the rerank seam, before top-N. It compares complete stored passage text
+and, by default, exact raw stored-vector identity under equal nonempty policies. Only
+representatives register lookup keys, so groups are direct rather than transitive. Hash maps span
+the candidate pool: RRF can interleave duplicates. Contextual chunk IDs and document content hashes
+cannot identify text-only duplicates. No persistent grouping or schema change is involved.
+
+Compact citation groups retain each occurrence's identifiers, source, location, and metadata while
+emitting each distinct text once. `total_candidates` describes fused occurrences; `total_results`
+describes groups before truncation. Authorization, selected-store scope, and filters apply before
+grouping. No additional retrieval rounds enumerate missing copies or refill collapsed pages.
+Profiling before adding fast paths is tracked in
+[#355](https://github.com/dokterbob/localdb/issues/355); no performance benefit has been measured.
 
 The `Citation` is the canonical output shape used by every surface — CLI, HTTP, and MCP all return
 the same structure. See
@@ -777,8 +793,9 @@ recommendation:
 
 - **[#47](https://github.com/dokterbob/localdb/issues/47)**: `policy_version` does not hash resolved
   per-source chunking parameters.
-- **[#95](https://github.com/dokterbob/localdb/issues/95)**: cross-store deduplication semantics —
-  collapse citations sharing a content hash, or keep them distinct.
+- **[#346](https://github.com/dokterbob/localdb/issues/346)**: approximate and persistent document
+  grouping remain deferred. Exact search-time passage grouping from #95 is implemented; it uses
+  complete text or eligible raw stored vectors, preserving occurrence-specific citations.
 - **[#267](https://github.com/dokterbob/localdb/issues/267)**: structured MCP tool results. The spec
   already decided this; the implementation is what is deferred.
 - **[#268](https://github.com/dokterbob/localdb/issues/268)**: allowed character set for store names

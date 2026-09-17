@@ -33,6 +33,10 @@ pub struct SearchArgs {
     #[schemars(description = "Natural language search query")]
     pub query: String,
 
+    /// Group exact stored text and optionally identical stored vectors (default: text_and_vector).
+    #[serde(default)]
+    pub dedup: localdb_core::SearchDedup,
+
     /// Optional list of store names to search. Defaults to all stores.
     #[serde(default)]
     #[schemars(description = "Optional list of store names to search. Defaults to all stores.")]
@@ -48,11 +52,11 @@ pub struct SearchArgs {
 
     /// Soft cap on snippet text chars per result in the text rendering; snaps
     /// to the nearest paragraph/sentence/word boundary rather than cutting
-    /// mid-word (default: 400). The JSON citation payload always carries the
-    /// full snippet.
+    /// mid-word (default: 400). Structured output retains distinct snippets
+    /// in full; repeated occurrence text is omitted or referenced.
     #[serde(default)]
     #[schemars(
-        description = "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload always carries the full snippet.",
+        description = "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload retains each distinct snippet in full; repeated occurrence text is omitted or referenced.",
         range(min = 1)
     )]
     pub content_length: Option<i64>,

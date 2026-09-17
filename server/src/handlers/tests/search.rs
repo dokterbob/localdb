@@ -406,3 +406,81 @@ async fn search_malformed_date_filter_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn search_groups_across_selected_stores_and_pages_groups() {
+    let (_dir, state) = make_state_with_fake_config().await;
+    for (store, chunk, text) in [
+        ("a", "c-a", "shared hello"),
+        ("b", "c-b", "shared hello"),
+        ("c", "c-c", "distinct hello"),
+    ] {
+        super::common::seed_chunk_in_store(
+            &state,
+            store,
+            SeedChunkInput {
+                chunk_id: chunk,
+                doc_id: chunk,
+                text,
+                uri: "file:///same.md",
+                metadata: Default::default(),
+            },
+        )
+        .await;
+    }
+    let app = crate::daemon::build_router(
+        state.clone(),
+        Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+    let first = search_page(&app, "hello", 1, None).await;
+    assert_eq!(first["total_candidates"], 3);
+    assert_eq!(first["total_results"], 2);
+    assert_eq!(first["next_cursor"], "1");
+    let second = search_page(&app, "hello", 1, Some("1")).await;
+    assert_eq!(second["total_results"], 2);
+    assert!(second["next_cursor"].is_null());
+    let occurrences: usize = [&first, &second]
+        .into_iter()
+        .map(|page| {
+            let c = &page["citations"][0];
+            1 + c
+                .get("duplicates")
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len)
+        })
+        .sum();
+    assert_eq!(occurrences, 3);
+    let past = search_page(&app, "hello", 1, Some("2")).await;
+    assert_eq!(past["citations"], json!([]));
+    assert_eq!(past["total_candidates"], 3);
+    assert_eq!(past["total_results"], 2);
+    assert!(past["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn invalid_dedup_is_http_400_with_invalid_request() {
+    let (_dir, app) = make_app().await;
+    for mode in [serde_json::Value::Null, json!(false), json!("unknown")] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"query":"hello", "dedup":mode}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response.into_body()).await["code"],
+            "invalid_request"
+        );
+    }
+}

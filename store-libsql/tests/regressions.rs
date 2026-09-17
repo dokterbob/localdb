@@ -244,6 +244,14 @@ async fn dense_search_exact_fallback_when_ann_cap_saturated() {
          when ANN is saturated by store-B's 25 chunks. Got: {results:?}"
     );
     assert_eq!(results[0].chunk.id, "a-chunk-0");
+    let identity = results[0].embedding_identity.as_ref().unwrap();
+    assert_eq!(identity.format, "libsql-blob-v1");
+    assert_eq!(identity.encoding, VectorEncoding::Float32);
+    assert_eq!(identity.dimensions, 2);
+    assert!(!identity.bytes.is_empty());
+    let bm25 = handle_a.bm25_search("text", 10, &[]).await.unwrap();
+    let hit = bm25.iter().find(|hit| hit.chunk.id == "a-chunk-0").unwrap();
+    assert_eq!(hit.embedding_identity.as_ref(), Some(identity));
 }
 
 /// Regression for Codex round-3 finding R2: a resource's *ingestion* time must

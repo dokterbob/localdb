@@ -236,7 +236,7 @@ curl -s http://127.0.0.1:7700/v1/status
   "store_count": 1,
   "source_count": 0,
   "job_count": 0,
-  "features": ["search_filters"],
+  "features": ["search_dedup", "search_filters", "refetch"],
   "stores": [
     {
       "name": "notes",
@@ -258,20 +258,20 @@ curl -s http://127.0.0.1:7700/v1/status
 }
 ```
 
-| Field                                              | Type      | Description                                                                                                                                                                                                                                                           |
-| -------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemon`                                           | bool      | Always `true` when the daemon is responding                                                                                                                                                                                                                           |
-| `store_count`                                      | int       | Number of stores known to this daemon instance                                                                                                                                                                                                                        |
-| `source_count`                                     | int       | Total sources across all stores                                                                                                                                                                                                                                       |
-| `job_count`                                        | int       | Number of jobs ever created in this daemon session                                                                                                                                                                                                                    |
-| `stores[].document_count` / `stores[].chunk_count` | int\|null | Per-store `RetrievalStore::stats()` figures; `null` if that store's stats call itself failed (a corrupt or mid-migration store must not blank out the report on the others)                                                                                           |
-| `database.path`                                    | string    | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store                                                                                                                                                   |
-| `database.exists`                                  | bool      | Whether the file exists yet (`false` before the first `store add`/`index`)                                                                                                                                                                                            |
-| `database.size_bytes` / `database.wal_size_bytes`  | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails                                                                                                                                                                                                       |
-| `features`                                         | string[]  | Capabilities this daemon supports, so a newer client can tell whether an older running daemon will honour a request before sending it. Currently `["search_filters"]`. Treat an absent or unknown name as unsupported — daemons predating this field omit it entirely |
-| `database.total_size_bytes`                        | int       | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now                                                                                                                                                      |
-| `database.bytes_per_chunk`                         | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks                                                                                                                                                                           |
-| `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                                                                                                            |
+| Field                                              | Type      | Description                                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon`                                           | bool      | Always `true` when the daemon is responding                                                                                                                                                                                                                                                     |
+| `store_count`                                      | int       | Number of stores known to this daemon instance                                                                                                                                                                                                                                                  |
+| `source_count`                                     | int       | Total sources across all stores                                                                                                                                                                                                                                                                 |
+| `job_count`                                        | int       | Number of jobs ever created in this daemon session                                                                                                                                                                                                                                              |
+| `stores[].document_count` / `stores[].chunk_count` | int\|null | Per-store `RetrievalStore::stats()` figures; `null` if that store's stats call itself failed (a corrupt or mid-migration store must not blank out the report on the others)                                                                                                                     |
+| `database.path`                                    | string    | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store                                                                                                                                                                             |
+| `database.exists`                                  | bool      | Whether the file exists yet (`false` before the first `store add`/`index`)                                                                                                                                                                                                                      |
+| `database.size_bytes` / `database.wal_size_bytes`  | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails                                                                                                                                                                                                                                 |
+| `features`                                         | string[]  | Capabilities this daemon supports, so a newer client can tell whether an older running daemon will honour a request before sending it. Includes `search_filters`, `search_dedup`, and `refetch`. Treat an absent or unknown name as unsupported — daemons predating this field omit it entirely |
+| `database.total_size_bytes`                        | int       | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now                                                                                                                                                                                |
+| `database.bytes_per_chunk`                         | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks                                                                                                                                                                                                     |
+| `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                                                                                                                                      |
 
 This is the same shape the embedded CLI's `localdb status --json` reports (see
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.4) —
@@ -622,6 +622,7 @@ daemon and the CLI share `<data_dir>/localdb.db`.
 | `query`                            | string   | yes      | Natural language search query                                                                                                 |
 | `store_filter`                     | string[] | no       | Store names to search; omit or pass `[]` to search all stores                                                                 |
 | `limit`                            | int      | no       | Maximum results to return (default: 10; silently clamped to 100, `SEARCH_MAX_LIMIT`)                                          |
+| `dedup`                            | string   | no       | `off`, `text`, or `text_and_vector` (default); null and unknown values are invalid requests                                   |
 | `cursor`                           | string   | no       | Pagination cursor from a previous response                                                                                    |
 | `path`                             | string   | no       | Restrict to resources whose URI starts with this prefix. Matched with SQL `LIKE`, so a literal `%` or `_` acts as a wildcard. |
 | `mime`                             | string   | no       | Restrict to resources with this exact MIME type, compared as an exact string.                                                 |
@@ -649,6 +650,7 @@ curl -s -X POST http://127.0.0.1:7700/v1/search \
 {
   "citations": [],
   "total_candidates": 0,
+  "total_results": 0,
   "next_cursor": null
 }
 ```
@@ -656,6 +658,147 @@ curl -s -X POST http://127.0.0.1:7700/v1/search \
 Each citation in `citations` follows the canonical Citation shape defined in
 [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
 §6. For a fully-populated example see the `localdb search --json` output in the CLI reference.
+
+Grouping runs across the selected stores the caller can access, after metadata filtering. It
+compares exact stored text or eligible stored-vector bytes under the same nonempty indexing policy;
+it never collapses whole documents or performs extra reads to enumerate copies.
+
+`total_candidates` counts distinct retrieved `(store_id, chunk_id)` occurrences before grouping.
+`total_results` counts representative groups before the page limit. These are candidate-pool counts,
+not collection totals. The default budget remains 50 results per leg per store; heavily collapsed
+pages are not refilled. With `dedup: "off"`, the two counts coincide.
+
+Citations use compact text ownership: exact copies omit `snippet` and `snippet_ref`, meaning the
+representative's snippet. A differing text appears once in an alternate's `snippet`; later copies
+carry `snippet_ref` pointing to that earlier owner's `(store_id, chunk_id)` within the same group.
+All occurrence identifiers, metadata, and locations survive. See the
+[complete grouped examples](search-groups.json); wrap either example's `citations` with the counts
+and `next_cursor`. For the four-occurrence `differing_text` example, the counts are 4 and 1, and
+`next_cursor` is null when requesting at least one group.
+
+A complete exact-text response (synthetic identifiers and scores; `dedup: "text"`) is:
+
+```json
+{
+  "citations": [
+    {
+      "chunk_id": "chunk-0",
+      "resource_id": "resource-0",
+      "store": {
+        "id": "store-a",
+        "name": "notes"
+      },
+      "uri": "file:///notes/copy-0.txt",
+      "title": null,
+      "heading_path": [],
+      "block": {
+        "seq": 0,
+        "kind": "text"
+      },
+      "chunk_position": {
+        "seq_in_block": 0
+      },
+      "location": {
+        "span": {
+          "start": 0,
+          "end": 15
+        }
+      },
+      "snippet": "Shared passage.",
+      "score": {
+        "fused": 0.03,
+        "dense": 0.8,
+        "bm25": null
+      },
+      "provenance": {
+        "fetched_at": "2026-09-17T00:00:00Z",
+        "content_hash": "document-hash-0"
+      },
+      "metadata": {
+        "title": null,
+        "description": null,
+        "publisher": null,
+        "date": null,
+        "type": null,
+        "format": null,
+        "identifier": null,
+        "source": null,
+        "language": null,
+        "coverage": null,
+        "rights": null,
+        "page_count": null,
+        "word_count": null,
+        "creator": [],
+        "subject": [],
+        "contributor": [],
+        "relation": [],
+        "kind": "document"
+      },
+      "duplicates": [
+        {
+          "reasons": ["exact_text"],
+          "citation": {
+            "chunk_id": "chunk-1",
+            "resource_id": "resource-1",
+            "store": {
+              "id": "store-a",
+              "name": "notes"
+            },
+            "uri": "file:///notes/copy-1.txt",
+            "title": null,
+            "heading_path": [],
+            "block": {
+              "seq": 1,
+              "kind": "text"
+            },
+            "chunk_position": {
+              "seq_in_block": 0
+            },
+            "location": {
+              "span": {
+                "start": 0,
+                "end": 15
+              }
+            },
+            "score": {
+              "fused": 0.028999999999999998,
+              "dense": 0.8,
+              "bm25": null
+            },
+            "provenance": {
+              "fetched_at": "2026-09-17T00:00:00Z",
+              "content_hash": "document-hash-1"
+            },
+            "metadata": {
+              "title": null,
+              "description": null,
+              "publisher": null,
+              "date": null,
+              "type": null,
+              "format": null,
+              "identifier": null,
+              "source": null,
+              "language": null,
+              "coverage": null,
+              "rights": null,
+              "page_count": null,
+              "word_count": null,
+              "creator": [],
+              "subject": [],
+              "contributor": [],
+              "relation": [],
+              "kind": "document"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "total_candidates": 2,
+  "total_results": 1,
+  "next_cursor": null
+}
+```
 
 A `limit` above 100 is not an error — it is silently clamped to 100
 (`localdb_core::SEARCH_MAX_LIMIT`), matching the MCP `search` tool's own cap.
@@ -951,6 +1094,14 @@ section above for why.
 | `limit`         | server default | Maximum items per page; must be ≥ 1 (`0` is `invalid_request`) |
 
 A `next_cursor` of `null` means the last page has been reached.
+
+Search pagination uses the request body's `cursor` and `limit`. The server checks offset + limit for
+overflow, groups the full candidate pool, requests that many groups, and skips offset. `next_cursor`
+uses `total_results`, so duplicate occurrences cannot create phantom pages. Every returned group
+includes all matching retrieved members, including those below the original occurrence limit.
+Out-of-range pages return empty citations, the pool's counts, and a null cursor. Ordering is
+deterministic for the same candidate pool; no snapshot consistency or stable ANN candidate
+membership across requests is promised.
 
 ---
 

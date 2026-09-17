@@ -3,7 +3,7 @@ use axum::{extract::State, Extension, Json};
 use localdb_core::auth::Principal;
 
 use super::require_principal;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::search_service::{SearchRequest, SearchResponse, SearchService};
 use crate::state::AppState;
 
@@ -15,7 +15,7 @@ use crate::state::AppState;
 pub async fn search(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
-    Json(req): Json<SearchRequest>,
+    ApiJson(req): ApiJson<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let principal = require_principal(principal)?;
     let svc = SearchService::new(state);

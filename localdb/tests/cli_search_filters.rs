@@ -130,7 +130,8 @@ fn setup_filter_fixtures(dir: &TempDir) -> (&'static str, String) {
 /// Run `localdb --json --store <store> search [extra_flags...] <QUERY_WORDS>`
 /// and parse the JSON response.
 fn run_search_json(dir: &TempDir, store: &str, extra_flags: &[&str]) -> serde_json::Value {
-    let mut args: Vec<&str> = vec!["--json", "--store", store, "search"];
+    // Exercise filter membership independently of passage grouping.
+    let mut args: Vec<&str> = vec!["--json", "--store", store, "search", "--dedup", "off"];
     args.extend_from_slice(extra_flags);
     args.extend_from_slice(&QUERY_WORDS);
 

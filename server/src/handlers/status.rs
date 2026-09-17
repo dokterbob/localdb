@@ -70,6 +70,9 @@ pub struct StatusResponse {
 
 /// Capability advertised by [`StatusResponse::features`] when `POST
 /// /v1/search` honours [`localdb_core::SearchFilters`].
+pub const FEATURE_SEARCH_DEDUP: &str = "search_dedup";
+
+/// Search-filter request support.
 pub const FEATURE_SEARCH_FILTERS: &str = "search_filters";
 
 /// Capability advertised by [`StatusResponse::features`] when `POST
@@ -186,6 +189,7 @@ pub async fn get_status(
         },
         stores,
         features: vec![
+            FEATURE_SEARCH_DEDUP.to_string(),
             FEATURE_SEARCH_FILTERS.to_string(),
             FEATURE_REFETCH.to_string(),
         ],

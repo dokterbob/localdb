@@ -168,12 +168,9 @@ claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
 
 Any MCP client that lets you attach a static header to an HTTP transport works the same way.
 
-**Stdio is always unauthenticated.** `localdb mcp` over stdio (embedded, or proxied to a local
-daemon — see [Daemon-proxied stdio](#daemon-proxied-stdio) below) never requires a bearer token,
-regardless of the daemon's own `server.auth` setting: stdio access to the local process is already
-trusted as local-files-equivalent, the same trust boundary as every other daemonless CLI command.
-Auth only applies to the HTTP transport (`/mcp` on a running daemon), which is what makes remote
-access meaningfully different from running `localdb mcp` on the same machine as the caller.
+**Embedded stdio uses local trust.** Daemon-proxied stdio uses the CLI's resolved credentials when
+connecting to the daemon. The daemon's HTTP authentication and store permissions apply to that
+upstream connection, including capability discovery.
 
 ---
 
@@ -185,9 +182,18 @@ opening the store a second time. This means:
 
 - You no longer need to stop `localdb serve` before using `localdb mcp` — the two now coexist by
   design (this replaces earlier v1 guidance that told you to stop the daemon first).
-- Absent `--store`, proxied mode exposes whatever store set the daemon had at its own startup, and
-  every request relays verbatim.
+- Absent `--store`, proxied mode exposes the stores currently visible to the authenticated caller.
+  Search validates its grouping mode and checks upstream support before relay.
 - With `--store`, the scope is enforced per request — see [Store scoping](#store-scoping) below.
+
+For search, omission of `dedup` means `text_and_vector`. That default and `text` require the
+upstream search tool to advertise a `dedup` input-schema property. The proxy checks authenticated
+`tools/list` pages, caches a supported or unsupported result for the connection, and retries after
+discovery failures. It rejects repeated pagination cursors. It relays tool schemas unchanged and
+preserves ordinary upstream errors. An older daemon without support returns the tool-level error
+`daemon_capability_unavailable`; upgrade/restart it, stop it to use embedded mode, or send
+`"dedup": "off"`. Off skips dedup discovery. Invalid/null modes return tool-level `invalid_request`
+before any upstream dispatch, in both scoped and unscoped mode.
 
 If no daemon is running, `localdb mcp` opens the store(s) embedded in-process exactly as before — no
 behavior change for the common case.
@@ -236,12 +242,10 @@ While the tool set is fixed at five read-only tools, a scoped session relays onl
 other tool name is rejected, so a future mutating tool cannot slip through unscoped on the day it
 lands.
 
-> **This is scoping, not a security boundary.** The daemon's `/mcp` route is loopback and
-> **unauthenticated**: anything that can open a socket can bypass `localdb mcp` entirely and talk to
-> the unscoped endpoint directly. `--store` stops an agent from _accidentally_ reading another
-> project's docs; it does not contain a hostile one. Real containment needs daemon-side
-> authentication, which does not exist in v1. In embedded mode there is no such endpoint, so the
-> scope is as strong as the process boundary.
+`--store` narrows the session's view. Daemon-side authorization still applies to every request:
+admins can read all stores, while members can read only granted shared stores. Grouping never
+expands either scope; every alternate must come from the selected, accessible candidate pool.
+Embedded mode opens only the scoped stores. Compact citation fields are preserved during relay.
 
 ---
 
@@ -261,6 +265,56 @@ capability, never widen access.)
 Hybrid search (BM25 + dense vector) across indexed stores. Returns a ranked list of citations in the
 canonical localdb Citation JSON shape.
 
+`dedup` accepts `off`, `text`, or `text_and_vector` (default). Text compares complete stored
+passages; the default additionally compares exact raw stored vectors under the same nonempty
+indexing policy. This is passage grouping, not whole-document collapse or approximate similarity.
+Null, wrong types, and unknown values return tool-level errors: direct MCP uses its existing
+argument-deserialization error text; the proxy returns `invalid_request` before upstream contact.
+
+Successful search JSON contains `citations`, `total_candidates` (distinct fused occurrences), and
+`total_results` (groups before the requested limit). Both counts describe only the retrieved pool,
+with default 50 candidates per leg per selected store; there are no extra searches to find every
+copy or refill collapsed results. An empty store set uses the same formatter with both counts 0.
+
+A representative has a full `snippet` and optional `duplicates`. Each duplicate contains `reasons`
+and a nonrecursive `citation` preserving its own retrieval IDs, URI, metadata, scores, and location.
+Resolve its text as follows:
+
+1. If `snippet` is present, use it, including the explicit empty string.
+2. Otherwise, if `snippet_ref` is present, find the earlier alternate with that
+   `(store_id, chunk_id)` in this group and use its explicit snippet.
+3. Otherwise use the representative's snippet.
+
+References never form chains or point outside the group. Exact copies omit both text fields;
+vector-only matches retain each differing text once. See [complete examples](search-groups.json) for
+exact copies and `X, Y, Y, X`. Retrieve any occurrence with `get_document` using its own
+`resource_id` as `id` and `store.id` (or `store.name`) as `store`; for surrounding chunks use
+`get_chunks` with `resource_id`, `store`, and its `chunk_id` as `anchor_chunk_id`.
+
+The human rendering shows only representative passage text plus alternate store, URI, title,
+location, and reasons; a vector-only match is labeled “identical stored vector.” Each distinct
+snippet occurs once **within the serialized citation group**. The existing JSON-plus-human framing
+can repeat representative text across those two renderings; structured MCP output is separate work
+under #267.
+
+A complete compact vector-match response (synthetic identifiers and scores) retains this framing:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "result": {
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"citations\": [\n    {\n      \"block\": {\n        \"kind\": \"text\",\n        \"seq\": 0\n      },\n      \"chunk_id\": \"chunk-0\",\n      \"chunk_position\": {\n        \"seq_in_block\": 0\n      },\n      \"duplicates\": [\n        {\n          \"citation\": {\n            \"block\": {\n              \"kind\": \"text\",\n              \"seq\": 1\n            },\n            \"chunk_id\": \"chunk-1\",\n            \"chunk_position\": {\n              \"seq_in_block\": 0\n            },\n            \"heading_path\": [],\n            \"location\": {\n              \"span\": {\n                \"end\": 16,\n                \"start\": 0\n              }\n            },\n            \"metadata\": {\n              \"contributor\": [],\n              \"coverage\": null,\n              \"creator\": [],\n              \"date\": null,\n              \"description\": null,\n              \"format\": null,\n              \"identifier\": null,\n              \"kind\": \"document\",\n              \"language\": null,\n              \"page_count\": null,\n              \"publisher\": null,\n              \"relation\": [],\n              \"rights\": null,\n              \"source\": null,\n              \"subject\": [],\n              \"title\": null,\n              \"type\": null,\n              \"word_count\": null\n            },\n            \"provenance\": {\n              \"content_hash\": \"document-hash-1\",\n              \"fetched_at\": \"2026-09-17T00:00:00Z\"\n            },\n            \"resource_id\": \"resource-1\",\n            \"score\": {\n              \"bm25\": null,\n              \"dense\": 0.8,\n              \"fused\": 0.028999999999999998\n            },\n            \"snippet\": \"Variant passage.\",\n            \"store\": {\n              \"id\": \"store-a\",\n              \"name\": \"notes\"\n            },\n            \"title\": null,\n            \"uri\": \"file:///notes/copy-1.txt\"\n          },\n          \"reasons\": [\n            \"exact_vector\"\n          ]\n        },\n        {\n          \"citation\": {\n            \"block\": {\n              \"kind\": \"text\",\n              \"seq\": 2\n            },\n            \"chunk_id\": \"chunk-2\",\n            \"chunk_position\": {\n              \"seq_in_block\": 0\n            },\n            \"heading_path\": [],\n            \"location\": {\n              \"span\": {\n                \"end\": 16,\n                \"start\": 0\n              }\n            },\n            \"metadata\": {\n              \"contributor\": [],\n              \"coverage\": null,\n              \"creator\": [],\n              \"date\": null,\n              \"description\": null,\n              \"format\": null,\n              \"identifier\": null,\n              \"kind\": \"document\",\n              \"language\": null,\n              \"page_count\": null,\n              \"publisher\": null,\n              \"relation\": [],\n              \"rights\": null,\n              \"source\": null,\n              \"subject\": [],\n              \"title\": null,\n              \"type\": null,\n              \"word_count\": null\n            },\n            \"provenance\": {\n              \"content_hash\": \"document-hash-2\",\n              \"fetched_at\": \"2026-09-17T00:00:00Z\"\n            },\n            \"resource_id\": \"resource-2\",\n            \"score\": {\n              \"bm25\": null,\n              \"dense\": 0.8,\n              \"fused\": 0.027999999999999997\n            },\n            \"snippet_ref\": {\n              \"chunk_id\": \"chunk-1\",\n              \"store_id\": \"store-a\"\n            },\n            \"store\": {\n              \"id\": \"store-b\",\n              \"name\": \"archive\"\n            },\n            \"title\": null,\n            \"uri\": \"file:///notes/copy-2.txt\"\n          },\n          \"reasons\": [\n            \"exact_vector\"\n          ]\n        },\n        {\n          \"citation\": {\n            \"block\": {\n              \"kind\": \"text\",\n              \"seq\": 3\n            },\n            \"chunk_id\": \"chunk-3\",\n            \"chunk_position\": {\n              \"seq_in_block\": 0\n            },\n            \"heading_path\": [],\n            \"location\": {\n              \"span\": {\n                \"end\": 15,\n                \"start\": 0\n              }\n            },\n            \"metadata\": {\n              \"contributor\": [],\n              \"coverage\": null,\n              \"creator\": [],\n              \"date\": null,\n              \"description\": null,\n              \"format\": null,\n              \"identifier\": null,\n              \"kind\": \"document\",\n              \"language\": null,\n              \"page_count\": null,\n              \"publisher\": null,\n              \"relation\": [],\n              \"rights\": null,\n              \"source\": null,\n              \"subject\": [],\n              \"title\": null,\n              \"type\": null,\n              \"word_count\": null\n            },\n            \"provenance\": {\n              \"content_hash\": \"document-hash-3\",\n              \"fetched_at\": \"2026-09-17T00:00:00Z\"\n            },\n            \"resource_id\": \"resource-3\",\n            \"score\": {\n              \"bm25\": null,\n              \"dense\": 0.8,\n              \"fused\": 0.027\n            },\n            \"store\": {\n              \"id\": \"store-b\",\n              \"name\": \"archive\"\n            },\n            \"title\": null,\n            \"uri\": \"file:///notes/copy-3.txt\"\n          },\n          \"reasons\": [\n            \"exact_text\",\n            \"exact_vector\"\n          ]\n        }\n      ],\n      \"heading_path\": [],\n      \"location\": {\n        \"span\": {\n          \"end\": 15,\n          \"start\": 0\n        }\n      },\n      \"metadata\": {\n        \"contributor\": [],\n        \"coverage\": null,\n        \"creator\": [],\n        \"date\": null,\n        \"description\": null,\n        \"format\": null,\n        \"identifier\": null,\n        \"kind\": \"document\",\n        \"language\": null,\n        \"page_count\": null,\n        \"publisher\": null,\n        \"relation\": [],\n        \"rights\": null,\n        \"source\": null,\n        \"subject\": [],\n        \"title\": null,\n        \"type\": null,\n        \"word_count\": null\n      },\n      \"provenance\": {\n        \"content_hash\": \"document-hash-0\",\n        \"fetched_at\": \"2026-09-17T00:00:00Z\"\n      },\n      \"resource_id\": \"resource-0\",\n      \"score\": {\n        \"bm25\": null,\n        \"dense\": 0.8,\n        \"fused\": 0.03\n      },\n      \"snippet\": \"Shared passage.\",\n      \"store\": {\n        \"id\": \"store-a\",\n        \"name\": \"notes\"\n      },\n      \"title\": null,\n      \"uri\": \"file:///notes/copy-0.txt\"\n    }\n  ],\n  \"total_candidates\": 4,\n  \"total_results\": 1\n}\n\n---\n1. file:///notes/copy-0.txt\n   Score: 0.0300\n   Shared passage.\n   3 additional matching occurrences in retrieved candidates:\n   - [notes (store-a)] file:///notes/copy-1.txt (block 1, chunk 0, span 0..16, window []; identical stored vector)\n   - [archive (store-b)] file:///notes/copy-2.txt (block 2, chunk 0, span 0..16, window []; identical stored vector)\n   - [archive (store-b)] file:///notes/copy-3.txt (block 3, chunk 0, span 0..15, window []; exact text, identical stored vector)\n"
+      }
+    ]
+  }
+}
+```
+
 > **Note:** the dense component uses the configured embedder (default: `pplx-embed-context-v1-0.6b`
 > local ONNX). The model is downloaded automatically on first use (~706 MB). See
 > [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
@@ -271,87 +325,114 @@ canonical localdb Citation JSON shape.
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
   "properties": {
-    "added_after": {
-      "default": null,
-      "description": "Lower bound (inclusive) on the added date — when this resource was first indexed. Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a relative duration such as \"7d\" or \"30m\", which always resolves to now minus the duration regardless of which bound it fills. Note: \"M\" means months and \"m\" means minutes in the duration grammar — both parse successfully, so a mistaken capital silently produces a bound roughly 44,000 times further out. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
-      "type": ["string", "null"]
-    },
-    "added_before": {
-      "default": null,
-      "description": "Upper bound (inclusive) on the added date — when this resource was first indexed. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
-      "type": ["string", "null"]
-    },
-    "content_length": {
-      "default": null,
-      "description": "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload always carries the full snippet.",
-      "format": "int64",
-      "minimum": 1,
-      "type": ["integer", "null"]
-    },
-    "document_after": {
-      "default": null,
-      "description": "Lower bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
-      "type": ["string", "null"]
-    },
-    "document_before": {
-      "default": null,
-      "description": "Upper bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
-      "type": ["string", "null"]
-    },
-    "limit": {
-      "default": null,
-      "description": "Maximum number of results to return (default: 10, max: 100)",
-      "format": "int64",
-      "maximum": 100,
-      "minimum": 1,
-      "type": ["integer", "null"]
-    },
-    "mime": {
-      "default": null,
-      "description": "Restrict to resources with this exact MIME type (e.g. \"text/markdown\"). Matched as an exact string: no date or duration parsing is applied.",
-      "type": ["string", "null"]
-    },
-    "modified_after": {
-      "default": null,
-      "description": "Lower bound (inclusive) on the modified date — the source's own claim of when this resource was last changed. Same value grammar as added_after. NULL rule: a resource with no claimed modification time is excluded, regardless of the bound.",
-      "type": ["string", "null"]
-    },
-    "modified_before": {
-      "default": null,
-      "description": "Upper bound (inclusive) on the modified date — the source's own claim of when this resource was last changed. Same value grammar as added_after. NULL rule: a resource with no claimed modification time is excluded, regardless of the bound.",
-      "type": ["string", "null"]
-    },
-    "path": {
-      "default": null,
-      "description": "Restrict to resources whose URI starts with this prefix (e.g. \"file:///docs/\"). Not a date: no date or duration parsing is applied. Matched with SQL LIKE, so a literal `%` or `_` in the prefix acts as a wildcard.",
-      "type": ["string", "null"]
-    },
     "query": {
       "description": "Natural language search query",
       "type": "string"
     },
+    "dedup": {
+      "description": "Group exact stored text and optionally identical stored vectors (default: text_and_vector).",
+      "$ref": "#/$defs/SearchDedup",
+      "default": "text_and_vector"
+    },
     "stores": {
-      "default": null,
       "description": "Optional list of store names to search. Defaults to all stores.",
+      "type": ["array", "null"],
       "items": {
         "type": "string"
       },
-      "type": ["array", "null"]
+      "default": null
+    },
+    "limit": {
+      "description": "Maximum number of results to return (default: 10, max: 100)",
+      "type": ["integer", "null"],
+      "format": "int64",
+      "minimum": 1,
+      "maximum": 100,
+      "default": null
+    },
+    "content_length": {
+      "description": "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload retains each distinct snippet in full; repeated occurrence text is omitted or referenced.",
+      "type": ["integer", "null"],
+      "format": "int64",
+      "minimum": 1,
+      "default": null
+    },
+    "path": {
+      "description": "Restrict to resources whose URI starts with this prefix (e.g. \"file:///docs/\"). Not a date: no date or duration parsing is applied. Matched with SQL LIKE, so a literal `%` or `_` in the prefix acts as a wildcard.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "mime": {
+      "description": "Restrict to resources with this exact MIME type (e.g. \"text/markdown\"). Matched as an exact string: no date or duration parsing is applied.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "added_after": {
+      "description": "Lower bound (inclusive) on the added date — when this resource was first indexed. Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a relative duration such as \"7d\" or \"30m\", which always resolves to now minus the duration regardless of which bound it fills. Note: \"M\" means months and \"m\" means minutes in the duration grammar — both parse successfully, so a mistaken capital silently produces a bound roughly 44,000 times further out. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "added_before": {
+      "description": "Upper bound (inclusive) on the added date — when this resource was first indexed. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "type": ["string", "null"],
+      "default": null
     },
     "updated_after": {
-      "default": null,
       "description": "Lower bound (inclusive) on the updated date — when the store last wrote this resource's stored state. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
-      "type": ["string", "null"]
+      "type": ["string", "null"],
+      "default": null
     },
     "updated_before": {
-      "default": null,
       "description": "Upper bound (inclusive) on the updated date — when the store last wrote this resource's stored state. Same value grammar as added_after. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
-      "type": ["string", "null"]
+      "type": ["string", "null"],
+      "default": null
+    },
+    "modified_after": {
+      "description": "Lower bound (inclusive) on the modified date — the source's own claim of when this resource was last changed. Same value grammar as added_after. NULL rule: a resource with no claimed modification time is excluded, regardless of the bound.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "modified_before": {
+      "description": "Upper bound (inclusive) on the modified date — the source's own claim of when this resource was last changed. Same value grammar as added_after. NULL rule: a resource with no claimed modification time is excluded, regardless of the bound.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "document_after": {
+      "description": "Lower bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "document_before": {
+      "description": "Upper bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
+      "type": ["string", "null"],
+      "default": null
     }
   },
   "required": ["query"],
-  "type": "object"
+  "$defs": {
+    "SearchDedup": {
+      "description": "Exact passage grouping mode shared by search surfaces.",
+      "oneOf": [
+        {
+          "description": "Return independently ranked occurrences.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Group equal stored text.",
+          "type": "string",
+          "const": "text"
+        },
+        {
+          "description": "Group equal stored text or eligible equal stored vectors.",
+          "type": "string",
+          "const": "text_and_vector"
+        }
+      ]
+    }
+  }
 }
 ```
 
@@ -402,7 +483,7 @@ tool that appends this rendering; the others return JSON alone):
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"citations\": [\n    {\n      \"block\": {\n        \"kind\": \"text\",\n        \"seq\": 0\n      },\n      \"chunk_id\": \"0bbaaa6b64dffd8b232410017b224c7b499bc3fe235382bfaa8ea63b1e435824\",\n      \"chunk_position\": {\n        \"seq_in_block\": 0\n      },\n      \"heading_path\": [],\n      \"location\": {\n        \"span\": {\n          \"end\": 165,\n          \"start\": 0\n        }\n      },\n      \"metadata\": {\n        \"contributor\": [],\n        \"coverage\": null,\n        \"creator\": [],\n        \"date\": null,\n        \"description\": null,\n        \"format\": \"text/plain\",\n        \"identifier\": null,\n        \"kind\": \"document\",\n        \"language\": null,\n        \"page_count\": null,\n        \"publisher\": null,\n        \"relation\": [],\n        \"rights\": null,\n        \"source\": null,\n        \"subject\": [],\n        \"title\": null,\n        \"type\": null,\n        \"word_count\": null\n      },\n      \"provenance\": {\n        \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n        \"fetched_at\": \"2026-06-11T14:17:30Z\"\n      },\n      \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n      \"score\": {\n        \"bm25\": 3.0748,\n        \"dense\": 0.7099609375,\n        \"fused\": 0.03278688524590164\n      },\n      \"snippet\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\",\n      \"store\": {\n        \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n        \"name\": \"notes\"\n      },\n      \"title\": null,\n      \"uri\": \"file:///home/user/notes/meeting.txt\"\n    }\n  ],\n  \"total_candidates\": 3\n}\n\n---\n1. file:///home/user/notes/meeting.txt\n   Score: 0.0328\n   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone."
+        "text": "{\n  \"citations\": [\n    {\n      \"block\": {\n        \"kind\": \"text\",\n        \"seq\": 0\n      },\n      \"chunk_id\": \"0bbaaa6b64dffd8b232410017b224c7b499bc3fe235382bfaa8ea63b1e435824\",\n      \"chunk_position\": {\n        \"seq_in_block\": 0\n      },\n      \"heading_path\": [],\n      \"location\": {\n        \"span\": {\n          \"end\": 165,\n          \"start\": 0\n        }\n      },\n      \"metadata\": {\n        \"contributor\": [],\n        \"coverage\": null,\n        \"creator\": [],\n        \"date\": null,\n        \"description\": null,\n        \"format\": \"text/plain\",\n        \"identifier\": null,\n        \"kind\": \"document\",\n        \"language\": null,\n        \"page_count\": null,\n        \"publisher\": null,\n        \"relation\": [],\n        \"rights\": null,\n        \"source\": null,\n        \"subject\": [],\n        \"title\": null,\n        \"type\": null,\n        \"word_count\": null\n      },\n      \"provenance\": {\n        \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n        \"fetched_at\": \"2026-06-11T14:17:30Z\"\n      },\n      \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n      \"score\": {\n        \"bm25\": 3.0748,\n        \"dense\": 0.7099609375,\n        \"fused\": 0.03278688524590164\n      },\n      \"snippet\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\",\n      \"store\": {\n        \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n        \"name\": \"notes\"\n      },\n      \"title\": null,\n      \"uri\": \"file:///home/user/notes/meeting.txt\"\n    }\n  ],\n  \"total_candidates\": 3,\n  \"total_results\": 3\n}\n\n---\n1. file:///home/user/notes/meeting.txt\n   Score: 0.0328\n   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone."
       }
     ]
   }

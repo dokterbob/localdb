@@ -254,6 +254,7 @@ fn search_to_tool_result(response: QueryResponse, content_length: usize) -> Call
     let v = serde_json::json!({
         "citations": citations_json,
         "total_candidates": response.total_candidates,
+        "total_results": response.total_results,
     });
 
     let text_rendering = render_citations_text(&response.citations, content_length);
@@ -294,10 +295,18 @@ pub async fn tool_search(
         Err(result) => return result,
     };
     if store_handles.is_empty() {
-        return success_json(&serde_json::json!({ "citations": [] }));
+        return search_to_tool_result(
+            QueryResponse {
+                citations: vec![],
+                total_candidates: 0,
+                total_results: 0,
+            },
+            content_length,
+        );
     }
     let request = QueryRequest {
         query: args.query.clone(),
+        dedup: args.dedup,
         leg_k: None,
         top_n: Some(limit),
         filters: metadata_filters,
@@ -307,6 +316,56 @@ pub async fn tool_search(
         Err(e) => return typed_error(e.code(), format!("search failed: {e}")),
     };
     search_to_tool_result(response, content_length)
+}
+
+/// Render occurrence details without repeating alternate passage text.
+pub fn render_duplicate_occurrences(citation: &Citation) -> String {
+    if citation.duplicates.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "   {} additional matching occurrences in retrieved candidates:\n",
+        citation.duplicates.len()
+    );
+    for duplicate in &citation.duplicates {
+        let c = &duplicate.citation;
+        let reasons = duplicate
+            .reasons
+            .iter()
+            .map(|reason| match reason {
+                localdb_core::DuplicateReason::ExactText => "exact text",
+                localdb_core::DuplicateReason::ExactVector => "identical stored vector",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let title = c
+            .title
+            .as_ref()
+            .map(|t| format!(" — {t}"))
+            .unwrap_or_default();
+        let page = c.block.page.map(|p| format!(", p.{p}")).unwrap_or_default();
+        let heading = if c.heading_path.is_empty() {
+            String::new()
+        } else {
+            format!(" > {}", c.heading_path.join(" > "))
+        };
+        out.push_str(&format!(
+            "   - [{} ({})] {}{}{} (block {}, chunk {}, span {}..{}{}, window {:?}; {})\n",
+            c.store.name,
+            c.store.id,
+            c.uri,
+            title,
+            heading,
+            c.block.seq,
+            c.chunk_position.seq_in_block,
+            c.location.span.start,
+            c.location.span.end,
+            page,
+            c.location.window_block_seqs,
+            reasons
+        ));
+    }
+    out
 }
 
 /// Render citations as human-readable text for non-structured clients.
@@ -355,7 +414,7 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
                 creator_date,
                 c.score.fused,
                 snippet_text
-            )
+            ) + &render_duplicate_occurrences(c)
         })
         .collect::<Vec<_>>()
         .join("\n")

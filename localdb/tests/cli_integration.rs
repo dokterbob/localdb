@@ -1748,7 +1748,14 @@ fn search_embedded_limit_is_clamped_across_multiple_stores() {
     // across three stores, comfortably above the 100-item clamp.
     let output = cmd_with_dir(&dir)
         .arg("--json")
-        .args(["search", "--limit", "5000", "zzzclamptestterm"])
+        .args([
+            "search",
+            "--limit",
+            "5000",
+            "--dedup",
+            "off",
+            "zzzclamptestterm",
+        ])
         .output()
         .unwrap();
 
@@ -2087,7 +2094,7 @@ fn search_routes_to_daemon_when_running() {
             }
 
             // Drain body if any (POST /v1/search sends a body).
-            let body_resp = r#"{"citations":[]}"#;
+            let body_resp = r#"{"citations":[],"features":["search_dedup"]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body_resp.len(),
@@ -8630,8 +8637,15 @@ fn search_daemon_renders_heading_path_breadcrumb() {
         "provenance": {"fetched_at": "2026-01-01T00:00:00Z", "content_hash": "abc"},
     });
     let body = serde_json::json!({ "citations": [citation] }).to_string();
-    let (port, _received) =
-        start_routing_mock_server(vec![("POST", "/v1/search", "HTTP/1.1 200 OK", body)]);
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/status",
+            "HTTP/1.1 200 OK",
+            serde_json::json!({"features":["search_dedup"]}).to_string(),
+        ),
+        ("POST", "/v1/search", "HTTP/1.1 200 OK", body),
+    ]);
 
     let output = cmd_with_dir(&dir)
         .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
@@ -8660,7 +8674,7 @@ fn search_daemon_json_citations_round_trip_exactly() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
-    let citation = serde_json::json!({
+    let mut citation = serde_json::json!({
         "chunk_id": "chunk1",
         "resource_id": "doc1",
         "store": {"id": "01HN1Y28MYWN6X5DSKZMNE1T5W", "name": "mystore"},
@@ -8675,9 +8689,33 @@ fn search_daemon_json_citations_round_trip_exactly() {
         "title": null,
         "metadata": {"kind": "document"},
     });
+    let mut alternate = citation.clone();
+    alternate.as_object_mut().unwrap().remove("snippet");
+    alternate["chunk_id"] = serde_json::json!("copy");
+    alternate["resource_id"] = serde_json::json!("copy-doc");
+    alternate["store"] = serde_json::json!({"id":"archive", "name":"archive"});
+    alternate["location"] = serde_json::json!({"span":{"start":10,"end":20}});
+    let mut differing = alternate.clone();
+    differing["chunk_id"] = serde_json::json!("variant");
+    differing["snippet"] = serde_json::json!("A differing passage.");
+    let mut referenced = alternate.clone();
+    referenced["chunk_id"] = serde_json::json!("variant-copy");
+    referenced["snippet_ref"] = serde_json::json!({"store_id":"archive", "chunk_id":"variant"});
+    citation["duplicates"] = serde_json::json!([
+        {"reasons":["exact_text"], "citation":alternate},
+        {"reasons":["exact_vector"], "citation":differing},
+        {"reasons":["exact_vector"], "citation":referenced},
+    ]);
     let body = serde_json::json!({ "citations": [citation.clone()] }).to_string();
-    let (port, _received) =
-        start_routing_mock_server(vec![("POST", "/v1/search", "HTTP/1.1 200 OK", body)]);
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/status",
+            "HTTP/1.1 200 OK",
+            serde_json::json!({"features":["search_dedup"]}).to_string(),
+        ),
+        ("POST", "/v1/search", "HTTP/1.1 200 OK", body),
+    ]);
 
     let output = cmd_with_dir(&dir)
         .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
@@ -8690,6 +8728,15 @@ fn search_daemon_json_citations_round_trip_exactly() {
     assert_eq!(v["citations"][0]["heading_path"], citation["heading_path"]);
     assert_eq!(v["citations"][0]["uri"], citation["uri"]);
     assert_eq!(v["citations"][0]["snippet"], citation["snippet"]);
+    let expected: localdb_core::Citation = serde_json::from_value(citation).unwrap();
+    assert_eq!(v["citations"][0], serde_json::to_value(expected).unwrap());
+    let duplicates = &v["citations"][0]["duplicates"];
+    assert!(duplicates[0]["citation"].get("snippet").is_none());
+    assert!(duplicates[0]["citation"].get("snippet_ref").is_none());
+    assert_eq!(
+        duplicates[2]["citation"]["snippet_ref"]["chunk_id"],
+        "variant"
+    );
 }
 
 /// `store add` shape parity: embedded and daemon-mock must produce

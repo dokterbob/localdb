@@ -18,6 +18,8 @@ use crate::state::AppState;
 pub struct SearchRequest {
     pub query: String,
     #[serde(default)]
+    pub dedup: localdb_core::SearchDedup,
+    #[serde(default)]
     pub store_filter: Vec<String>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
@@ -38,6 +40,7 @@ fn default_search_limit() -> usize {
 pub struct SearchResponse {
     pub citations: Vec<Citation>,
     pub total_candidates: usize,
+    pub total_results: usize,
     pub next_cursor: Option<String>,
 }
 
@@ -139,12 +142,14 @@ impl SearchService {
             return Ok(SearchResponse {
                 citations: vec![],
                 total_candidates: 0,
+                total_results: 0,
                 next_cursor: None,
             });
         }
 
         let query_request = QueryRequest {
             query: req.query.clone(),
+            dedup: req.dedup,
             leg_k: None,
             top_n: Some(page_end),
             filters: metadata_filters,
@@ -154,7 +159,7 @@ impl SearchService {
             .await
             .map_err(ApiError)?;
 
-        let total = response.total_candidates;
+        let total = response.total_results;
         let next_cursor = if page_end < total {
             Some(format!("{page_end}"))
         } else {
@@ -165,7 +170,8 @@ impl SearchService {
 
         Ok(SearchResponse {
             citations,
-            total_candidates: total,
+            total_candidates: response.total_candidates,
+            total_results: total,
             next_cursor,
         })
     }

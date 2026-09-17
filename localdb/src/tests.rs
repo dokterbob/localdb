@@ -514,3 +514,20 @@ fn global_flags_present() {
     assert!(arg_names.contains(&"stores"), "missing --store flag");
     assert!(arg_names.contains(&"yes"), "missing --yes/-y flag");
 }
+
+#[test]
+fn search_dedup_cli_default_and_modes() {
+    for mode in ["off", "text", "text_and_vector"] {
+        let parsed = Cli::try_parse_from(["localdb", "search", "query", "--dedup", mode]).unwrap();
+        let Command::Search { dedup, .. } = parsed.command else {
+            panic!("search expected")
+        };
+        assert_eq!(dedup.to_string(), mode);
+    }
+    let parsed = Cli::try_parse_from(["localdb", "search", "query"]).unwrap();
+    let Command::Search { dedup, .. } = parsed.command else {
+        panic!("search expected")
+    };
+    assert_eq!(dedup.to_string(), "text_and_vector");
+    assert!(Cli::try_parse_from(["localdb", "search", "query", "--dedup", "approximate"]).is_err());
+}

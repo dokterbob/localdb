@@ -24,6 +24,7 @@ use super::common::{duplicate_doc_stores, make_chunk, make_descriptor, text_of};
 
 fn search_args(query: &str) -> SearchArgs {
     SearchArgs {
+        dedup: localdb_core::SearchDedup::Off,
         query: query.to_string(),
         stores: None,
         limit: None,
@@ -342,6 +343,7 @@ fn make_citation_with_metadata(
         types::Span,
     };
     localdb_core::citation::Citation {
+        duplicates: vec![],
         chunk_id: "c1".to_string(),
         resource_id: "d1".to_string(),
         store: CitationStore {
@@ -548,4 +550,67 @@ fn get_chunks_args_negative_limit_is_invalid_request() {
 fn render_citations_empty() {
     let text = render_citations_text(&[], 400);
     assert_eq!(text, "No results found.");
+}
+
+#[tokio::test]
+async fn empty_search_has_counts_and_normal_framing() {
+    let result = tool_search(&[], &FakeEmbedder::new(128), search_args("hello")).await;
+    let text = text_of(&result);
+    let (json, human) = text.split_once("\n\n---\n").expect("normal search framing");
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"citations":[], "total_candidates":0, "total_results":0})
+    );
+    assert_eq!(human, "No results found.");
+}
+
+#[test]
+fn search_dedup_mcp_defaults_and_validation() {
+    let args: SearchArgs = serde_json::from_value(serde_json::json!({"query":"x"})).unwrap();
+    assert_eq!(args.dedup, localdb_core::SearchDedup::TextAndVector);
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!("unknown"),
+    ] {
+        assert!(serde_json::from_value::<SearchArgs>(
+            serde_json::json!({"query":"x", "dedup":invalid})
+        )
+        .is_err());
+    }
+    let schema = serde_json::to_value(schemars::schema_for!(SearchArgs)).unwrap();
+    assert!(schema["properties"].get("dedup").is_some());
+}
+
+#[tokio::test]
+async fn grouped_search_preserves_scope_counts_and_compact_occurrences() {
+    let mut stores = Vec::new();
+    for id in ["a", "b", "excluded"] {
+        let store = FakeStore::new();
+        store
+            .upsert_chunks(vec![make_chunk(id, id, id, "shared hello")])
+            .await
+            .unwrap();
+        stores.push(AvailableStore::new(
+            make_descriptor(id, id),
+            Box::new(store),
+        ));
+    }
+    let args: SearchArgs =
+        serde_json::from_value(serde_json::json!({"query":"hello", "stores":["a","b"]})).unwrap();
+    let result = tool_search(&stores, &FakeEmbedder::new(128), args).await;
+    let rendered = text_of(&result);
+    let (json, human) = rendered.split_once("\n\n---\n").unwrap();
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(value["total_candidates"], 2);
+    assert_eq!(value["total_results"], 1);
+    let representative = &value["citations"][0];
+    assert_eq!(representative["snippet"], "shared hello");
+    let alternate = &representative["duplicates"][0]["citation"];
+    assert!(alternate.get("snippet").is_none());
+    assert!(alternate.get("snippet_ref").is_none());
+    assert_ne!(alternate["store"]["id"], "excluded");
+    assert!(human.contains("1 additional matching occurrences in retrieved candidates"));
+    assert!(human.contains("identical stored vector"));
 }

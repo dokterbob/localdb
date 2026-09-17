@@ -14,8 +14,8 @@
 //!
 //! ## Why scope is enforced on tool *arguments*
 //!
-//! Unscoped (no `--store`), this really is a verbatim relay and nothing here
-//! inspects a request. Scoped, it has to — and the tool arguments are the
+//! Search requests validate the grouping mode and upstream capability before relay.
+//! Scoped requests also inspect store arguments, which are the
 //! only channel available. rmcp's `StreamableHttpService` (`http.rs`) takes a
 //! synchronous `Fn() -> Result<S, io::Error>` service factory with no access
 //! to the HTTP request, so the daemon cannot hand out a per-connection scoped
@@ -185,8 +185,9 @@ impl std::error::Error for ProxyConnectError {}
 /// for as long as this stdio process serves requests.
 pub struct ProxyHandler {
     upstream: RunningService<RoleClient, rmcp::model::ClientInfo>,
-    /// `None` = unscoped (no `--store` given): every request relays verbatim.
+    /// `None` = unscoped (no `--store` given).
     scope: Option<ProxyScope>,
+    search_dedup_supported: tokio::sync::Mutex<Option<bool>>,
 }
 
 impl ProxyHandler {
@@ -242,6 +243,7 @@ impl ProxyHandler {
             return Ok(Self {
                 upstream,
                 scope: None,
+                search_dedup_supported: tokio::sync::Mutex::new(None),
             });
         }
 
@@ -265,11 +267,54 @@ impl ProxyHandler {
 
         Ok(Self {
             upstream,
+            search_dedup_supported: tokio::sync::Mutex::new(None),
             scope: Some(ProxyScope {
                 upstream_stores,
                 allowed_ids,
             }),
         })
+    }
+
+    /// Discover on the authenticated session; cache only completed discovery.
+    async fn supports_search_dedup(&self) -> Result<bool, McpError> {
+        let mut cached = self.search_dedup_supported.lock().await;
+        if let Some(supported) = *cached {
+            return Ok(supported);
+        }
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = self
+                .upstream
+                .list_tools(
+                    cursor
+                        .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor))),
+                )
+                .await
+                .map_err(upstream_error_to_mcp)?;
+            if let Some(search) = page.tools.iter().find(|tool| tool.name == "search") {
+                let supported = search
+                    .input_schema
+                    .get("properties")
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|properties| properties.contains_key("dedup"));
+                *cached = Some(supported);
+                return Ok(supported);
+            }
+            match page.next_cursor {
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(McpError::internal_error(
+                        "mcp proxy: repeated tools/list pagination cursor",
+                        None,
+                    ))
+                }
+                None => {
+                    *cached = Some(false);
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     /// Relay a `tools/call` to the upstream unchanged.
@@ -551,8 +596,32 @@ impl ServerHandler for ProxyHandler {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if request.name == "search" {
+            let mode = match request
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("dedup"))
+            {
+                None => localdb_core::SearchDedup::default(),
+                Some(value) => {
+                    match serde_json::from_value::<localdb_core::SearchDedup>(value.clone()) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            return Ok(crate::tools::typed_error(
+                                "invalid_request",
+                                format!("invalid dedup mode: {error}"),
+                            ))
+                        }
+                    }
+                }
+            };
+            if mode != localdb_core::SearchDedup::Off && !self.supports_search_dedup().await? {
+                return Ok(crate::tools::typed_error("daemon_capability_unavailable",
+                    "the running daemon does not support search grouping; restart it, use embedded mode, or pass dedup: off"));
+            }
+        }
         let Some(scope) = &self.scope else {
-            // Unscoped: byte-identical relay, including for unknown tool
+            // Unscoped relay after search compatibility validation, including unknown tool
             // names — the upstream owns "tool not found".
             return self.relay(request).await;
         };

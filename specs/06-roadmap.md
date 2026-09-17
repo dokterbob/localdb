@@ -39,8 +39,10 @@ issue carrying the research and open design questions.
   _reference_ lists (pointers plus introductions, never relayed content). This pulls the Phase 5
   direction into a scoped ticket; the §3 requirements below constrain the design. This is access
   federation, **not** import/export — backup/export/import remains a separate later item (§6).
-- **Identical and near-identical document grouping** (#346) — exact grouping via content hash
-  (builds on #95), "soft dedup" of re-scans/re-OCRs/redaction variants via vector proximity.
+- **Passage grouping delivered** (#95; first increment of #346): search-time exact stored text and
+  exact eligible stored vector matching, compact occurrence citations across accessible stores.
+  **Remaining #346 work:** approximate matching of re-scans/re-OCRs/redaction variants and
+  persistent document groups. Exact matching does not complete that broader work.
 - **Agent / second-brain memory over MCP** — the read side works today and is documented as a recipe
   ([docs/agent-memory.md](../docs/agent-memory.md)); the MCP write path is tracked as (#349).
 - **Minimal read-only web UI** (#273) — basic search and browse on the existing HTTP API; the first

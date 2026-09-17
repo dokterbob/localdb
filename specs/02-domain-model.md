@@ -676,10 +676,10 @@ A normalized row granting one user read access to one `shared`-visibility store 
 from content (Resource, Chunk) get **content-addressed blake3 IDs** as defined above.
 
 **Rationale:** content-addressed IDs are the federation prerequisite — two nodes indexing the same
-content derive the same chunk identity, enabling dedup, provenance comparison, and integrity checks
-without coordination ([06-roadmap.md](06-roadmap.md) §3). They also make re-indexing idempotent.
-**Rejected:** auto-increment rows (meaningless off-node); UUIDv4 for resources/chunks (stable only
-by table lookup, not by content).
+content at the same URI and position derive the same chunk identity, enabling provenance comparison
+and integrity checks without coordination ([06-roadmap.md](06-roadmap.md) §3). They also make
+re-indexing idempotent. **Rejected:** auto-increment rows (meaningless off-node); UUIDv4 for
+resources/chunks (stable only by table lookup, not by content).
 
 Consequence: a resource edit produces a _new_ resource ID; the pipeline treats it as replace-by-URI
 (delete chunks of the old ID, insert new) — see [04-search-pipeline.md](04-search-pipeline.md) §2.
@@ -758,10 +758,10 @@ Every search hit, on every surface, resolves to the same citation structure:
 ```
 
 That's the shape of the field list distinctive to the block model; the full `Citation` also carries
-`chunk_id`, `store: {id, name}`, `heading_path`, `snippet` (chunk text, possibly trimmed), the full
-`score: {fused, dense, bm25}` breakdown, `provenance: {fetched_at, content_hash}`, and `metadata`
-(the tagged `Metadata` enum — Dublin Core base + resource-kind-specific fields, §7). There is no
-top-level `document_id`, `block_seq`, `block_kind`, or `span` — those are superseded by
+`chunk_id`, `store: {id, name}`, `heading_path`, `snippet` (complete representative chunk text), the
+full `score: {fused, dense, bm25}` breakdown, `provenance: {fetched_at, content_hash}`, and
+`metadata` (the tagged `Metadata` enum — Dublin Core base + resource-kind-specific fields, §7).
+There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` — those are superseded by
 `resource_id`, the nested `block {seq, kind, page}`, `chunk_position {seq_in_block}`, and
 `location {span, window_block_seqs}` respectively. `window_block_seqs` is present only for
 message-window chunks (§2); absent otherwise.
@@ -775,8 +775,9 @@ would fight the coarse-`Text` run packing (#158), which packs chunks within bloc
 
 Surface mappings — defined here once, referenced by [05-surfaces.md](05-surfaces.md): **HTTP**
 returns the structure verbatim as JSON. **CLI** renders `uri` + heading path + snippet (and full
-JSON with `--json`). **MCP** returns it as structured tool output content, never as prose-only text,
-so agents can cite mechanically.
+JSON with `--json`). **MCP** returns its JSON followed by human text in one `Content::text`, so
+agents can parse citations mechanically. A separate structured-content field remains work under
+#267.
 
 **Context expansion:** given a search hit, the backend supports:
 
@@ -784,6 +785,71 @@ so agents can cite mechanically.
    (`chunks WHERE store_id = ? AND resource_id = ? AND block_seq = ? ORDER BY seq_in_block`)
 2. Nearby blocks in the same resource (`blocks WHERE resource_id = ? AND seq BETWEEN ? AND ?`)
 3. Full resource block sequence (`blocks WHERE resource_id = ? ORDER BY seq`)
+
+### Passage groups and compact text ownership
+
+Search returns representative citations, not document groups. `duplicates` is an optional array
+(omitted when empty; defaults to empty when reading legacy citations). Each entry contains `reasons`
+(`exact_text`, then `exact_vector` when applicable) and a nonrecursive `citation` occurrence. Every
+occurrence preserves its own `chunk_id`, `resource_id`, `store`, `uri`, `title`, `heading_path`,
+`block`, `chunk_position`, `location`, `score`, `provenance`, and `metadata`. Representative scores
+are unchanged; larger groups receive no boost.
+
+The representative always owns its full `snippet`. An alternate with exactly the representative's
+text omits both `snippet` and `snippet_ref`. The first alternate with different text owns its full
+`snippet`; subsequent copies omit `snippet` and carry
+`snippet_ref: {"store_id": "owner-store", "chunk_id": "owner-chunk"}`. References point only to an
+earlier alternate in the same group with an explicit snippet: no chains, forward references,
+cross-group references, or references to unseen pages. Optional text fields are omitted, never
+`null`; an explicit empty snippet `""` is an owned value. Text ownership uses exact text equality,
+not vector equality. Thus texts `X, Y, Y, X` emit X and Y once each; exact copies `X, X` emit only
+one snippet and no reference. Complete serialized examples live in `docs/search-groups.json` and are
+checked against the citation model.
+
+The following are text-ownership projections of the complete examples (all other occurrence fields
+are present in the [serialized fixture](../docs/search-groups.json)). Exact stored-text copies:
+
+```json
+{
+  "snippet": "Shared passage.",
+  "duplicates": [{ "reasons": ["exact_text"], "citation": { "chunk_id": "chunk-1" } }]
+}
+```
+
+Differing stored text with equal eligible vectors, followed by copies of each text:
+
+```json
+{
+  "snippet": "Shared passage.",
+  "duplicates": [
+    {
+      "reasons": ["exact_vector"],
+      "citation": {
+        "chunk_id": "chunk-1",
+        "snippet": "Variant passage."
+      }
+    },
+    {
+      "reasons": ["exact_vector"],
+      "citation": {
+        "chunk_id": "chunk-2",
+        "snippet_ref": { "store_id": "store-a", "chunk_id": "chunk-1" }
+      }
+    },
+    { "reasons": ["exact_text", "exact_vector"], "citation": { "chunk_id": "chunk-3" } }
+  ]
+}
+```
+
+Groups and members retain ranked order. Matching is directly against representatives, not
+transitive: `(X,P), (X,Q), (Y,Q)` forms the first two together and the third separately. A candidate
+matching two representatives joins the earlier one. Members retain `(store_id, chunk_id)` identity;
+URI and document content hashes cannot replace this identity.
+
+Chunk IDs are `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`; resource IDs include
+URI and document content hash. They cannot identify equal passages across files or positions.
+`ChunkRecord.content_hash` belongs to the whole resource. Text grouping instead uses a hash map
+keyed by complete stored passage text, with equality resolving keys; no persisted digest is added.
 
 ## 7. Metadata taxonomy
 
@@ -990,7 +1056,8 @@ performance:
 
 - **Composite Uniqueness:** The `resources` and `chunks` tables use composite `(store_id, id)`
   uniqueness. Content-addressed IDs can collide across stores by design. Each store maintains its
-  own rows. Cross-store deduplication is deferred to query-time `GROUP BY` operations.
+  own rows. Core search-time passage grouping combines retrieved occurrences across selected,
+  accessible stores; persisted occurrences remain independent (see §6 and the retrieval spec).
 - **Normalized Blocks:** The `blocks` table stores individual blocks as rows (not a JSON blob),
   enabling efficient context expansion queries (fetch neighboring blocks for a search hit).
 - **Denormalised Store ID:** The `store_id` column is denormalised onto the `chunks` table for

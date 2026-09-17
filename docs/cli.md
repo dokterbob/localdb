@@ -1117,6 +1117,8 @@ Options:
           Path to config file (default: platform data dir / localdb / config.yaml)
       --limit <LIMIT>
           Maximum number of results to return (must be >= 1) [default: 3]
+      --dedup <DEDUP>
+          Passage grouping: off, text, or text_and_vector [default: text_and_vector]
       --content-length <CONTENT_LENGTH>
           Max characters of snippet text shown per result in human-readable output [default: 1000]
       --json
@@ -1145,6 +1147,44 @@ Options:
 
 Omit `--store` and every store is searched; pass `--store` (repeatable) to narrow to specific stores
 (specs/05-surfaces.md §2.2) — unchanged behavior, listed here for completeness.
+
+### Passage grouping
+
+Search groups exact stored-text or exact eligible stored-vector matches by default. The highest
+ranked occurrence represents each group; all copies keep their own source, metadata, location, and
+retrieval identifiers. Distinct passages in a document remain separate results.
+
+```sh
+localdb search --dedup text_and_vector hybrid search  # default
+localdb search --dedup text hybrid search             # exact stored text only
+localdb search --dedup off hybrid search              # independently ranked occurrences
+```
+
+Grouping considers only retrieved candidates (default 50 per leg per selected store). It does not
+search again to find every copy, refill collapsed results, or increase a representative's score.
+Vector equality means identical stored bytes under the same nonempty indexing policy; it is not an
+approximate similarity threshold or a claim that two documents are identical.
+
+Human output prints the representative passage and lists additional matching occurrences among
+retrieved candidates, including each store, URI, title if present, location, and match reasons.
+Alternate passage text is available in JSON when it differs; it is not appended to the human
+summary. `--content-length` limits only the representative's human rendering.
+
+For the four-occurrence example in [search-groups.json](search-groups.json), human output is:
+
+```text
+1. file:///notes/copy-0.txt
+   Shared passage.
+   3 additional matching occurrences in retrieved candidates:
+   - [notes (store-a)] file:///notes/copy-1.txt (block 1, chunk 0, span 0..16, window []; identical stored vector)
+   - [archive (store-b)] file:///notes/copy-2.txt (block 2, chunk 0, span 0..16, window []; identical stored vector)
+   - [archive (store-b)] file:///notes/copy-3.txt (block 3, chunk 0, span 0..15, window []; exact text, identical stored vector)
+```
+
+An older running daemon must advertise `search_dedup` in `/v1/status` for default grouping or
+`--dedup text`. Otherwise the CLI exits 5 (`daemon_capability_unavailable`): upgrade/restart the
+daemon, stop it to use embedded search, or explicitly choose `--dedup off`. Off still requires
+search-filter support when filters are supplied. Both checks share one status request.
 
 ### Filter options
 
@@ -1300,6 +1340,140 @@ $ localdb search -s notes --json hybrid search
 (The structural fields above — `block`, `chunk_position`, `heading_path`, `location.span`,
 `snippet`, `metadata`, `chunk_id`, `resource_id` and `provenance.content_hash` — are captured from a
 real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative.)
+
+Grouped JSON keeps the same `{"citations": [...]}` wrapper. Each citation's optional `duplicates`
+array carries `reasons` and a nonrecursive `citation`. An exact text copy omits both `snippet` and
+`snippet_ref`: use the representative's snippet. A vector-only alternate with different text owns
+its full snippet; later copies use `snippet_ref: {"store_id": "...", "chunk_id": "..."}` to refer to
+the first earlier alternate with that text in this group. Missing fields are omitted, not null. An
+explicit empty snippet is a value. Every reference resolves within the returned group.
+
+[Complete compact JSON examples](search-groups.json) show exact copies and texts `X, Y, Y, X`. For
+example, the exact-text group serializes as follows (synthetic identifiers and scores):
+
+```json
+{
+  "citations": [
+    {
+      "chunk_id": "chunk-0",
+      "resource_id": "resource-0",
+      "store": {
+        "id": "store-a",
+        "name": "notes"
+      },
+      "uri": "file:///notes/copy-0.txt",
+      "title": null,
+      "heading_path": [],
+      "block": {
+        "seq": 0,
+        "kind": "text"
+      },
+      "chunk_position": {
+        "seq_in_block": 0
+      },
+      "location": {
+        "span": {
+          "start": 0,
+          "end": 15
+        }
+      },
+      "snippet": "Shared passage.",
+      "score": {
+        "fused": 0.03,
+        "dense": 0.8,
+        "bm25": null
+      },
+      "provenance": {
+        "fetched_at": "2026-09-17T00:00:00Z",
+        "content_hash": "document-hash-0"
+      },
+      "metadata": {
+        "title": null,
+        "description": null,
+        "publisher": null,
+        "date": null,
+        "type": null,
+        "format": null,
+        "identifier": null,
+        "source": null,
+        "language": null,
+        "coverage": null,
+        "rights": null,
+        "page_count": null,
+        "word_count": null,
+        "creator": [],
+        "subject": [],
+        "contributor": [],
+        "relation": [],
+        "kind": "document"
+      },
+      "duplicates": [
+        {
+          "reasons": ["exact_text"],
+          "citation": {
+            "chunk_id": "chunk-1",
+            "resource_id": "resource-1",
+            "store": {
+              "id": "store-a",
+              "name": "notes"
+            },
+            "uri": "file:///notes/copy-1.txt",
+            "title": null,
+            "heading_path": [],
+            "block": {
+              "seq": 1,
+              "kind": "text"
+            },
+            "chunk_position": {
+              "seq_in_block": 0
+            },
+            "location": {
+              "span": {
+                "start": 0,
+                "end": 15
+              }
+            },
+            "score": {
+              "fused": 0.028999999999999998,
+              "dense": 0.8,
+              "bm25": null
+            },
+            "provenance": {
+              "fetched_at": "2026-09-17T00:00:00Z",
+              "content_hash": "document-hash-1"
+            },
+            "metadata": {
+              "title": null,
+              "description": null,
+              "publisher": null,
+              "date": null,
+              "type": null,
+              "format": null,
+              "identifier": null,
+              "source": null,
+              "language": null,
+              "coverage": null,
+              "rights": null,
+              "page_count": null,
+              "word_count": null,
+              "creator": [],
+              "subject": [],
+              "contributor": [],
+              "relation": [],
+              "kind": "document"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+To retrieve an alternate independently, use its own `resource_id` with
+`localdb document get --store <citation.store.name> <citation.resource_id>`. MCP `get_chunks`
+accepts its `chunk_id` as `anchor_chunk_id` together with `resource_id` and `store.id` or
+`store.name`. Keep the store identifier: the same chunk ID may occur in different stores.
 
 There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` in the Citation shape —
 those are superseded by `resource_id`, the nested `block {seq, kind}`,
