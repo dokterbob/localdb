@@ -14,8 +14,8 @@
 //!
 //! ## Why scope is enforced on tool *arguments*
 //!
-//! Unscoped (no `--store`), this really is a verbatim relay and nothing here
-//! inspects a request. Scoped, it has to — and the tool arguments are the
+//! Search requests validate the grouping mode and upstream capability before relay.
+//! Scoped requests also inspect store arguments, which are the
 //! only channel available. rmcp's `StreamableHttpService` (`http.rs`) takes a
 //! synchronous `Fn() -> Result<S, io::Error>` service factory with no access
 //! to the HTTP request, so the daemon cannot hand out a per-connection scoped
@@ -30,6 +30,8 @@
 //! `localdb mcp` and talk to the unscoped endpoint directly. It stops an
 //! agent from *accidentally* reading another project's docs; it does not
 //! contain a hostile one. See specs/05-surfaces.md §4.2.1.
+
+mod capabilities;
 
 use rmcp::{
     model::{
@@ -185,8 +187,9 @@ impl std::error::Error for ProxyConnectError {}
 /// for as long as this stdio process serves requests.
 pub struct ProxyHandler {
     upstream: RunningService<RoleClient, rmcp::model::ClientInfo>,
-    /// `None` = unscoped (no `--store` given): every request relays verbatim.
+    /// `None` = unscoped (no `--store` given).
     scope: Option<ProxyScope>,
+    search_dedup_supported: tokio::sync::Mutex<Option<bool>>,
 }
 
 impl ProxyHandler {
@@ -242,6 +245,7 @@ impl ProxyHandler {
             return Ok(Self {
                 upstream,
                 scope: None,
+                search_dedup_supported: tokio::sync::Mutex::new(None),
             });
         }
 
@@ -265,6 +269,7 @@ impl ProxyHandler {
 
         Ok(Self {
             upstream,
+            search_dedup_supported: tokio::sync::Mutex::new(None),
             scope: Some(ProxyScope {
                 upstream_stores,
                 allowed_ids,
@@ -551,8 +556,32 @@ impl ServerHandler for ProxyHandler {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if request.name == "search" {
+            let mode = match request
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("dedup"))
+            {
+                None => localdb_core::SearchDedup::default(),
+                Some(value) => {
+                    match serde_json::from_value::<localdb_core::SearchDedup>(value.clone()) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            return Ok(crate::tools::typed_error(
+                                "invalid_request",
+                                format!("invalid dedup mode: {error}"),
+                            ))
+                        }
+                    }
+                }
+            };
+            if mode != localdb_core::SearchDedup::Off && !self.supports_search_dedup().await? {
+                return Ok(crate::tools::typed_error("daemon_capability_unavailable",
+                    "the running daemon does not support search grouping; restart it, use embedded mode, or pass dedup: off"));
+            }
+        }
         let Some(scope) = &self.scope else {
-            // Unscoped: byte-identical relay, including for unknown tool
+            // Unscoped relay after search compatibility validation, including unknown tool
             // names — the upstream owns "tool not found".
             return self.relay(request).await;
         };

@@ -475,3 +475,165 @@ async fn get_chunks_plain_offset_shape_matches_spec_05_surfaces_4_1() {
 
     assert_matches_spec_shape(spec, &real, "get_chunks_response");
 }
+
+#[tokio::test]
+async fn search_empty_example_matches_documented_counts_and_framing() {
+    let (handler, _, _) = make_handler_with_sequential_chunks(0).await;
+    let client = client_for(handler).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(
+                serde_json::json!({"query":"hello"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let text = &result.content[0].as_text().unwrap().text;
+    let (json, human) = text
+        .split_once("\n\n---\n")
+        .expect("search response framing");
+    let actual: Value = serde_json::from_str(json).unwrap();
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/search-groups.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut expected = fixture["empty_http"].clone();
+    expected.as_object_mut().unwrap().remove("next_cursor");
+    assert_eq!(actual, expected);
+    assert_eq!(human, "No results found.");
+}
+
+#[tokio::test]
+async fn search_compact_vector_group_preserves_document_retrieval_identifiers() {
+    let (handler, resource, ids) = make_handler_with_sequential_chunks(4).await;
+    let client = client_for(handler).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(
+                serde_json::json!({"query":"chunk", "limit":1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let text = &result.content[0].as_text().unwrap().text;
+    let (json, _) = text.split_once("\n\n---\n").unwrap();
+    let actual: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(actual["total_candidates"], 4);
+    assert_eq!(actual["total_results"], 1);
+    let representative = &actual["citations"][0];
+    let alternates = representative["duplicates"].as_array().unwrap();
+    assert_eq!(alternates.len(), 3);
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(representative["chunk_id"].as_str().unwrap().to_string());
+    for alternate in alternates {
+        assert_eq!(alternate["reasons"], serde_json::json!(["exact_vector"]));
+        let occurrence = &alternate["citation"];
+        assert_eq!(occurrence["resource_id"], resource);
+        assert_eq!(occurrence["store"]["id"], "store-1");
+        assert!(occurrence.get("duplicates").is_none());
+        assert!(occurrence["snippet"].is_string());
+        assert!(occurrence.get("snippet_ref").is_none());
+        seen.insert(occurrence["chunk_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(seen, ids.into_iter().collect());
+}
+
+#[tokio::test]
+async fn direct_mcp_invalid_dedup_remains_a_tool_deserialization_error() {
+    let (handler, _, _) = make_handler_with_sequential_chunks(0).await;
+    let client = client_for(handler).await;
+    for invalid in [
+        Value::Null,
+        serde_json::json!(true),
+        serde_json::json!("unknown"),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("search").with_arguments(
+                    serde_json::json!({"query":"hello", "dedup":invalid})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("deserialize"));
+    }
+}
+
+#[test]
+fn complete_search_documentation_examples_match_compact_citations_and_rendering() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("docs/search-groups.json")).unwrap(),
+    )
+    .unwrap();
+    let http = std::fs::read_to_string(root.join("docs/http-api.md")).unwrap();
+    let http_value: Value =
+        serde_json::from_str(json_block_after(&http, "A complete exact-text response")).unwrap();
+    assert_eq!(http_value["citations"], fixture["exact_text"]["citations"]);
+    assert_eq!(http_value["total_candidates"], 2);
+    assert_eq!(http_value["total_results"], 1);
+    let mcp_doc = std::fs::read_to_string(root.join("docs/mcp.md")).unwrap();
+    let response: Value = serde_json::from_str(json_block_after(
+        &mcp_doc,
+        "A complete compact vector-match response",
+    ))
+    .unwrap();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    let (json, human) = text.split_once("\n\n---\n").unwrap();
+    let inner: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(inner["citations"], fixture["differing_text"]["citations"]);
+    assert_eq!(inner["total_candidates"], 4);
+    assert_eq!(inner["total_results"], 1);
+    let citations: Vec<localdb_core::Citation> =
+        serde_json::from_value(inner["citations"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&citations).unwrap(),
+        inner["citations"]
+    );
+    assert_eq!(human, mcp::tools::render_citations_text(&citations, 400));
+}
+
+#[tokio::test]
+async fn documented_search_input_schema_matches_actual_tools_list() {
+    let (handler, _, _) = make_handler_with_sequential_chunks(0).await;
+    let client = client_for(handler).await;
+    let tools = client.list_tools(None).await.unwrap();
+    let search = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "search")
+        .unwrap();
+    let docs =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/mcp.md"))
+            .unwrap();
+    let search_docs = docs
+        .split_once("### `search`")
+        .unwrap()
+        .1
+        .split_once("### `get_document`")
+        .unwrap()
+        .0;
+    let documented: Value =
+        serde_json::from_str(json_block_after(search_docs, "**Input schema**")).unwrap();
+    assert_eq!(
+        documented,
+        serde_json::to_value(&search.input_schema).unwrap()
+    );
+}

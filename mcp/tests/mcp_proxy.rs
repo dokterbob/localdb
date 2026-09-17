@@ -835,3 +835,58 @@ async fn mcp_tool_set_identical_with_and_without_allow_write() {
          scoping gate, which currently refuses every tool outside this five-tool set"
     );
 }
+
+#[tokio::test]
+async fn scoped_proxy_preserves_compact_groups_and_excludes_matching_outside_copy() {
+    let mut stores = Vec::new();
+    for (id, text) in [
+        ("a", "shared passage"),
+        ("b", "variant passage"),
+        ("c", "variant passage"),
+        ("d", "shared passage"),
+        ("denied", "shared passage"),
+    ] {
+        stores.push(seeded_store(id, id, text).await.0);
+    }
+    let base = serve_upstream(stores).await;
+    let proxy = ProxyHandler::connect(&base, &["a".into(), "b".into(), "c".into(), "d".into()])
+        .await
+        .unwrap();
+    let client = client_for(proxy).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(
+                serde_json::json!({"query":"passage"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let value = result_json(&result);
+    assert_eq!(value["total_candidates"], 4);
+    assert_eq!(value["total_results"], 1);
+    let group = &value["citations"][0];
+    let duplicates = group["duplicates"].as_array().unwrap();
+    assert_eq!(duplicates.len(), 3);
+    assert_eq!(group["store"]["id"], "a");
+    assert_eq!(duplicates[0]["citation"]["snippet"], "variant passage");
+    assert!(duplicates[1]["citation"].get("snippet").is_none());
+    assert_eq!(
+        duplicates[1]["citation"]["snippet_ref"],
+        serde_json::json!({"store_id":"b", "chunk_id":duplicates[0]["citation"]["chunk_id"]})
+    );
+    assert!(duplicates[2]["citation"].get("snippet").is_none());
+    assert!(duplicates[2]["citation"].get("snippet_ref").is_none());
+    for occurrence in
+        std::iter::once(group).chain(duplicates.iter().map(|entry| &entry["citation"]))
+    {
+        assert_ne!(occurrence["store"]["id"], "denied");
+        assert!(occurrence["location"]["span"].is_object());
+        assert!(occurrence["metadata"].is_object());
+        assert!(occurrence["resource_id"].is_string());
+    }
+    let _ = client.cancel().await;
+}

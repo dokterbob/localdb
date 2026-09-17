@@ -1,5 +1,5 @@
 use localdb_core::citation::Citation;
-use localdb_core::{config::loader::ConfigLoader, Error, SearchFilters};
+use localdb_core::{config::loader::ConfigLoader, Error, SearchDedup, SearchFilters};
 use serde_json::json;
 use server::search_service::SearchRequest;
 
@@ -11,16 +11,18 @@ use crate::{
     normalize::{exit_err, format_snippet, print_json, validate_store_name},
 };
 
+/// Retrieval and display options shared by both CLI search execution paths.
+pub struct SearchOptions {
+    pub limit: usize,
+    pub content_length: usize,
+    pub dedup: SearchDedup,
+    pub filters: SearchFilters,
+}
+
 /// `localdb search <query> [--limit N] [--content-length N] [filters...]`
-pub fn run_search(
-    ctx: &CliContext,
-    query: &str,
-    limit: usize,
-    content_length: usize,
-    filters: SearchFilters,
-) {
+pub fn run_search(ctx: &CliContext, query: &str, options: SearchOptions) {
     // F9: Reject --limit 0.
-    if limit == 0 {
+    if options.limit == 0 {
         exit_err(
             &Error::InvalidRequest {
                 message: "--limit must be at least 1".to_string(),
@@ -37,7 +39,7 @@ pub fn run_search(
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_search_async(ctx, query, limit, content_length, filters));
+    rt.block_on(run_search_async(ctx, query, options));
 }
 
 /// `search`'s table entry (issue #187 stage 5). `Outcome` is `Vec<Citation>`
@@ -52,39 +54,44 @@ pub(crate) struct SearchCmd<'a> {
     pub(crate) query: &'a str,
     pub(crate) limit: usize,
     pub(crate) filters: SearchFilters,
+    pub(crate) dedup: SearchDedup,
 }
 
-/// Fail unless the daemon at `base_url` advertises search-filter support.
-///
-/// Absence is treated as unsupported, which is the only safe reading: a
-/// daemon older than the `features` field omits it entirely, and one older
-/// than search filters would silently drop them and answer unfiltered.
-/// Exits 5 (unavailable) — the daemon is running and healthy, it just cannot
-/// do what was asked — and names the fix, since restarting it resolves this
-/// permanently.
-async fn require_daemon_search_filter_support(
+/// Check all required search capabilities in one authenticated status request.
+async fn require_daemon_search_support(
     ctx: &CliContext,
     base_url: &str,
+    filters: bool,
+    dedup: SearchDedup,
 ) -> Result<(), Error> {
-    let url = format!("{base_url}/v1/status");
-    let status = daemon_request_async(ctx, reqwest::Method::GET, &url, None).await?;
-    let supported = status
-        .get("features")
-        .and_then(|f| f.as_array())
-        .is_some_and(|features| {
-            features
-                .iter()
-                .any(|f| f.as_str() == Some("search_filters"))
-        });
-
-    if supported {
+    if !filters && dedup == SearchDedup::Off {
+        return Ok(());
+    }
+    let status = daemon_request_async(
+        ctx,
+        reqwest::Method::GET,
+        &format!("{base_url}/v1/status"),
+        None,
+    )
+    .await?;
+    let supported = |feature: &str| {
+        status
+            .get("features")
+            .and_then(|v| v.as_array())
+            .is_some_and(|features| features.iter().any(|v| v.as_str() == Some(feature)))
+    };
+    let mut missing = Vec::new();
+    if filters && !supported("search_filters") {
+        missing.push("search filters");
+    }
+    if dedup != SearchDedup::Off && !supported("search_dedup") {
+        missing.push("search grouping");
+    }
+    if missing.is_empty() {
         return Ok(());
     }
     Err(Error::DaemonCapabilityUnavailable {
-        message: "the running daemon predates search filters and would ignore them, \
-                  returning unfiltered results; restart it (`localdb serve`) to use \
-                  --path/--mime/date filters, or stop it to search in embedded mode"
-            .to_string(),
+        message: format!("the running daemon does not support {}; restart it (`localdb serve`) or stop it to search in embedded mode. Use --dedup off to bypass only the grouping requirement", missing.join(" and ")),
     })
 }
 
@@ -97,20 +104,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStoresAllowEmpty;
 
     async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
-        // A daemon predating search filters ignores the new request fields
-        // rather than rejecting them — `SearchRequest` has no
-        // `deny_unknown_fields` — and answers as though no filter had been
-        // asked for. That is the worst possible failure for a scoping
-        // request: the caller gets a full, unfiltered result set that looks
-        // like a correctly narrowed one. A long-lived daemon outliving a
-        // binary upgrade makes this reachable in normal use.
-        //
-        // So when filters are actually set, confirm the daemon advertises
-        // support before sending them. Only paid for when filtering; an
-        // unfiltered search still goes straight to the POST below.
-        if self.filters.is_any_set() {
-            require_daemon_search_filter_support(ctx, base_url).await?;
-        }
+        require_daemon_search_support(ctx, base_url, self.filters.is_any_set(), self.dedup).await?;
 
         let url = format!("{base_url}/v1/search");
         // Serialize the shared `SearchRequest` struct rather than hand-building
@@ -122,6 +116,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
         // as the same `invalid_request` / exit 2 either way.
         let request = SearchRequest {
             query: self.query.to_string(),
+            dedup: self.dedup,
             store_filter: ctx.stores.clone(),
             limit: self.limit,
             cursor: None,
@@ -196,6 +191,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
         // to be running — the exact asymmetry this issue is about fixing.
         let request = QueryRequest {
             query: self.query.to_string(),
+            dedup: self.dedup,
             leg_k: None,
             top_n: Some(clamp_search_limit(self.limit)),
             filters,
@@ -244,32 +240,28 @@ fn render_search_output(
         for (i, citation) in citations.iter().enumerate() {
             println!("{}. {}", i + 1, citation_headline(citation));
             println!("   {}", format_snippet(&citation.snippet, content_length));
+            print!("{}", mcp::tools::render_duplicate_occurrences(citation));
             println!();
         }
     }
 }
 
-pub(crate) async fn run_search_async(
-    ctx: &CliContext,
-    query: &str,
-    limit: usize,
-    content_length: usize,
-    filters: SearchFilters,
-) {
+pub(crate) async fn run_search_async(ctx: &CliContext, query: &str, options: SearchOptions) {
     // F1-cli: use lenient loader so search works even with malformed config.
     let config_loader = load_config_lenient(ctx).await;
     let citations = dispatch(
         &SearchCmd {
             query,
-            limit,
-            filters,
+            limit: options.limit,
+            filters: options.filters,
+            dedup: options.dedup,
         },
         ctx,
         &config_loader,
         || open_app_db_lenient_or_exit(ctx, &config_loader),
     )
     .await;
-    render_search_output(&citations, query, content_length, ctx.json);
+    render_search_output(&citations, query, options.content_length, ctx.json);
 }
 
 #[cfg(test)]

@@ -220,6 +220,10 @@ pub enum Command {
         #[arg(long, default_value = "3", value_parser = clap::value_parser!(usize))]
         limit: usize,
 
+        /// Passage grouping: off, text, or text_and_vector.
+        #[arg(long, default_value = "text_and_vector")]
+        dedup: cli::SearchDedup,
+
         /// Max characters of snippet text shown per result in human-readable output.
         #[arg(long, default_value = "1000", value_parser = clap::value_parser!(usize))]
         content_length: usize,
@@ -859,6 +863,7 @@ fn main() {
             query,
             limit,
             content_length,
+            dedup,
             filters,
         } => {
             let filters = cli::SearchFilters {
@@ -873,7 +878,16 @@ fn main() {
                 document_after: filters.document_after.clone(),
                 document_before: filters.document_before.clone(),
             };
-            cli::run_search(&ctx, &query.join(" "), *limit, *content_length, filters)
+            cli::run_search(
+                &ctx,
+                &query.join(" "),
+                cli::SearchOptions {
+                    limit: *limit,
+                    content_length: *content_length,
+                    dedup: *dedup,
+                    filters,
+                },
+            )
         }
         Command::Add {
             sources,

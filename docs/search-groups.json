@@ -1,0 +1,366 @@
+{
+  "exact_text": {
+    "citations": [
+      {
+        "chunk_id": "chunk-0",
+        "resource_id": "resource-0",
+        "store": {
+          "id": "store-a",
+          "name": "notes"
+        },
+        "uri": "file:///notes/copy-0.txt",
+        "title": null,
+        "heading_path": [],
+        "block": {
+          "seq": 0,
+          "kind": "text"
+        },
+        "chunk_position": {
+          "seq_in_block": 0
+        },
+        "location": {
+          "span": {
+            "start": 0,
+            "end": 15
+          }
+        },
+        "snippet": "Shared passage.",
+        "score": {
+          "fused": 0.03,
+          "dense": 0.8,
+          "bm25": null
+        },
+        "provenance": {
+          "fetched_at": "2026-09-17T00:00:00Z",
+          "content_hash": "document-hash-0"
+        },
+        "metadata": {
+          "title": null,
+          "description": null,
+          "publisher": null,
+          "date": null,
+          "type": null,
+          "format": null,
+          "identifier": null,
+          "source": null,
+          "language": null,
+          "coverage": null,
+          "rights": null,
+          "page_count": null,
+          "word_count": null,
+          "creator": [],
+          "subject": [],
+          "contributor": [],
+          "relation": [],
+          "kind": "document"
+        },
+        "duplicates": [
+          {
+            "reasons": [
+              "exact_text"
+            ],
+            "citation": {
+              "chunk_id": "chunk-1",
+              "resource_id": "resource-1",
+              "store": {
+                "id": "store-a",
+                "name": "notes"
+              },
+              "uri": "file:///notes/copy-1.txt",
+              "title": null,
+              "heading_path": [],
+              "block": {
+                "seq": 1,
+                "kind": "text"
+              },
+              "chunk_position": {
+                "seq_in_block": 0
+              },
+              "location": {
+                "span": {
+                  "start": 0,
+                  "end": 15
+                }
+              },
+              "score": {
+                "fused": 0.028999999999999998,
+                "dense": 0.8,
+                "bm25": null
+              },
+              "provenance": {
+                "fetched_at": "2026-09-17T00:00:00Z",
+                "content_hash": "document-hash-1"
+              },
+              "metadata": {
+                "title": null,
+                "description": null,
+                "publisher": null,
+                "date": null,
+                "type": null,
+                "format": null,
+                "identifier": null,
+                "source": null,
+                "language": null,
+                "coverage": null,
+                "rights": null,
+                "page_count": null,
+                "word_count": null,
+                "creator": [],
+                "subject": [],
+                "contributor": [],
+                "relation": [],
+                "kind": "document"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "differing_text": {
+    "citations": [
+      {
+        "chunk_id": "chunk-0",
+        "resource_id": "resource-0",
+        "store": {
+          "id": "store-a",
+          "name": "notes"
+        },
+        "uri": "file:///notes/copy-0.txt",
+        "title": null,
+        "heading_path": [],
+        "block": {
+          "seq": 0,
+          "kind": "text"
+        },
+        "chunk_position": {
+          "seq_in_block": 0
+        },
+        "location": {
+          "span": {
+            "start": 0,
+            "end": 15
+          }
+        },
+        "snippet": "Shared passage.",
+        "score": {
+          "fused": 0.03,
+          "dense": 0.8,
+          "bm25": null
+        },
+        "provenance": {
+          "fetched_at": "2026-09-17T00:00:00Z",
+          "content_hash": "document-hash-0"
+        },
+        "metadata": {
+          "title": null,
+          "description": null,
+          "publisher": null,
+          "date": null,
+          "type": null,
+          "format": null,
+          "identifier": null,
+          "source": null,
+          "language": null,
+          "coverage": null,
+          "rights": null,
+          "page_count": null,
+          "word_count": null,
+          "creator": [],
+          "subject": [],
+          "contributor": [],
+          "relation": [],
+          "kind": "document"
+        },
+        "duplicates": [
+          {
+            "reasons": [
+              "exact_vector"
+            ],
+            "citation": {
+              "chunk_id": "chunk-1",
+              "resource_id": "resource-1",
+              "store": {
+                "id": "store-a",
+                "name": "notes"
+              },
+              "uri": "file:///notes/copy-1.txt",
+              "title": null,
+              "heading_path": [],
+              "block": {
+                "seq": 1,
+                "kind": "text"
+              },
+              "chunk_position": {
+                "seq_in_block": 0
+              },
+              "location": {
+                "span": {
+                  "start": 0,
+                  "end": 16
+                }
+              },
+              "snippet": "Variant passage.",
+              "score": {
+                "fused": 0.028999999999999998,
+                "dense": 0.8,
+                "bm25": null
+              },
+              "provenance": {
+                "fetched_at": "2026-09-17T00:00:00Z",
+                "content_hash": "document-hash-1"
+              },
+              "metadata": {
+                "title": null,
+                "description": null,
+                "publisher": null,
+                "date": null,
+                "type": null,
+                "format": null,
+                "identifier": null,
+                "source": null,
+                "language": null,
+                "coverage": null,
+                "rights": null,
+                "page_count": null,
+                "word_count": null,
+                "creator": [],
+                "subject": [],
+                "contributor": [],
+                "relation": [],
+                "kind": "document"
+              }
+            }
+          },
+          {
+            "reasons": [
+              "exact_vector"
+            ],
+            "citation": {
+              "chunk_id": "chunk-2",
+              "resource_id": "resource-2",
+              "store": {
+                "id": "store-b",
+                "name": "archive"
+              },
+              "uri": "file:///notes/copy-2.txt",
+              "title": null,
+              "heading_path": [],
+              "block": {
+                "seq": 2,
+                "kind": "text"
+              },
+              "chunk_position": {
+                "seq_in_block": 0
+              },
+              "location": {
+                "span": {
+                  "start": 0,
+                  "end": 16
+                }
+              },
+              "score": {
+                "fused": 0.027999999999999997,
+                "dense": 0.8,
+                "bm25": null
+              },
+              "provenance": {
+                "fetched_at": "2026-09-17T00:00:00Z",
+                "content_hash": "document-hash-2"
+              },
+              "metadata": {
+                "title": null,
+                "description": null,
+                "publisher": null,
+                "date": null,
+                "type": null,
+                "format": null,
+                "identifier": null,
+                "source": null,
+                "language": null,
+                "coverage": null,
+                "rights": null,
+                "page_count": null,
+                "word_count": null,
+                "creator": [],
+                "subject": [],
+                "contributor": [],
+                "relation": [],
+                "kind": "document"
+              },
+              "snippet_ref": {
+                "store_id": "store-a",
+                "chunk_id": "chunk-1"
+              }
+            }
+          },
+          {
+            "reasons": [
+              "exact_text",
+              "exact_vector"
+            ],
+            "citation": {
+              "chunk_id": "chunk-3",
+              "resource_id": "resource-3",
+              "store": {
+                "id": "store-b",
+                "name": "archive"
+              },
+              "uri": "file:///notes/copy-3.txt",
+              "title": null,
+              "heading_path": [],
+              "block": {
+                "seq": 3,
+                "kind": "text"
+              },
+              "chunk_position": {
+                "seq_in_block": 0
+              },
+              "location": {
+                "span": {
+                  "start": 0,
+                  "end": 15
+                }
+              },
+              "score": {
+                "fused": 0.027,
+                "dense": 0.8,
+                "bm25": null
+              },
+              "provenance": {
+                "fetched_at": "2026-09-17T00:00:00Z",
+                "content_hash": "document-hash-3"
+              },
+              "metadata": {
+                "title": null,
+                "description": null,
+                "publisher": null,
+                "date": null,
+                "type": null,
+                "format": null,
+                "identifier": null,
+                "source": null,
+                "language": null,
+                "coverage": null,
+                "rights": null,
+                "page_count": null,
+                "word_count": null,
+                "creator": [],
+                "subject": [],
+                "contributor": [],
+                "relation": [],
+                "kind": "document"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "empty_http": {
+    "citations": [],
+    "total_candidates": 0,
+    "total_results": 0,
+    "next_cursor": null
+  }
+}

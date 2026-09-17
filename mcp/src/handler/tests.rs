@@ -294,6 +294,7 @@ async fn member_search_naming_an_ungranted_store_is_forbidden_not_not_found() {
         None,
     );
     let args = SearchArgs {
+        dedup: localdb_core::SearchDedup::Off,
         query: "hello".to_string(),
         stores: Some(vec!["ungranted".to_string()]),
         limit: None,
@@ -330,6 +331,7 @@ async fn member_search_naming_a_truly_unknown_store_is_store_not_found() {
         access: StoreAccess::Granted(["granted-shared".to_string()].into_iter().collect()),
     };
     let args = SearchArgs {
+        dedup: localdb_core::SearchDedup::Off,
         query: "hello".to_string(),
         stores: Some(vec!["does-not-exist".to_string()]),
         limit: None,
@@ -359,6 +361,7 @@ async fn admin_search_naming_any_store_works() {
         None,
     );
     let args = SearchArgs {
+        dedup: localdb_core::SearchDedup::Off,
         query: "hello".to_string(),
         stores: Some(vec!["secret-docs".to_string()]),
         limit: None,
@@ -385,4 +388,88 @@ fn named_store_authorization_preserves_id_precedence() {
         McpHandler::forbidden_for_named_unreadable_store(&full, &[allowed], &["shadow".into()])
             .unwrap();
     assert_eq!(error_code(&error), "forbidden");
+}
+
+#[tokio::test]
+async fn default_grouping_excludes_denied_copies_from_members_and_counts() {
+    use localdb_core::{ChunkRecord, FakeStore, RetrievalStore};
+    let mut stores = Vec::new();
+    for name in ["allowed-a", "allowed-b", "denied"] {
+        let store = FakeStore::new();
+        store
+            .upsert_chunks(vec![ChunkRecord {
+                id: format!("chunk-{name}"),
+                resource_id: format!("resource-{name}"),
+                store_id: name.into(),
+                text: "shared passage".into(),
+                span: localdb_core::types::Span::new(0, 14),
+                heading_path: vec![],
+                embedding: vec![0.5; 4],
+                policy_version: "same-policy".into(),
+                fetched_at: "2026-09-17T00:00:00Z".into(),
+                modified_at: None,
+                content_hash: format!("document-{name}"),
+                origin_store: name.into(),
+                source_id: "source".into(),
+                ingestor_kind: "path".into(),
+                mime: Some("text/plain".into()),
+                uri: format!("file:///{name}.txt"),
+                metadata: Default::default(),
+                block_seq: 0,
+                seq_in_block: 0,
+                block_kind: None,
+                page: None,
+                window_block_seqs: vec![],
+                date_original: None,
+                date_parsed: None,
+                external_id: None,
+                external_etag: None,
+            }])
+            .await
+            .unwrap();
+        stores.push(AvailableStore::new(
+            crate::tools::StoreDescriptor {
+                id: name.into(),
+                name: name.into(),
+                visibility: "shared".into(),
+            },
+            Box::new(store),
+        ));
+    }
+    let backend = Arc::new(crate::tools::StoresBackend::new(&stores));
+    let handler = McpHandler::new(
+        Arc::new(StaticStoreProvider::new(stores)),
+        backend,
+        embedder(),
+        false,
+        None,
+    );
+    let mut principal = member("restricted");
+    principal.access = StoreAccess::Granted(
+        ["allowed-a".to_string(), "allowed-b".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    let args = serde_json::from_value(serde_json::json!({"query":"shared passage"})).unwrap();
+    let result = handler
+        .search_inner(args, &http_extensions_with_principal(principal))
+        .await;
+    assert_ne!(result.is_error, Some(true));
+    let text = &result.content[0].as_text().unwrap().text;
+    let value: serde_json::Value =
+        serde_json::from_str(text.split_once("\n\n---\n").unwrap().0).unwrap();
+    assert_eq!(value["total_candidates"], 2);
+    assert_eq!(value["total_results"], 1);
+    let citation = &value["citations"][0];
+    let duplicates = citation["duplicates"].as_array().unwrap();
+    assert_eq!(duplicates.len(), 1);
+    for occurrence in [citation, &duplicates[0]["citation"]] {
+        assert!(["allowed-a", "allowed-b"].contains(&occurrence["store"]["id"].as_str().unwrap()));
+        assert!(!occurrence["uri"].as_str().unwrap().contains("denied"));
+    }
+    assert_eq!(
+        duplicates[0]["reasons"],
+        serde_json::json!(["exact_text", "exact_vector"])
+    );
+    assert!(duplicates[0]["citation"].get("snippet").is_none());
 }

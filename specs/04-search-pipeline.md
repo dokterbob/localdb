@@ -930,7 +930,8 @@ Markdown string). `extractor_version` on resources enables selective reprocessin
 ## 5. Retrieval
 
 **Decision:** hybrid **BM25 + dense, fused with RRF** (k = 60), implemented **in our code** above
-the `RetrievalStore` trait: query both legs (top-K each, default K = 50), fuse, then shape results.
+the `RetrievalStore` trait: query both legs (top-K each, default K = 50), fuse → rerank → group →
+limit/page → compact citation shaping.
 
 **Rationale:** hybrid-by-default is a day-one requirement; RRF is robust, parameter-light, and
 score-scale-free. Owning fusion keeps it identical across future backends. **Rejected:** score
@@ -1005,14 +1006,52 @@ interpolation (needs per-model calibration); backend-native fusion (backend-depe
   solved until both legs are calibrated. Tracked by issue #40; see also §"Rejected" above on score
   interpolation.
 
-- **Result shaping:** top-N (default 10) → Citation objects
-  ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
+- **Result shaping:** group the full reranked pool, then top-N (default 10) → compact Citation
+  objects ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
   (`score: {fused, dense, bm25}`). Citations carry a **block reference** and chunk position within
   that block, not just a Markdown span.
 - **Reranking: explicitly post-MVP** ([06-roadmap.md](06-roadmap.md) §6). The pipeline leaves a seam
-  (rerank stage between fuse and shape) but ships nothing.
+  (rerank stage between fuse and grouping) but ships nothing.
 - Query rewriting and answer generation are **not** backend-core concerns — they belong to
   downstream consumers (agents, future UI). URL/image as _query_ modes: out of scope v1.
+
+### Exact passage grouping
+
+`SearchDedup` is shared by core and all surfaces: `off` returns independently ranked occurrences,
+`text` groups exact stored text, and `text_and_vector` (default) groups exact text or eligible exact
+stored vectors. Missing mode selects the default; explicit null, wrong types, and unknown values are
+invalid. `text` emits only `exact_text`; the default emits applicable reasons in the order
+`exact_text`, `exact_vector`. Off emits no duplicate details.
+
+Process the full ranked candidate pool using complete text and vector lookup maps. Register keys
+only for representatives; match directly to representatives, choosing the earliest when criteria
+match different representatives. Preserve representative and member order and unchanged scores.
+Never assume adjacency: dense ties, contextual embeddings, cross-store ranks, and RRF can separate
+copies. Group across accessible selected stores after filters, without extra searches, document
+reads, block reads, or group enumeration. Members below the original top-N are retained when their
+group is returned. Distinct passages in the same document remain independent.
+
+Internal `StoredEmbeddingIdentity` compares `format`, `encoding`, `dimensions`, and complete raw
+`bytes` exactly. Namespaces are `libsql-blob-v1` and `fake-f32-le-v1`. Empty bytes, zero dimensions,
+or missing identity disable vector matching. Policies must also be equal and nonempty. The policy
+includes embedding, chunking, and parser settings, intentionally making equality conservative. Text
+matches are independent of these restrictions. Search-result identities are skipped during both
+serialization and deserialization; raw bytes never enter citations. Fusion accepts an identity from
+either leg; conflicting supplied identities permanently disable vector matching for that occurrence
+for the whole fusion pass, even if a later leg supplies the original identity.
+
+Compare raw storage, never `vector_extract` text: Float32 export can round different binary values
+to the same text. Signed-zero bit differences remain distinct; binary storage compares packed sign
+bits (equal stored signs match despite different original magnitudes). No epsilon, radius, or
+approximate threshold applies. FakeStore compares Float32 `to_bits().to_le_bytes()`; it does not
+simulate binary quantization. SQL score ties use `c.id ASC` before limits; FakeStore uses
+`(store_id, chunk_id)`. This stabilizes ordering within selected ANN candidates, not ANN membership.
+
+`total_candidates` counts distinct fused occurrences before grouping. `total_results` counts
+representatives after reranking/grouping, before truncation. Both describe the retrieved pool, not
+the whole collection. Budgets remain default 50 per leg per store (respecting core `leg_k`);
+collapsed pages are not refilled. Pagination is deterministic for the same pool, without snapshot
+consistency. No schema migration, reindexing, ingestion changes, or persistent groups are needed.
 
 ### Context expansion
 

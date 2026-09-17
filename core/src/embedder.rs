@@ -17,7 +17,7 @@ use crate::error::Error;
 ///
 /// The embedder signals the encoding; the store binarizes at index time for `Binary`.
 /// `FakeEmbedder` always returns `Float32`; pplx local-ONNX models return `Binary`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VectorEncoding {
     /// Raw 32-bit float vectors. Default for all embedders.
     #[default]

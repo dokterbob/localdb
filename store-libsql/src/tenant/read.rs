@@ -2,7 +2,8 @@ use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{
     compute_metadata_hash, content_hash, ChunkRecord, Error, Metadata, MetadataFilter,
-    ResourceRecord, SearchResult, StaleFeedResource, StoreStats, VectorEncoding,
+    ResourceRecord, SearchResult, StaleFeedResource, StoreStats, StoredEmbeddingIdentity,
+    VectorEncoding,
 };
 
 use super::rows::{row_to_block, row_to_chunk_record_strict};
@@ -41,6 +42,7 @@ use crate::vectors;
 //  19  c.location_json
 //  20  c.block_kind
 //  21  distance/score     (appended by each query)
+//  22  c.embedding        (raw BLOB, appended by search queries only)
 const CHUNK_COLS: &str = "c.id, c.resource_id,
                     c.text, c.heading_path, vector_extract(c.embedding) AS embedding_json,
                     r.store_id, r.source_id, r.ingestor_kind, r.uri, r.title, r.mime,
@@ -80,13 +82,13 @@ pub(crate) async fn dense_search(
         // position; `fetch_k`/`limit` are Rust-computed `usize`.
         let sql = format!(
             "SELECT {CHUNK_COLS},
-                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance
+                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance, c.embedding
              FROM vector_top_k('chunks_vec_idx', {qvec_sql}, {fetch_k}) AS v
              JOIN chunks c ON c.rowid = v.id
              JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
              WHERE c.store_id = ?
              {filter_clauses}
-             ORDER BY distance ASC
+             ORDER BY distance ASC, c.id ASC
              LIMIT {limit}"
         );
         // `filter_values` is reused across this fetch_k-doubling loop and the
@@ -103,7 +105,11 @@ pub(crate) async fn dense_search(
                 VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
                 VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
             };
-            results.push(SearchResult { chunk, score });
+            results.push(SearchResult {
+                chunk,
+                score,
+                embedding_identity: Some(row_embedding_identity(&row, store)?),
+            });
         }
         if results.len() >= limit {
             break;
@@ -124,12 +130,12 @@ pub(crate) async fn dense_search(
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let sql = format!(
             "SELECT {CHUNK_COLS},
-                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance
+                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance, c.embedding
              FROM chunks c
              JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
              WHERE c.store_id = ?
              {filter_clauses}
-             ORDER BY distance ASC
+             ORDER BY distance ASC, c.id ASC
              LIMIT {limit}"
         );
         let mut params = vec![store.store_id().to_string()];
@@ -143,7 +149,11 @@ pub(crate) async fn dense_search(
                 VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
                 VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
             };
-            results.push(SearchResult { chunk, score });
+            results.push(SearchResult {
+                chunk,
+                score,
+                embedding_identity: Some(row_embedding_identity(&row, store)?),
+            });
         }
     }
     Ok(results)
@@ -163,14 +173,14 @@ pub(crate) async fn bm25_search(
     let (filter_clauses, filter_values) = build_filter_clauses(filters);
     let sql = format!(
         "SELECT {CHUNK_COLS},
-                bm25(chunks_fts) AS score
+                bm25(chunks_fts) AS score, c.embedding
          FROM chunks_fts f
          JOIN chunks c ON c.rowid = f.rowid
          JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
          WHERE chunks_fts MATCH ?
          AND c.store_id = ?
          {filter_clauses}
-         ORDER BY score ASC
+         ORDER BY score ASC, c.id ASC
          LIMIT {limit}"
     );
     // `MATCH ?` is bound first, so it must stay the first positional param;
@@ -186,9 +196,24 @@ pub(crate) async fn bm25_search(
         results.push(SearchResult {
             chunk,
             score: -raw_score as f32,
+            embedding_identity: Some(row_embedding_identity(&row, store)?),
         });
     }
     Ok(results)
+}
+
+/// Keep the complete stored representation: vector text export can round Float32 values.
+fn row_embedding_identity(
+    row: &libsql::Row,
+    store: &TenantStore,
+) -> Result<StoredEmbeddingIdentity, Error> {
+    let bytes: Vec<u8> = row.get(22).map_err(map_libsql_err)?;
+    Ok(StoredEmbeddingIdentity {
+        format: "libsql-blob-v1".to_string(),
+        encoding: store.encoding(),
+        dimensions: store.embedding_dim(),
+        bytes: bytes.into(),
+    })
 }
 
 pub(crate) async fn stats(store: &TenantStore) -> Result<StoreStats, Error> {
