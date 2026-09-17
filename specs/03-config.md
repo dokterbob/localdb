@@ -19,7 +19,8 @@ server:
     #   See 05-surfaces.md §3.1.
   # public_url: https://localdb.example.com   # optional; only set behind a TLS-terminating
   #   reverse proxy — used as the OAuth issuer/resource identifier in
-  #   the .well-known responses (05-surfaces.md §3.1)
+  #   the .well-known responses (05-surfaces.md §3.1). Must be an absolute HTTP(S) URL
+  #   without credentials, query, or fragment; optional path prefixes are allowed.
   job_workers: 1 # daemon job-queue workers; see §5
 
 paths: # all optional; platform defaults in §4

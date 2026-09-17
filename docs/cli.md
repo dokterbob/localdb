@@ -481,9 +481,12 @@ Options:
       --url <URL>  Daemon base URL (default: auto-detected running daemon)
 ```
 
-Calls `POST /revoke` on the daemon and removes the cached entry from `credentials.json` regardless
-of whether the revoke call succeeds (a daemon that's already gone shouldn't leave a stale local
-credential behind).
+Calls `POST /revoke` for the cached credentials and removes the entry only after successful
+revocation. A network or server failure returns an error and retains the cache so logout can be
+retried. Logout affects those credentials, not separate sessions on other clients.
+
+Credential mutations are serialized across CLI processes. Concurrent commands share one token
+refresh, and updates preserve credentials for other servers.
 
 ---
 
@@ -1382,8 +1385,8 @@ framework entirely, is reportable state, not an error.
 
 ```
 $ localdb db status
-schema version: 4 (this binary's head: 10, baseline: 4)
-6 pending migrations; run `localdb db migrate`
+schema version: 4 (this binary's head: 11, baseline: 4)
+7 pending migrations; run `localdb db migrate`
 history:
   v4 baseline  applied 2026-08-25T17:07:04Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
 ```
@@ -1399,8 +1402,8 @@ reported distinctly, never as "up to date":
 
 ```
 $ localdb db status
-schema version: 0 (this binary's head: 10, baseline: 4)
-store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v10
+schema version: 0 (this binary's head: 11, baseline: 4)
+store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v11
 ```
 
 `--json` sets `"uninitialized": true` for this case. `pending` stays `0` rather than reporting
@@ -1457,11 +1460,11 @@ lost — so it prompts first:
 ```
 $ localdb db migrate
 This store's schema (v2) predates the migration baseline (v4); migrating it erases ALL indexed data and rebuilds from scratch. Continue? [y/N] y
-rebuilt legacy store: v2 -> v10 (all indexed data erased)
+rebuilt legacy store: v2 -> v11 (all indexed data erased)
 hint: run `localdb index` to re-index stale content
 ```
 
-(the rebuild drops and recreates the schema directly at this binary's head version — v10 here — not
+(the rebuild drops and recreates the schema directly at this binary's head version — v11 here — not
 at the baseline; a legacy rebuild always marks derived data stale, so the re-index hint always
 follows it)
 
@@ -1494,11 +1497,12 @@ migrated forward. Requires confirmation for every _plausible_ downgrade (`--yes`
 non-interactive rule as `migrate`):
 
 ```
-$ localdb db downgrade --to 5
-This reverses the store's schema to version 5, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
+$ localdb db downgrade --to 8
+This reverses the store's schema to version 8, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
+downgraded migration v11 'add_pending_bootstrap' in 1ms
 downgraded migration v10 'add_access_requests_collected_at_column' in 3ms
 downgraded migration v9 'create_auth_tables' in 8ms
-downgraded: v10 -> v8 (2 steps)
+downgraded: v11 -> v8 (3 steps)
 ```
 
 An **impossible** target is checked and refused — exit `2`, store untouched — before that

@@ -80,19 +80,22 @@ admins) only see/search `shared`-visibility stores they hold an explicit grant f
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.1 for
 the D7 authorization model.
 
-**One-time setup code.** The first time `localdb serve` starts with auth enforced and zero users
-exist yet, it prints a one-time setup code to stderr:
+**Setup and recovery.** When authentication is enforced and no admin exists, or first-admin setup is
+incomplete, `localdb serve` prints a setup code:
 
 ```
-No users exist yet and authentication is enforced.
-One-time setup code (use it to create the first admin account; shown only once):
-
-    ldb_...
+One-time setup code: ldb_...
 ```
 
-Paste that code into the browser consent page `GET /authorize` renders (or run
-`localdb login --setup-code <code>`) to create the first admin account. The code is single-use and
-is rejected once any user exists.
+Paste it into the browser consent page (or use `localdb login --setup-code <code>`). Interrupted
+authorization can be retried with the same code and reuses the pending admin. The first
+authenticated protected request completes setup and disables the code. Restarting incomplete setup
+prints a replacement code; an established admin never reopens setup merely because credentials were
+lost. Existing `--direct-db` recovery remains available to operators.
+
+Closed-invite browser onboarding waits for approval, collects the credential, and resumes the
+original OAuth flow. It requires JavaScript; no CLI operation is needed by the invited user. OAuth
+and invite responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
 
 **Route table:**
 

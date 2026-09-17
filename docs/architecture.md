@@ -223,7 +223,11 @@ for the full decision matrix.
 
 **Bootstrap.** The first `localdb serve` with auth enforced and no admin yet prints a one-time setup
 code to stderr. Paste it into the browser consent page `/authorize` opens (or pass it via
-`localdb login --setup-code <code>`) to create the first admin account.
+`localdb login --setup-code <code>`) to create the first admin account. A singleton
+`pending_bootstrap` record keeps interrupted onboarding recoverable until an issued admin credential
+authenticates a protected request. Retrying reuses the same admin; restart rotates the in-memory
+setup code. Established accounts do not reopen setup. These operations live in the shared auth
+service, independent of terminal, browser, or future native UI presentation.
 
 **Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a blake3
 hash. Access tokens are short-lived (1h); refresh tokens (30d) rotate on every use with reuse
@@ -270,10 +274,10 @@ credential is minted.
 invite instead — no browser round trip) and caches the resulting bearer in `credentials.json` next
 to `config.yaml`
 ([specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §6);
-`localdb logout` revokes it and clears the cache. `localdb status` shows the caller's identity and
-cached token expiry once authenticated. The `LOCALDB_API_KEY` environment variable overrides the
-cached credential for a single invocation. Exit code `6` (new) is reserved for
-`unauthorized`/`forbidden`.
+`localdb logout` revokes it and clears the cache only after successful revocation; failures retain
+the cache for retry. `localdb status` shows the caller's identity and cached token expiry once
+authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached credential for a
+single invocation. Exit code `6` (new) is reserved for `unauthorized`/`forbidden`.
 
 **Behavior changes worth flagging to anyone tracking this branch:**
 
