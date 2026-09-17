@@ -46,9 +46,11 @@ async fn from_backend_derives_same_default_policy_version_as_new() {
     .unwrap();
     let db_path = dir.path().join("localdb.db");
     let config = StoreBackendConfig::local_path(db_path, dim, encoding);
-    let backend = Arc::new(SqliteBackend::open(config).await.unwrap()) as Arc<dyn StoreBackend>;
+    let backend = Arc::new(SqliteBackend::open(config).await.unwrap());
 
     let queue = JobQueue::new();
+    let auth_context =
+        crate::state::AuthContext::new(Arc::new(backend.auth_store()), crate::auth::AuthMode::Open);
     let state = AppState::from_backend(
         yaml_config.clone(),
         dir.path().to_path_buf(),
@@ -56,6 +58,7 @@ async fn from_backend_derives_same_default_policy_version_as_new() {
         backend,
         queue.clone(),
         UrlRefreshScheduler::new(queue),
+        auth_context,
     );
 
     state.add_store("notes", "private").await.unwrap();
@@ -85,7 +88,7 @@ async fn from_backend_shares_the_given_backend_handle() {
     .unwrap();
     let db_path = dir.path().join("localdb.db");
     let config = StoreBackendConfig::local_path(db_path, dim, encoding);
-    let backend = Arc::new(SqliteBackend::open(config).await.unwrap()) as Arc<dyn StoreBackend>;
+    let backend = Arc::new(SqliteBackend::open(config).await.unwrap());
 
     // Add a store directly via the caller's own handle, before the
     // `AppState` even exists.
@@ -99,6 +102,8 @@ async fn from_backend_shares_the_given_backend_handle() {
     backend.upsert_store(&row).await.unwrap();
 
     let queue = JobQueue::new();
+    let auth_context =
+        crate::state::AuthContext::new(Arc::new(backend.auth_store()), crate::auth::AuthMode::Open);
     let state = AppState::from_backend(
         yaml_config,
         dir.path().to_path_buf(),
@@ -106,6 +111,7 @@ async fn from_backend_shares_the_given_backend_handle() {
         backend,
         queue.clone(),
         UrlRefreshScheduler::new(queue),
+        auth_context,
     );
 
     let effective = state.effective_config().await.unwrap();

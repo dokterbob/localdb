@@ -225,7 +225,13 @@ async fn serve_upstream_with_backend(
     // `vec![]` disables rmcp's Host-header allowlist entirely — these tests
     // exercise proxy forwarding, not the allowlist itself, and connect
     // over a real loopback socket regardless.
-    let service = mcp::build_streamable_http_service(stores, backend, embedder, vec![]);
+    let service = mcp::build_streamable_http_service(
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(stores)),
+        backend,
+        embedder,
+        vec![],
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
     let app = Router::new().nest_service("/mcp", service);
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -782,7 +788,13 @@ async fn mcp_tool_set_identical_with_and_without_allow_write() {
         let backend: Arc<dyn localdb_core::StoreBackend> =
             Arc::new(mcp::tools::StoresBackend::new(&stores));
         let embedder: Arc<dyn localdb_core::Embedder> = Arc::new(FakeEmbedder::new(4));
-        let handler = mcp::McpHandler::new(stores, backend, embedder, allow_write);
+        let handler = mcp::McpHandler::new(
+            std::sync::Arc::new(mcp::StaticStoreProvider::new(stores)),
+            backend,
+            embedder,
+            allow_write,
+            Some(localdb_core::auth::Principal::local_trust()),
+        );
 
         let (server_transport, client_transport) = tokio::io::duplex(8192);
         tokio::spawn(async move {

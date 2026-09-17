@@ -26,7 +26,7 @@ use super::common::make_state;
 #[tokio::test]
 async fn get_or_build_fetchers_builds_once_across_repeated_calls() {
     let (_dir, state) = make_state().await;
-    let yaml = state.yaml_config().await;
+    let yaml = state.yaml_config().clone();
 
     let a = state.get_or_build_fetchers(&yaml).await.unwrap();
     let b = state.get_or_build_fetchers(&yaml).await.unwrap();
@@ -50,12 +50,11 @@ async fn get_or_build_fetchers_builds_once_across_repeated_calls() {
 #[tokio::test]
 async fn get_or_build_fetchers_rebuilds_on_http_config_change() {
     let (_dir, state) = make_state().await;
-    let old_yaml = state.yaml_config().await;
+    let old_yaml = state.yaml_config().clone();
     let first = state.get_or_build_fetchers(&old_yaml).await.unwrap();
 
     let mut new_yaml = old_yaml.clone();
     new_yaml.http.max_retries = old_yaml.http.max_retries + 1;
-    state.reload_yaml_config(new_yaml.clone()).await;
     let second = state.get_or_build_fetchers(&new_yaml).await.unwrap();
 
     assert!(

@@ -197,7 +197,7 @@ async fn get_status_degrades_source_listing_best_effort_for_one_broken_store() {
         fail_sources_for: Some(broken_id),
         touched,
     });
-    let yaml = real_state.yaml_config().await;
+    let yaml = real_state.yaml_config().clone();
     let queue = crate::job_queue::JobQueue::new();
     let wrapped_state = AppState::from_backend(
         yaml,
@@ -206,6 +206,7 @@ async fn get_status_degrades_source_listing_best_effort_for_one_broken_store() {
         wrapped,
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        real_state.auth_context(),
     );
     let app = build_router(wrapped_state);
 
@@ -285,7 +286,7 @@ async fn get_status_store_scoping_only_touches_and_reports_scoped_stores() {
         fail_sources_for: None,
         touched: touched.clone(),
     });
-    let yaml = real_state.yaml_config().await;
+    let yaml = real_state.yaml_config().clone();
     let queue = crate::job_queue::JobQueue::new();
     let wrapped_state = AppState::from_backend(
         yaml,
@@ -294,6 +295,7 @@ async fn get_status_store_scoping_only_touches_and_reports_scoped_stores() {
         wrapped,
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        real_state.auth_context(),
     );
     let app = build_router(wrapped_state);
 

@@ -22,14 +22,15 @@ async fn router_serves_status_endpoint() {
         dir.path().join("models"),
         queue.clone(),
         UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();
     // `vec![]` disables the Host check entirely (see `mcp_allowed_hosts`);
     // this test only drives `/v1/status` via `oneshot`, never `/mcp`.
     let app = build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );

@@ -38,7 +38,14 @@ impl IntoResponse for ApiError {
             code: self.0.code().to_string(),
             message: error_response_message(&self.0),
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
@@ -152,6 +159,8 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
 
+        CoreError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+        CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
         CoreError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

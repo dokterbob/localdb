@@ -4,6 +4,7 @@ use std::sync::Arc;
 use fetch::HttpUrlFetcher;
 use tokio::sync::RwLock;
 
+use crate::auth::{AuthMode, ServerAuthService};
 use localdb_core::{
     config::{
         policy::compute_policy_version,
@@ -15,7 +16,7 @@ use localdb_core::{
     Error, IndexJobScope, IndexJobStats, ProgressSink, SourceRow, Store, StoreBackend,
     StoreBackendConfig, StoreRow, StoreVisibility,
 };
-use store_libsql::SqliteBackend;
+use store_libsql::{LibsqlAuthStore, SqliteBackend};
 
 use crate::{job_exec, job_queue::JobQueue, scheduler::UrlRefreshScheduler};
 
@@ -72,8 +73,28 @@ type EmbedderCacheEntry = (
 /// that produced it. See `Inner::fetcher_cache` / `AppState::get_or_build_fetchers`.
 type FetcherCacheEntry = (HttpConfig, Arc<(HttpUrlFetcher, HttpUrlFetcher)>);
 
+#[derive(Clone)]
+pub struct AuthContext {
+    auth: Arc<ServerAuthService>,
+    auth_store: Arc<LibsqlAuthStore>,
+    mode: AuthMode,
+    setup_code_hash: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl AuthContext {
+    pub fn new(auth_store: Arc<LibsqlAuthStore>, mode: AuthMode) -> Self {
+        Self {
+            auth: Arc::new(ServerAuthService::new(auth_store.clone())),
+            auth_store,
+            mode,
+            setup_code_hash: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+}
+
 struct Inner {
-    yaml_config: RwLock<RawConfig>,
+    auth_context: AuthContext,
+    yaml_config: RawConfig,
     data_dir: PathBuf,
     models_dir: PathBuf,
     backend: Arc<dyn StoreBackend>,
@@ -81,41 +102,9 @@ struct Inner {
     default_policy_version: String,
     job_queue: JobQueue,
     url_scheduler: UrlRefreshScheduler,
-    /// Single-slot embedder cache, keyed by the `EmbeddingPolicy` plus the
-    /// full `providers` snapshot that together determined the cached
-    /// embedder's identity (Codex review finding F2, issue #187; provider
-    /// settings added for finding H1, issue #212 — a hosted provider's
-    /// `base_url`/`api_key_env` can change under an unchanged policy).
-    /// `http` (issue #207 adversarial review, finding 1) is in the key for
-    /// the same reason as `providers`: a hosted provider's client is built
-    /// from `http:` too (user agent, retry count), so an operator changing
-    /// `http.max_retries` via config reload with an otherwise-unchanged
-    /// policy/providers must still rebuild — without this, the stale cached
-    /// embedder would keep using the *old* `http:` settings indefinitely.
-    /// See `AppState::get_or_build_embedder`.
+    /// Shared embedder keyed by model policy, providers, and HTTP settings.
     embedder_cache: RwLock<Option<EmbedderCacheEntry>>,
-    /// Single-slot HTTP fetcher-pair cache, keyed by `HttpConfig` alone —
-    /// unlike `embedder_cache`, a fetcher pair's identity depends on nothing
-    /// but the outbound HTTP policy (issue #208 PR #227 review): with
-    /// `server.job_workers` > 1, each job used to build its own fresh
-    /// `HttpUrlFetcher::new_pair` (and so its own fresh `HostLimiter`),
-    /// which multiplied `http.rate_limit.requests_per_second` by however
-    /// many jobs for different stores happened to run concurrently against
-    /// the same destination host, and meant one job observing a
-    /// `Retry-After` cooldown never slowed the others — both violate issue
-    /// #207's "per destination host, process-wide" pacing contract. Mirrors
-    /// `embedder_cache`'s invalidation exactly: an unchanged `http:` block
-    /// hits the cache; a changed one (operator edits
-    /// `requests_per_second`/`burst`/`max_retries` and the daemon's
-    /// config-file watcher reloads it, `reload_yaml_config`) misses and
-    /// rebuilds on the next call — no explicit flush needed. Wrapped in an
-    /// `Arc` (unlike `embedder_cache`'s bare `Arc<dyn Embedder>`, which is
-    /// already reference-counted on its own) purely so
-    /// `AppState::get_or_build_fetchers` can hand back one cheap `Arc::clone`
-    /// per call and so tests can assert sharing via `Arc::ptr_eq` — the pair
-    /// itself (`HttpUrlFetcher`) is already `Clone` internally, so this
-    /// isn't needed for correctness, only for a cheap, directly-testable
-    /// identity check. See `AppState::get_or_build_fetchers`.
+    /// Shared HTTP fetchers keep per-host pacing and cooldowns process-wide.
     fetcher_cache: RwLock<Option<FetcherCacheEntry>>,
     /// Test-only construction counter for the `embed::create_embedder` call
     /// made by `get_or_build_embedder`, so tests can assert the embedder is
@@ -145,6 +134,7 @@ impl AppState {
         models_dir: PathBuf,
         job_queue: JobQueue,
         url_scheduler: UrlRefreshScheduler,
+        auth_mode: AuthMode,
     ) -> Result<Self, Error> {
         let embedding_policy = &yaml_config.defaults.indexing.embedding;
         let providers = &yaml_config.providers;
@@ -156,7 +146,9 @@ impl AppState {
             })?;
         let db_path = data_dir.join("localdb.db");
         let config = StoreBackendConfig::local_path(db_path, dim, encoding);
-        let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
+        let backend = Arc::new(SqliteBackend::open(config).await?);
+        let auth_store = Arc::new(backend.auth_store());
+        let auth_context = AuthContext::new(auth_store, auth_mode);
 
         Ok(Self::from_backend(
             yaml_config,
@@ -165,6 +157,7 @@ impl AppState {
             backend,
             job_queue,
             url_scheduler,
+            auth_context,
         ))
     }
 
@@ -199,13 +192,15 @@ impl AppState {
         backend: Arc<dyn StoreBackend>,
         job_queue: JobQueue,
         url_scheduler: UrlRefreshScheduler,
+        auth_context: AuthContext,
     ) -> Self {
         let default_indexing_policy = yaml_config.defaults.indexing.clone();
         let default_policy_version = compute_policy_version(&default_indexing_policy);
 
         Self {
             inner: Arc::new(Inner {
-                yaml_config: RwLock::new(yaml_config),
+                yaml_config,
+                auth_context,
                 data_dir,
                 models_dir,
                 backend,
@@ -268,15 +263,61 @@ impl AppState {
         Ok(EffectiveConfig { stores })
     }
 
-    /// Get the current YAML config snapshot.
-    pub async fn yaml_config(&self) -> RawConfig {
-        self.inner.yaml_config.read().await.clone()
+    /// The YAML config as loaded at startup. There is no hot-reload
+    /// (specs/03-config.md §5): this reflects startup state for the process
+    /// lifetime.
+    pub fn yaml_config(&self) -> &RawConfig {
+        &self.inner.yaml_config
     }
 
-    /// Reload the YAML config snapshot (called by the file watcher).
-    pub async fn reload_yaml_config(&self, new_config: RawConfig) {
-        let mut yaml = self.inner.yaml_config.write().await;
-        *yaml = new_config;
+    /// The configured `server.public_url`, if any (specs/03-config.md §1) —
+    /// the OAuth discovery base-URL resolution's preferred source
+    /// (`server::auth::base_url::resolve_base_url`, T7).
+    pub fn public_url(&self) -> Option<&str> {
+        self.inner.yaml_config.server.public_url.as_deref()
+    }
+
+    /// The auth policy service, backed by the same persistent unified
+    /// database as `backend()`.
+    pub fn auth(&self) -> &Arc<ServerAuthService> {
+        &self.inner.auth_context.auth
+    }
+
+    /// The raw `AuthStore` behind `auth()` (setup-code bootstrap, tests).
+    pub fn auth_store(&self) -> &Arc<LibsqlAuthStore> {
+        &self.inner.auth_context.auth_store
+    }
+
+    /// The auth enforcement mode resolved at startup.
+    pub fn auth_mode(&self) -> AuthMode {
+        self.inner.auth_context.mode
+    }
+
+    /// Record the blake3 hash of the one-time setup code (D3b). Called once
+    /// at startup by `auth::generate_setup_code_if_needed`.
+    pub fn set_setup_code_hash(&self, hash: String) {
+        *self
+            .inner
+            .auth_context
+            .setup_code_hash
+            .write()
+            .expect("setup_code_hash lock poisoned") = Some(hash);
+    }
+
+    /// The held setup-code hash, if a code was generated at startup. This is
+    /// the T4 seam: `/authorize` verifies a presented code against this hash
+    /// to bootstrap the first admin user.
+    pub fn setup_code_hash(&self) -> Option<String> {
+        self.inner
+            .auth_context
+            .setup_code_hash
+            .read()
+            .expect("setup_code_hash lock poisoned")
+            .clone()
+    }
+
+    pub fn auth_context(&self) -> AuthContext {
+        self.inner.auth_context.clone()
     }
 
     /// Get the embedder for `yaml`'s embedding policy, building it only when
@@ -299,11 +340,7 @@ impl AppState {
     /// misses and rebuilds. Comparing the whole `Vec`/`HttpConfig` rather
     /// than isolating "the provider this policy resolves to" is deliberate —
     /// simpler, and an unrelated provider/http edit costing one extra
-    /// rebuild is an acceptable trade. A config reload (`reload_yaml_config`)
-    /// needs no explicit cache flush — the caller always passes the freshly
-    /// reloaded `yaml`, so a changed policy, providers list, or http block
-    /// simply fails the equality check below on the next call and rebuilds
-    /// naturally.
+    /// rebuild is an acceptable trade. The daemon passes its startup configuration.
     pub async fn get_or_build_embedder(
         &self,
         yaml: &RawConfig,
@@ -379,7 +416,7 @@ impl AppState {
     /// Same double-checked-locking shape as [`Self::get_or_build_embedder`]
     /// immediately above, for the same reason: with `server.job_workers` > 1
     /// two cross-store jobs can race to build the cache on a cold start (or
-    /// after an `http:` config reload), and one simply waits behind the
+    /// with different HTTP settings), and one simply waits behind the
     /// write lock — correctness is unchanged, the only cost is transient
     /// latency for whichever job waits. Returns the cache's own `Arc` (not
     /// an unwrapped tuple) so a caller building many jobs in sequence only
@@ -454,21 +491,21 @@ impl AppState {
         refetch: bool,
         progress: ProgressSink,
     ) -> Result<IndexJobStats, Error> {
-        let yaml = self.yaml_config().await;
+        let yaml = self.yaml_config();
         let sources = job_exec::resolve_job_sources(self.backend(), &store_row.id, &scope).await?;
         let embedder = if sources.is_empty() {
             None
         } else {
-            Some(self.get_or_build_embedder(&yaml).await?)
+            Some(self.get_or_build_embedder(yaml).await?)
         };
         let fetchers = if sources.is_empty() {
             None
         } else {
-            Some((*self.get_or_build_fetchers(&yaml).await?).clone())
+            Some((*self.get_or_build_fetchers(yaml).await?).clone())
         };
         let deps = job_exec::JobExecDeps {
             backend: self.backend(),
-            yaml: &yaml,
+            yaml,
             models_dir: self.models_dir(),
             embedder,
             fetchers,
@@ -530,7 +567,6 @@ impl AppState {
                     model: "default".to_string(),
                 },
             },
-            acl: vec![],
         })
     }
 

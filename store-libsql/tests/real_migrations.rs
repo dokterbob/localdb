@@ -725,14 +725,17 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
         .unwrap();
 
     assert_eq!(report.from_version, BASELINE_VERSION);
-    assert_eq!(report.to_version, BASELINE_VERSION + 4);
+    assert_eq!(report.to_version, chain::head_version_current());
     assert_eq!(
         report.applied.iter().map(|s| s.version).collect::<Vec<_>>(),
         vec![
             BASELINE_VERSION + 1,
             BASELINE_VERSION + 2,
             BASELINE_VERSION + 3,
-            BASELINE_VERSION + 4
+            BASELINE_VERSION + 4,
+            BASELINE_VERSION + 5,
+            BASELINE_VERSION + 6,
+            BASELINE_VERSION + 7
         ],
         "a v4 store steps through the whole compiled chain, not just v5"
     );
@@ -745,7 +748,7 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
     );
 
     let (_db, conn) = open_conn(&path).await;
-    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 4);
+    assert_eq!(user_version(&conn).await, chain::head_version_current());
     assert!(!column_exists(&conn, "chunks", "block_id").await);
     assert!(!index_exists(&conn, "idx_chunks_store_resource").await);
     assert!(index_exists(&conn, "idx_chunks_store_resource_pos").await);
@@ -793,7 +796,7 @@ async fn migrate_store_on_real_chain_backfills_index_updated_at_from_added_at() 
     let report = store_libsql::migrate_store(&path, &ctx(), false)
         .await
         .unwrap();
-    assert_eq!(report.to_version, BASELINE_VERSION + 4);
+    assert_eq!(report.to_version, chain::head_version_current());
 
     let (_db, conn) = open_conn(&path).await;
     assert!(column_exists(&conn, "resources", "index_updated_at").await);
@@ -893,7 +896,7 @@ async fn migrate_v7_relaxes_modified_at_not_null() {
     let report = store_libsql::migrate_store(&path, &ctx(), false)
         .await
         .unwrap();
-    assert_eq!(report.to_version, BASELINE_VERSION + 4);
+    assert_eq!(report.to_version, chain::head_version_current());
 
     let (_db, conn) = open_conn(&path).await;
 
@@ -1000,7 +1003,7 @@ async fn migrate_store_on_real_chain_adds_conditional_get_validator_columns() {
     let report = store_libsql::migrate_store(&path, &ctx(), false)
         .await
         .unwrap();
-    assert_eq!(report.to_version, BASELINE_VERSION + 4);
+    assert_eq!(report.to_version, chain::head_version_current());
 
     let (_db, conn) = open_conn(&path).await;
 
@@ -1151,4 +1154,102 @@ async fn downgrade_real_chain_from_head_to_v7_drops_conditional_get_validator_co
     assert_eq!(row.get::<String>(0).unwrap(), "path");
     assert_eq!(row.get::<String>(1).unwrap(), "/test/path1");
     assert_eq!(row.get::<String>(2).unwrap(), "2024-01-01T00:00:00Z");
+}
+
+#[tokio::test]
+async fn auth_migrations_round_trip_preserves_populated_v8_database() {
+    let (_dir, path) = temp_db_path();
+    let before;
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+        apply_pending(&conn, &chain::migrations()[..4], &ctx())
+            .await
+            .unwrap();
+        before = normalized_master_rows(&conn).await;
+    }
+    for _ in 0..2 {
+        let report = store_libsql::migrate_store(&path, &ctx(), false)
+            .await
+            .unwrap();
+        assert_eq!(report.from_version, 8);
+        assert_eq!(report.to_version, 11);
+        assert!(!report.staleness_marked);
+        {
+            let (_db, conn) = open_conn(&path).await;
+            for table in [
+                "users",
+                "auth_tokens",
+                "oauth_clients",
+                "auth_codes",
+                "store_grants",
+                "invites",
+                "access_requests",
+            ] {
+                assert!(table_exists(&conn, table).await);
+            }
+            assert!(column_exists(&conn, "access_requests", "collected_at").await);
+            assert_eq!(row_count(&conn, "oauth_clients").await, 1);
+            let mut rows = conn
+                .query("SELECT id FROM oauth_clients", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<String>(0)
+                    .unwrap(),
+                "localdb-cli"
+            );
+            assert_eq!(row_count(&conn, "chunks").await, 4);
+        }
+        store_libsql::downgrade_store(&path, Some(8)).await.unwrap();
+        let (_db, conn) = open_conn(&path).await;
+        assert_eq!(normalized_master_rows(&conn).await, before);
+        assert_eq!(row_count(&conn, "resources").await, 2);
+        assert_eq!(row_count(&conn, "chunks").await, 4);
+    }
+}
+
+#[tokio::test]
+async fn pending_bootstrap_migration_round_trip_preserves_users_tokens_and_content() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+        apply_pending(&conn, &chain::migrations()[..6], &ctx())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO users VALUES ('admin', 'admin', 'admin', '2026-01-01T00:00:00Z')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO auth_tokens (id,user_id,kind,secret_hash,created_at) VALUES ('key','admin','api_key','hash','2026-01-01T00:00:00Z')", ()).await.unwrap();
+    }
+    for _ in 0..2 {
+        let report = store_libsql::migrate_store(&path, &ctx(), false)
+            .await
+            .unwrap();
+        assert_eq!((report.from_version, report.to_version), (10, 11));
+        {
+            let (_db, conn) = open_conn(&path).await;
+            conn.execute("INSERT INTO pending_bootstrap VALUES (1,'admin')", ())
+                .await
+                .unwrap();
+        }
+        store_libsql::downgrade_store(&path, Some(10))
+            .await
+            .unwrap();
+        let (_db, conn) = open_conn(&path).await;
+        assert!(!table_exists(&conn, "pending_bootstrap").await);
+        assert_eq!(row_count(&conn, "users").await, 1);
+        assert_eq!(row_count(&conn, "auth_tokens").await, 1);
+        assert_eq!(row_count(&conn, "chunks").await, 4);
+    }
 }

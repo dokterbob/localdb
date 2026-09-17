@@ -227,7 +227,34 @@ $ localdb status --json
 
 (path shown from a scratch run; `document_count`/`chunk_count` appear per store, and the `database`
 block reports on-disk size and a breakdown of the largest tables — useful for deciding whether
-`localdb db vacuum` is worth running.)
+`localdb db vacuum` is worth running.) **Identity line:** when connected to a daemon with auth
+enforced and a cached credential resolves (`LOCALDB_API_KEY`, or a `credentials.json` entry for that
+daemon's base URL), `status` also shows the caller's identity and the cached access token's expiry.
+This is best-effort — no cached credential, an unreachable daemon, or a rejected token all degrade
+silently to no identity line rather than failing `status` itself:
+
+```
+$ localdb status
+daemon: running (http://100.x.y.z:7700)
+identity: alice (admin)
+token expires: 2026-07-08T13:00:00Z
+stores (2):
+  notes [libsql] (runtime)
+  shared-docs [libsql] (runtime)
+```
+
+```
+$ localdb status --json
+{
+  "daemon": "running (http://100.x.y.z:7700)",
+  "identity": {
+    "name": "alice",
+    "role": "admin",
+    "access_expires_at": "2026-07-08T13:00:00Z"
+  },
+  "stores": [...]
+}
+```
 
 ---
 
@@ -355,6 +382,289 @@ exit: 3
 **Not store-scoped:** the store is named by the `<NAME>` argument, so passing `--store` exits `2`
 rather than being silently ignored. This is checked before the confirmation prompt, so a misused
 flag never gets as far as asking you to confirm a deletion.
+
+### `localdb store grant`
+
+```
+Grant a user read access to a `shared` store (D7)
+
+Usage: localdb store grant <STORE> <USER>
+
+Arguments:
+  <STORE>  Store name
+  <USER>   User name or ID
+```
+
+Grants `<USER>` read access to `<STORE>`, which must be `shared`-visibility — `private` stores are
+admin-only and rejected with `forbidden` (exit `6`). Routed to a running daemon (admin bearer
+required) when one is reachable; falls back to a direct database write otherwise, same pattern as
+`store add`/`remove`.
+
+```
+$ localdb store grant shared-docs alice
+Granted alice read access to 'shared-docs'
+```
+
+### `localdb store revoke`
+
+```
+Revoke a user's read access to a store
+
+Usage: localdb store revoke <STORE> <USER>
+
+Arguments:
+  <STORE>  Store name
+  <USER>   User name or ID
+```
+
+```
+$ localdb store revoke shared-docs alice
+Revoked alice's access to 'shared-docs'
+```
+
+---
+
+## `localdb login`
+
+Authenticate against a daemon and cache the resulting credential.
+
+```
+Authenticate against a daemon via OAuth2 (authorization code + PKCE) and cache the resulting
+token in credentials.json
+
+Usage: localdb login [OPTIONS]
+
+Options:
+      --url <URL>              Daemon base URL (default: auto-detected running daemon)
+      --setup-code <SETUP_CODE>
+                                Pre-fill the consent form's one-time setup code (bootstrap);
+                                the form still requires an explicit submit
+      --no-browser              Don't try to open a browser; print the URL and read a pasted
+                                 code from stdin instead
+      --invite <INVITE>         Redeem an invite token instead of an interactive login
+      --name <NAME>             The requested user name for --invite (default: the OS login
+                                 name)
+```
+
+Without `--invite`, drives the browser OAuth2 authorization-code + PKCE flow: opens a browser at the
+daemon's `/authorize` consent page, receives the resulting code on a local loopback listener, and
+exchanges it for an access + refresh token pair at `/token`, caching both in `credentials.json`.
+`--no-browser` skips opening a browser and instead prints a URL to visit and reads the resulting
+code back from stdin (useful over SSH/headless).
+
+With `--invite <token>` (T6): redeems the invite directly against `POST /v1/invites/redeem` — no
+browser round trip. `open`-mode invites persist the redeemed API key immediately; `closed`-mode
+invites print a "waiting for admin approval" message and poll until an admin approves (credential
+persisted) or denies (non-zero exit).
+
+```
+$ localdb login
+Opening browser to http://127.0.0.1:7700/authorize?...
+Waiting for authorization...
+Logged in as alice (admin)
+```
+
+```
+$ localdb login --invite ldb_abc123 --name bob
+Redeeming invite...
+Logged in as bob (member)
+```
+
+## `localdb logout`
+
+```
+Revoke the cached token for a daemon and clear it from credentials.json
+
+Usage: localdb logout [OPTIONS]
+
+Options:
+      --url <URL>  Daemon base URL (default: auto-detected running daemon)
+```
+
+Calls `POST /revoke` for the cached credentials and removes the entry only after successful
+revocation. A network or server failure returns an error and retains the cache so logout can be
+retried. Logout affects those credentials, not separate sessions on other clients.
+
+Credential mutations are serialized across CLI processes. Concurrent commands share one token
+refresh, and updates preserve credentials for other servers.
+
+---
+
+## `localdb user`
+
+Manage user accounts (admin only). Every subcommand routes to a running daemon (admin bearer) by
+default and falls back to a direct database read/write when no daemon is reachable — the recovery
+path when the daemon is unreachable or auth is locked out.
+
+```
+Manage user accounts
+
+Usage: localdb user <COMMAND>
+
+Commands:
+  add       Create a user account
+  list      List all user accounts
+  remove    Remove a user account
+  set-role  Change a user's role
+```
+
+### `localdb user add`
+
+```
+Usage: localdb user add [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  User name (unique)
+
+Options:
+      --admin       Create the user with the admin role (default: member)
+      --direct-db   Write directly to the database even if a daemon is running
+                    (lockout recovery)
+```
+
+`--direct-db` is the deliberate break-glass escape hatch: it forces the direct-DB write even while a
+daemon is running, for the lockout-recovery case where the daemon's own auth is broken or every
+admin credential has been lost. It warns rather than refuses (non-JSON mode) — SQLite WAL +
+busy-timeout already make concurrent access with a live daemon safe.
+
+```
+$ localdb user add alice --admin
+Created user alice (admin)
+```
+
+### `localdb user list` / `localdb user remove` / `localdb user set-role`
+
+```
+$ localdb user list
+alice (admin)
+bob (member)
+
+$ localdb user remove bob
+Removed user bob
+
+$ localdb user set-role bob admin
+Set bob's role to admin
+```
+
+Deleting or demoting the **last remaining admin** is rejected (`invalid_request`, exit `2`) — this
+guard rail checks the resulting state generically, not just self-targeted calls.
+
+---
+
+## `localdb key`
+
+Manage API keys (`auth_tokens` rows with `kind='api_key'`) for the caller or, as admin, another
+user. Routed to a running daemon by default (admin bearer, unless minting your own key); falls back
+to a direct database read/write when no daemon is reachable.
+
+```
+Manage API keys
+
+Usage: localdb key <COMMAND>
+
+Commands:
+  create  Mint an API key for a user
+  list    List API keys (metadata only — never secrets)
+  revoke  Revoke an API key by its ID
+```
+
+### `localdb key create`
+
+```
+Usage: localdb key create [OPTIONS] --user <USER>
+
+Options:
+      --user <USER>   The user name to mint the key for
+      --direct-db     Write directly to the database even if a daemon is running
+                      (lockout recovery)
+```
+
+The secret is shown **exactly once** — copy it immediately, it cannot be retrieved again. Minting a
+key for yourself is always allowed without admin; minting one for another user requires admin.
+
+```
+$ localdb key create --user alice
+Created API key for alice: ldb_...
+(This secret is shown once. Store it securely.)
+```
+
+### `localdb key list` / `localdb key revoke`
+
+```
+$ localdb key list --user alice
+01K... alice created:2026-07-01T12:00:00Z last_used:2026-07-08T09:00:00Z
+
+$ localdb key revoke 01K...
+Revoked key 01K...
+```
+
+---
+
+## `localdb invite`
+
+Manage invites and pending access requests (admin only, T6) — lets a new user join without an admin
+creating their account directly.
+
+```
+Manage invites and pending access requests
+
+Usage: localdb invite <COMMAND>
+
+Commands:
+  create    Create an invite
+  list      List all invites (no secrets)
+  revoke    Revoke an invite by ID
+  requests  List pending (and decided) access requests
+  approve   Approve a pending access request, creating its user
+  deny      Deny a pending access request
+```
+
+### `localdb invite create`
+
+```
+Usage: localdb invite create [OPTIONS]
+
+Options:
+      --mode <MODE>          "open" (redeem creates the user immediately) or "closed" (redeem
+                              files a pending access request for admin approval) [default: open]
+      --store <STORES>       Store(s) to grant the resulting user read access to (repeatable;
+                              must be `shared` stores)
+      --expires <EXPIRES>    Expiry as a human-readable duration (e.g. "7d", "24h", "30m");
+                              omit for no expiry
+      --max-uses <MAX_USES>  How many times this invite may be redeemed [default: 1]
+```
+
+Prints a show-once plaintext token plus a ready-made consent URL (`{base}/authorize?invite=<token>`)
+a human can open directly in a browser.
+
+```
+$ localdb invite create --mode open --store shared-docs --expires 7d
+Invite created: ldb_...
+Consent URL: http://127.0.0.1:7700/authorize?invite=ldb_...
+```
+
+### `localdb invite list` / `revoke` / `requests` / `approve` / `deny`
+
+```
+$ localdb invite list
+01K... open shared-docs max_uses=1 uses=0 expires=2026-07-15T12:00:00Z
+
+$ localdb invite revoke 01K...
+Revoked invite 01K...
+
+$ localdb invite requests
+01K... requester=carol state=pending
+
+$ localdb invite approve 01K...
+Approved; user carol created
+
+$ localdb invite deny 01K...
+Denied request 01K...
+```
+
+`closed`-mode invites file a pending `AccessRequest` on redemption instead of creating a user
+immediately; `approve` creates the user (no credential minted yet — the requester's own next
+`localdb login --invite` poll collects it), `deny` marks it denied.
 
 ---
 
@@ -1075,21 +1385,16 @@ framework entirely, is reportable state, not an error.
 
 ```
 $ localdb db status
-schema version: 6 (this binary's head: 6, baseline: 4)
-up to date
+schema version: 4 (this binary's head: 11, baseline: 4)
+7 pending migrations; run `localdb db migrate`
 history:
   v4 baseline  applied 2026-08-25T17:07:04Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
-  v5 drop_chunks_block_id_and_retag_resource_metadata  applied 2026-08-25T17:07:04Z  (not downgradable: chunks.block_id cannot be reconstructed; re-index required after downgrade)
-  v6 shrink_vector_index  applied 2026-08-25T17:07:04Z  (downgradable)
 ```
 
-(from a scratch run — all three migrations were applied at store-creation time, since a freshly
-created store is built directly at head rather than replayed step by step)
-
-With pending migrations the second line becomes ``2 pending migrations; run `localdb db migrate` ``.
-`--json` emits `current_version`, `head_version`, `baseline_version`, `pending`, `legacy`,
-`too_new`, `uninitialized`, `table_present`, and a `migrations` history array (per row: `version`,
-`name`, `applied_at`, `downgradable`, `down_unsupported_reason`).
+When there's nothing pending the second line reads `up to date` instead. `--json` emits
+`current_version`, `head_version`, `baseline_version`, `pending`, `legacy`, `too_new`,
+`uninitialized`, `table_present`, and a `migrations` history array (per row: `version`, `name`,
+`applied_at`, `downgradable`, `down_unsupported_reason`).
 
 An existing-but-uninitialized store — a store file that opens fine but has no schema at all yet
 (`PRAGMA user_version` is `0`; a zero-byte file the user pointed at is the common case) — is
@@ -1097,8 +1402,8 @@ reported distinctly, never as "up to date":
 
 ```
 $ localdb db status
-schema version: 0 (this binary's head: 6, baseline: 4)
-store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v6
+schema version: 0 (this binary's head: 11, baseline: 4)
+store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v11
 ```
 
 `--json` sets `"uninitialized": true` for this case. `pending` stays `0` rather than reporting
@@ -1155,11 +1460,11 @@ lost — so it prompts first:
 ```
 $ localdb db migrate
 This store's schema (v2) predates the migration baseline (v4); migrating it erases ALL indexed data and rebuilds from scratch. Continue? [y/N] y
-rebuilt legacy store: v2 -> v6 (all indexed data erased)
+rebuilt legacy store: v2 -> v11 (all indexed data erased)
 hint: run `localdb index` to re-index stale content
 ```
 
-(the rebuild drops and recreates the schema directly at this binary's head version — v6 here — not
+(the rebuild drops and recreates the schema directly at this binary's head version — v11 here — not
 at the baseline; a legacy rebuild always marks derived data stale, so the re-index hint always
 follows it)
 
@@ -1192,10 +1497,12 @@ migrated forward. Requires confirmation for every _plausible_ downgrade (`--yes`
 non-interactive rule as `migrate`):
 
 ```
-$ localdb db downgrade --to 5
-This reverses the store's schema to version 5, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
-downgraded migration v6 'shrink_vector_index' in 1ms
-downgraded: v6 -> v5 (1 step)
+$ localdb db downgrade --to 8
+This reverses the store's schema to version 8, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
+downgraded migration v11 'add_pending_bootstrap' in 1ms
+downgraded migration v10 'add_access_requests_collected_at_column' in 3ms
+downgraded migration v9 'create_auth_tables' in 8ms
+downgraded: v11 -> v8 (3 steps)
 ```
 
 An **impossible** target is checked and refused — exit `2`, store untouched — before that
@@ -1642,3 +1949,6 @@ Bad config files exit `2` with a path-precise message. Common cases:
 | Source missing required field | `invalid config: stores[0].sources[0].root: required for kind 'path'`                                                               |
 | Config file not found         | `invalid config: cannot read config file '/path/to/config.yaml': No such file or directory`                                         |
 | Not valid YAML                | `invalid config: invalid type: map, expected field identifier at line 1 column 2`                                                   |
+
+Authentication errors: `unauthorized` maps to HTTP 401, `forbidden` to HTTP 403; both use CLI exit
+code 6.

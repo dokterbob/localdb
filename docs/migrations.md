@@ -65,8 +65,8 @@ Read-only, never refuses — reports state even for a too-new or legacy store:
 
 ```
 $ localdb db status
-schema version: 4 (this binary's head: 6, baseline: 4)
-2 pending migrations; run `localdb db migrate`
+schema version: 4 (this binary's head: 11, baseline: 4)
+7 pending migrations; run `localdb db migrate`
 history:
   v4 baseline  applied 2026-01-01T00:00:00Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
 ```
@@ -82,11 +82,11 @@ Before applying anything, `db migrate` re-verifies the store's _existing_ `schem
 already-applied prefix) and refuses, untouched, if that history is drifted or incomplete — a store
 with corrupted bookkeeping never gets new migrations layered on top of it. Only once that passes
 does it apply every pending migration in order, one transaction per step, with per-step progress on
-stderr (`applied migration v5 'create_auth_tables' in 12ms`). If already at head:
+stderr (`applied migration v9 'create_auth_tables' in 12ms`). If already at head:
 
 ```
 $ localdb db migrate
-already at head (v6)
+already at head (v11)
 ```
 
 If the store is a **legacy** (pre-baseline, v1–v3) store, migrating it means an unconditional
@@ -119,21 +119,21 @@ reasonable default for a program calling the library directly, but not what the 
 requires confirmation:
 
 ```
-$ localdb db downgrade --to 5
-This reverses the store's schema to version 5, replaying stored down-SQL and discarding any data
+$ localdb db downgrade --to 8
+This reverses the store's schema to version 8, replaying stored down-SQL and discarding any data
 or structure introduced by later migrations. Continue? [y/N]
 ```
 
 ```
-$ localdb db downgrade --to 5
-downgraded: v6 -> v5 (1 step)
+$ localdb db downgrade --to 8
+downgraded: v11 -> v8 (3 steps)
 ```
 
 If a migration on the path to `--to` has `down_unsupported_reason` set, the whole downgrade is
 refused up front — before touching anything — naming the blocking migration and suggesting the
-nearest reachable target. For example, on the current real chain (baseline v4, irreversible v5, head
-v6 — see the [CLI reference](cli.md#localdb-db-status) for the full listing), trying to downgrade
-past v5 (`drop_chunks_block_id_and_retag_resource_metadata`, which is `Down::Unsupported`) to v4:
+nearest reachable target. For example, on a database at v6 (see the
+[CLI reference](cli.md#localdb-db-status) for the full listing), trying to downgrade past v5
+(`drop_chunks_block_id_and_retag_resource_metadata`, which is `Down::Unsupported`) to v4:
 
 ```
 $ localdb db downgrade --to 4
@@ -273,6 +273,16 @@ message, so write it for the person hitting that refusal, not for yourself. Down
 `Unsupported` step is refused cleanly (pre-scanned before anything runs), naming the migration and
 suggesting the nearest reachable `--to` target.
 
+### `ALTER TABLE ... ADD COLUMN` and the drift guard
+
+SQLite's `ALTER TABLE ... ADD COLUMN` splices the new column definition verbatim immediately before
+the original `CREATE TABLE` statement's closing `)`; it does not reformat the stored SQL. Because
+the drift guard byte-compares `sqlite_master` between a fresh `create_schema` and baseline+chain,
+the `create_schema` literal for a table touched by an `ADD COLUMN` migration must reproduce that
+exact splice rather than the naturally-formatted DDL a human would write. See `schema.rs`'s
+`access_requests` literal, which ends `decided_at TEXT\n        , collected_at TEXT)` for precisely
+this reason.
+
 ### `needs_reindex`
 
 Set `true` when applying the migration invalidates already-derived data (chunks, embeddings) in a
@@ -344,3 +354,16 @@ A migration touching the `chunks_vec_idx` DiskANN vector index should start its 
 partial ANN-index construction on transaction rollback is unverified (see the comment in
 `runner.rs`'s `apply_pending`) — an explicit drop-first keeps a retried migration safe regardless of
 that answer.
+
+### Authentication schema
+
+Main’s v5–v8 migrations retain their version numbers and SQL. Authentication adds v9
+(`create_auth_tables`) and v10 (the invite credential collection marker). A populated v8 database
+upgrades without reindexing. Downgrading v10 to v8 removes all auth data while preserving indexed
+content. Databases created by earlier unpublished versions of the authentication branch are not
+supported; recreate those development databases.
+
+Auth migration v11 (`add_pending_bootstrap`) adds the first-admin recovery marker without
+reindexing. Downgrading v11 to v10 removes only that marker, preserving users, credentials, grants,
+invites, and indexed content. Finish pending setup before downgrading; v10 cannot resume an
+interrupted v11 bootstrap automatically.

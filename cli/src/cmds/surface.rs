@@ -7,7 +7,7 @@ use crate::{
         reject_store_flag, resolve_store_scope, StoreScopePolicy, SERVE_REJECT_MESSAGE,
     },
     daemon_client::{probe_daemon, CliContext, DaemonState},
-    normalize::{exit_err, print_json, visibility_to_string},
+    normalize::{exit_err, print_json},
 };
 
 /// `localdb serve` — start the HTTP daemon (specs/05-surfaces.md §3).
@@ -89,7 +89,7 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     use mcp::{
         proxy::{ProxyConnectError, ProxyHandler},
-        AvailableStore, McpHandler, StoreDescriptor,
+        McpHandler,
     };
 
     // specs/05-surfaces.md §4: v1 registers no mutating tool on any
@@ -152,7 +152,8 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
             }
         }
 
-        let handler = match ProxyHandler::connect(&base_url, &ctx.stores).await {
+        let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, &base_url).await;
+        let handler = match ProxyHandler::connect_with_auth(&base_url, &ctx.stores, bearer).await {
             Ok(handler) => handler,
             Err(ProxyConnectError::StoreNotFound(name)) => {
                 exit_err(&Error::StoreNotFound { id: name }, ctx.json);
@@ -196,7 +197,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     // must still *start* — an MCP server that exits non-zero at startup reads
     // to its client as broken, not as empty.
     let db = open_app_db_or_exit(ctx, &config_loader).await;
-    let scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
+    let _scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
 
     let embed_policy = &config_loader.config.defaults.indexing.embedding;
     let models_dir = config_loader.paths.models_dir.clone();
@@ -210,25 +211,17 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         Err(e) => exit_err(&Error::from(e), ctx.json),
     };
 
-    let mut available: Vec<AvailableStore> = Vec::new();
-    for store_row in &scoped_stores {
-        let descriptor = StoreDescriptor {
-            id: store_row.id.clone(),
-            name: store_row.name.clone(),
-            visibility: visibility_to_string(&store_row.visibility).to_string(),
-        };
-        let handle = match db.backend().retrieval_store(&store_row.id).await {
-            Ok(handle) => handle,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        available.push(AvailableStore::from_arc(descriptor, handle));
-    }
-
+    let db = std::sync::Arc::new(db);
+    let provider = std::sync::Arc::new(crate::app_db::AppDbStoreProvider::new(
+        db.clone(),
+        ctx.stores.clone(),
+    ));
     let handler = McpHandler::new(
-        available,
+        provider,
         db.backend_arc(),
         std::sync::Arc::from(embedder),
         allow_write,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
 
     if let Err(e) = mcp::serve_embedded_stdio(handler).await {

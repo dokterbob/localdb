@@ -1,3 +1,4 @@
+use crate::daemon_client::{probe_daemon, DaemonState};
 use localdb_core::{config::loader::ConfigLoader, Error};
 use serde_json::json;
 
@@ -41,10 +42,10 @@ impl DaemonAwareCommand for StoreAddCmd<'_> {
     // placeholder as any.
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
 
-    async fn run_daemon(&self, _ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
         let url = format!("{base_url}/v1/stores");
         let body = json!({ "name": self.name, "visibility": "private", "backend": "libsql" });
-        let v = daemon_request_async(reqwest::Method::POST, &url, Some(body)).await?;
+        let v = daemon_request_async(ctx, reqwest::Method::POST, &url, Some(body)).await?;
         let name = v
             .get("name")
             .and_then(|n| n.as_str())
@@ -149,7 +150,7 @@ impl DaemonAwareCommand for StoreListCmd {
             validate_store_name(name)?;
         }
         let mut all: Vec<StoreListEntry> = Vec::new();
-        walk_daemon_pages(base_url, "/v1/stores", |items| {
+        walk_daemon_pages(ctx, base_url, "/v1/stores", |items| {
             for item in items {
                 all.push(StoreListEntry {
                     name: item
@@ -247,13 +248,13 @@ impl DaemonAwareCommand for StoreRemoveCmd<'_> {
     // variant here is ever consulted.
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
 
-    async fn run_daemon(&self, _ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
         // `name` is percent-encoded before it's interpolated into the URL
         // path segment — see `daemon_client::encode_path_segment`'s doc
         // comment (finding 1): an unescaped '#'/'?'/'/' would otherwise
         // retarget the DELETE at a different daemon endpoint entirely.
         let url = format!("{base_url}/v1/stores/{}", encode_path_segment(self.name));
-        daemon_request_async(reqwest::Method::DELETE, &url, None).await?;
+        daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await?;
         Ok(StoreRemoveOutcome {
             name: self.name.to_string(),
         })
@@ -325,4 +326,130 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     })
     .await;
     render_store_remove(outcome, ctx.json);
+}
+
+/// `localdb store grant <store> <user>`
+pub fn run_store_grant(ctx: &CliContext, store: &str, user: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_store_grant_async(ctx, store, user));
+}
+
+pub(crate) async fn run_store_grant_async(ctx: &CliContext, store: &str, user: &str) {
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
+    let data_dir = &config_loader.paths.data_dir;
+
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
+        let url = format!(
+            "{base_url}/v1/stores/{store}/grants",
+            store = encode_path_segment(store)
+        );
+        let body = json!({ "user": user });
+        match daemon_request_async(ctx, reqwest::Method::POST, &url, Some(body)).await {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    println!("Granted '{user}' access to store '{store}' (via daemon)");
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
+
+    let store_row = match db.backend().get_store_by_name(store).await {
+        Ok(Some(s)) => s,
+        Ok(None) => exit_err(
+            &Error::StoreNotFound {
+                id: store.to_string(),
+            },
+            ctx.json,
+        ),
+        Err(e) => exit_err(&e, ctx.json),
+    };
+    let target_user = resolve_user_direct_db(&db, ctx, user).await;
+    if let Err(e) = db
+        .auth_service()
+        .grant_store(store, store_row.visibility, &target_user.id, "local")
+        .await
+    {
+        exit_err(&e, ctx.json);
+    }
+
+    if ctx.json {
+        print_json(&json!({ "status": "ok", "store": store, "user": target_user.name }));
+    } else {
+        println!("Granted '{}' access to store '{}'", target_user.name, store);
+    }
+}
+
+/// `localdb store revoke <store> <user>`
+pub fn run_store_revoke(ctx: &CliContext, store: &str, user: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_store_revoke_async(ctx, store, user));
+}
+
+pub(crate) async fn run_store_revoke_async(ctx: &CliContext, store: &str, user: &str) {
+    let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
+    let data_dir = &config_loader.paths.data_dir;
+
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
+        let url = format!(
+            "{base_url}/v1/stores/{store}/grants/{user}",
+            store = encode_path_segment(store),
+            user = encode_path_segment(user)
+        );
+        match daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await {
+            Ok(_) => {
+                if ctx.json {
+                    print_json(&json!({ "status": "ok", "store": store, "user": user }));
+                } else {
+                    println!("Revoked '{user}' access to store '{store}' (via daemon)");
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+    let db = crate::app_db::open_app_db_or_exit(ctx, &config_loader).await;
+
+    let target_user = resolve_user_direct_db(&db, ctx, user).await;
+    match db.auth_service().revoke_store(store, &target_user.id).await {
+        Ok(true) => {}
+        Ok(false) => exit_err(
+            &Error::InvalidRequest {
+                message: format!("no grant for user '{user}' on store '{store}'"),
+            },
+            ctx.json,
+        ),
+        Err(e) => exit_err(&e, ctx.json),
+    }
+
+    if ctx.json {
+        print_json(&json!({ "status": "ok", "store": store, "user": target_user.name }));
+    } else {
+        println!("Revoked '{}' access to store '{}'", target_user.name, store);
+    }
+}
+
+async fn resolve_user_direct_db(
+    db: &crate::app_db::AppDb,
+    ctx: &CliContext,
+    ident: &str,
+) -> localdb_core::auth::UserRow {
+    use localdb_core::auth::AuthStore as _;
+    if let Ok(Some(u)) = db.auth_store().get_user_by_name(ident).await {
+        return u;
+    }
+    match db.auth_store().get_user(ident).await {
+        Ok(Some(u)) => u,
+        Ok(None) => exit_err(
+            &Error::InvalidRequest {
+                message: format!("no user named or with id '{ident}'"),
+            },
+            ctx.json,
+        ),
+        Err(e) => exit_err(&e, ctx.json),
+    }
 }

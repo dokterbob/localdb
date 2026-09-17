@@ -43,8 +43,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
 async fn rejected_response_is_logged_at_warn() {
     let (_dir, state) = make_state().await;
     let app = build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -112,8 +112,8 @@ async fn rejected_response_is_logged_at_warn() {
 async fn rejected_response_through_mcp_mount_is_logged_at_warn() {
     let (_dir, state) = make_state().await;
     let app = build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );

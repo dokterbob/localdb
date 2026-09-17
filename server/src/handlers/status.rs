@@ -1,5 +1,7 @@
-use axum::{extract::State, Json};
+use super::require_principal;
+use axum::{extract::State, Extension, Json};
 use axum_extra::extract::Query;
+use localdb_core::auth::{Principal, Role};
 use serde::{Deserialize, Serialize};
 
 use localdb_core::{resolve_named_stores, Error, StoreRow, TableSize};
@@ -50,7 +52,8 @@ pub struct StatusResponse {
     /// daemon-routed `status` can render identically to embedded `status`
     /// instead of only reporting a bare `store_count`.
     pub stores: Vec<StoreStatusRecord>,
-    pub database: DatabaseStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseStatus>,
     /// Optional capabilities this daemon supports, so a newer client can tell
     /// whether an older running daemon will honour a request before sending
     /// it. `SearchRequest` does not reject unknown fields, so a
@@ -106,9 +109,17 @@ async fn resolve_status_scope(state: &AppState, names: &[String]) -> Result<Vec<
 
 pub async fn get_status(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    let scoped_stores = resolve_status_scope(&state, &query.store).await?;
+    let principal = require_principal(principal)?;
+    let mut scoped_stores = resolve_status_scope(&state, &query.store).await?;
+    if !query.store.is_empty() {
+        for store in &scoped_stores {
+            principal.require_read_store(&store.name, store.visibility.clone())?;
+        }
+    }
+    scoped_stores.retain(|s| principal.can_read_store(&s.name, s.visibility.clone()));
     let store_count = scoped_stores.len();
 
     let mut source_count = 0;
@@ -140,26 +151,16 @@ pub async fn get_status(
 
     let jobs = state.job_queue().list_jobs().await;
 
-    let db_path = state.data_dir().join("localdb.db");
-    let db_size = localdb_core::compute_db_file_size(&db_path);
-    let total_chunks: u64 = stores.iter().filter_map(|s| s.chunk_count).sum();
-    let largest_tables = state
-        .backend()
-        .largest_tables(LARGEST_TABLES_LIMIT)
-        .await
-        .unwrap_or_default();
-
-    Ok(Json(StatusResponse {
-        daemon: true,
-        store_count,
-        source_count,
-        job_count: jobs.len(),
-        stores,
-        features: vec![
-            FEATURE_SEARCH_FILTERS.to_string(),
-            FEATURE_REFETCH.to_string(),
-        ],
-        database: DatabaseStatus {
+    let database = if principal.role == Role::Admin {
+        let db_path = state.data_dir().join("localdb.db");
+        let db_size = localdb_core::compute_db_file_size(&db_path);
+        let total_chunks: u64 = stores.iter().filter_map(|s| s.chunk_count).sum();
+        let largest_tables = state
+            .backend()
+            .largest_tables(LARGEST_TABLES_LIMIT)
+            .await
+            .unwrap_or_default();
+        Some(DatabaseStatus {
             path: db_path.display().to_string(),
             exists: db_size.main_bytes.is_some(),
             size_bytes: db_size.main_bytes,
@@ -167,6 +168,27 @@ pub async fn get_status(
             total_size_bytes: db_size.total_bytes(),
             bytes_per_chunk: localdb_core::bytes_per_chunk(db_size.total_bytes(), total_chunks),
             largest_tables,
+        })
+    } else {
+        None
+    };
+
+    Ok(Json(StatusResponse {
+        daemon: true,
+        store_count,
+        source_count,
+        job_count: if principal.role == Role::Admin {
+            jobs.len()
+        } else {
+            jobs.iter()
+                .filter(|j| scoped_stores.iter().any(|s| s.id == j.store_id))
+                .count()
         },
+        stores,
+        features: vec![
+            FEATURE_SEARCH_FILTERS.to_string(),
+            FEATURE_REFETCH.to_string(),
+        ],
+        database,
     }))
 }

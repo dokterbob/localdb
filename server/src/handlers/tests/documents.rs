@@ -1,3 +1,4 @@
+use super::common::{make_state_with_auth_mode, seed_user_with_key};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -53,8 +54,8 @@ async fn get_document_returns_record_when_indexed() {
     .await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -188,8 +189,8 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
         .unwrap();
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
         vec![],
     );
@@ -651,4 +652,122 @@ async fn get_document_unknown_store_name_in_query_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = json_body(resp.into_body()).await;
     assert_eq!(body["code"], "store_not_found");
+}
+
+#[tokio::test]
+async fn get_document_without_store_grant_returns_403() {
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        SeedChunkInput {
+            chunk_id: "chunk-secret-1",
+            doc_id: "doc-secret-1",
+            text: "confidential contents the ungranted member must never see",
+            uri: "file:///secret.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let bearer =
+        seed_user_with_key(&state, "member-no-grant", localdb_core::auth::Role::Member).await;
+
+    state
+        .update_store("store-shared", Some("shared"))
+        .await
+        .unwrap();
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-secret-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "forbidden");
+}
+
+/// Positive counterpart to `get_document_without_store_grant_returns_403`:
+/// a `Role::Member` principal *with* a grant on the document's owning
+/// `shared` store gets the document back, status `200`.
+#[tokio::test]
+async fn get_document_with_store_grant_returns_200() {
+    use localdb_core::types::StoreVisibility;
+
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        SeedChunkInput {
+            chunk_id: "chunk-visible-1",
+            doc_id: "doc-visible-1",
+            text: "contents a granted member may read",
+            uri: "file:///visible.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let admin = state
+        .auth()
+        .create_user("admin-granter", localdb_core::auth::Role::Admin)
+        .await
+        .unwrap();
+    let member = state
+        .auth()
+        .create_user("member-with-grant", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    state
+        .auth()
+        .grant_store(
+            "store-shared",
+            StoreVisibility::Shared,
+            &member.id,
+            &admin.id,
+        )
+        .await
+        .unwrap();
+    let bearer = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    state
+        .update_store("store-shared", Some("shared"))
+        .await
+        .unwrap();
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-visible-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["id"], "doc-visible-1");
 }

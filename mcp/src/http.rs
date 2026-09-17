@@ -12,24 +12,16 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-use localdb_core::{Embedder, StoreBackend};
+use crate::StoreProvider;
+use localdb_core::{auth::Principal, Embedder, StoreBackend};
 
 use crate::handler::McpHandler;
-use crate::tools::AvailableStore;
 
 /// Build the Streamable HTTP tower service serving `McpHandler`.
 ///
-/// `stores`, `backend`, and `embedder` are a startup-time snapshot (see
-/// `server::mcp_bridge::build_available_stores`), not rebuilt per session:
-/// rmcp's service factory below is a synchronous `Fn() -> Result<S,
-/// io::Error>`, so there is no hook to redo the async `AppState` lookups
-/// per HTTP session. The factory clones `stores`/`backend`/`embedder` per
-/// session instead — cheap, since `AvailableStore::store`, `backend`, and
-/// `embedder` are all already `Arc`-backed — which satisfies the sync
-/// boundary without a `block_on` bridge. A store added later via `/v1/stores`
-/// is therefore
-/// invisible over MCP until the daemon restarts; an accepted, documented
-/// gap (specs/05-surfaces.md §4), not something this function works around.
+/// Sessions share the provider, backend, and embedder. The handler resolves
+/// stores asynchronously on every tool call, so registry changes take effect
+/// without restarting the daemon or reconnecting the client.
 ///
 /// HTTP MCP sessions always run with `allow_write = false`: there is no
 /// CLI-flag equivalent for an HTTP caller, and v1 registers no mutating
@@ -60,10 +52,11 @@ use crate::tools::AvailableStore;
 /// fix would be a no-op for the one case (non-loopback bind) it exists for.
 /// Do not "simplify" this back to always using `::default()`.
 pub fn build_streamable_http_service(
-    stores: Vec<AvailableStore>,
+    provider: Arc<dyn StoreProvider>,
     backend: Arc<dyn StoreBackend>,
     embedder: Arc<dyn Embedder>,
     allowed_hosts: Vec<String>,
+    default_principal: Option<Principal>,
 ) -> StreamableHttpService<McpHandler, LocalSessionManager> {
     let config = if allowed_hosts.is_empty() {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
@@ -73,10 +66,11 @@ pub fn build_streamable_http_service(
     StreamableHttpService::new(
         move || {
             Ok(McpHandler::new(
-                stores.clone(),
+                provider.clone(),
                 backend.clone(),
                 embedder.clone(),
                 false,
+                default_principal.clone(),
             ))
         },
         Default::default(),

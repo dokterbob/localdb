@@ -258,6 +258,63 @@ pub enum Command {
         no_fetch_full_content: bool,
     },
 
+    /// Manage user accounts. Every subcommand routes to a running daemon
+    /// (admin bearer) by default and falls back to a direct database
+    /// read/write when no daemon is reachable; `add` also accepts
+    /// `--direct-db` to bypass a running daemon for lockout recovery.
+    #[command(subcommand)]
+    User(UserCommand),
+
+    /// Manage API keys. Every subcommand routes to a running daemon by
+    /// default (admin bearer, except minting your own key) and falls back
+    /// to a direct database read/write when no daemon is reachable;
+    /// `create` also accepts `--direct-db` to bypass a running daemon for
+    /// lockout recovery.
+    #[command(subcommand)]
+    Key(KeyCommand),
+
+    /// Authenticate against a daemon via OAuth2 (authorization code + PKCE)
+    /// and cache the resulting token in credentials.json.
+    Login {
+        /// Daemon base URL (default: auto-detected running daemon).
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Pre-fill the consent form's one-time setup code (bootstrap);
+        /// the form still requires an explicit submit.
+        #[arg(long = "setup-code")]
+        setup_code: Option<String>,
+
+        /// Don't try to open a browser; print the URL and read a pasted
+        /// code from stdin instead.
+        #[arg(long = "no-browser")]
+        no_browser: bool,
+
+        /// Redeem an invite token instead of an interactive login
+        /// (specs/05-surfaces.md §2, T6): `open`-mode invites complete
+        /// immediately; `closed`-mode invites wait and poll until an admin
+        /// approves or denies. Mutually exclusive with `--setup-code` and
+        /// `--no-browser`'s browser flow — no browser is opened at all.
+        #[arg(long)]
+        invite: Option<String>,
+
+        /// The requested user name for `--invite` (default: the OS login
+        /// name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Revoke the cached token for a daemon and clear it from
+    /// credentials.json.
+    Logout {
+        /// Daemon base URL (default: auto-detected running daemon).
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Manage invites and pending access requests (admin only, T6).
+    #[command(subcommand)]
+    Invite(InviteCommand),
     /// Generate a shell completion script on stdout.
     ///
     /// Pure codegen: no config load, no daemon probe, works before `init`.
@@ -274,6 +331,111 @@ pub enum Command {
     /// build/release tooling only.
     #[command(subcommand, hide = true)]
     Internal(InternalCommand),
+}
+
+/// Invite management subcommands (specs/05-surfaces.md §2, T6).
+#[derive(Debug, Subcommand)]
+pub enum InviteCommand {
+    /// Create an invite. Prints a show-once token and a ready-made consent
+    /// URL.
+    Create {
+        /// `open` (redeem creates the user immediately) or `closed` (redeem
+        /// files a pending access request for admin approval).
+        #[arg(long, default_value = "open")]
+        mode: String,
+        /// Store(s) to grant the resulting user read access to (repeatable;
+        /// must be `shared` stores — `private` stores are rejected).
+        #[arg(long = "store")]
+        stores: Vec<String>,
+        /// Expiry as a human-readable duration (e.g. "7d", "24h", "30m");
+        /// omit for no expiry.
+        #[arg(long)]
+        expires: Option<String>,
+        /// How many times this invite may be redeemed.
+        #[arg(long = "max-uses", default_value = "1")]
+        max_uses: u32,
+    },
+    /// List all invites (no secrets).
+    List,
+    /// Revoke an invite by ID.
+    Revoke {
+        /// Invite ID (see `invite list`).
+        id: String,
+    },
+    /// List pending (and decided) access requests from closed-mode invites.
+    Requests,
+    /// Approve a pending access request, creating its user.
+    Approve {
+        /// Access request ID (see `invite requests`).
+        request_id: String,
+    },
+    /// Deny a pending access request.
+    Deny {
+        /// Access request ID (see `invite requests`).
+        request_id: String,
+    },
+}
+
+/// User management subcommands (specs/05-surfaces.md §2).
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// Create a user account. Routed to a running daemon (admin bearer) by
+    /// default; falls back to a direct database write when no daemon is
+    /// reachable.
+    Add {
+        /// User name (unique).
+        name: String,
+        /// Create the user with the admin role (default: member).
+        #[arg(long)]
+        admin: bool,
+        /// Write directly to the database even if a daemon is running
+        /// (lockout recovery — bypasses the daemon rather than refusing).
+        #[arg(long = "direct-db")]
+        direct_db: bool,
+    },
+    /// List all user accounts.
+    List,
+    /// Remove a user account.
+    Remove {
+        /// User name.
+        name: String,
+    },
+    /// Change a user's role.
+    SetRole {
+        /// User name.
+        name: String,
+        /// New role: "admin" or "member".
+        role: String,
+    },
+}
+
+/// API key management subcommands (specs/05-surfaces.md §2).
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Mint an API key for a user. The secret is shown exactly once. Routed
+    /// to a running daemon by default (admin bearer, unless minting a key
+    /// for yourself); falls back to a direct database write when no daemon
+    /// is reachable.
+    Create {
+        /// The user name to mint the key for.
+        #[arg(long)]
+        user: String,
+        /// Write directly to the database even if a daemon is running
+        /// (lockout recovery — bypasses the daemon rather than refusing).
+        #[arg(long = "direct-db")]
+        direct_db: bool,
+    },
+    /// List API keys (metadata only — never secrets).
+    List {
+        /// Restrict to this user's keys (default: every user's).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Revoke an API key by its ID.
+    Revoke {
+        /// The key's ID (see `key list`).
+        id: String,
+    },
 }
 
 /// `search`'s ten metadata-filter flags, flattened into
@@ -411,6 +573,20 @@ pub enum StoreCommand {
     Remove {
         /// Store name or ID.
         name: String,
+    },
+    /// Grant a user read access to a `shared` store (D7).
+    Grant {
+        /// Store name.
+        store: String,
+        /// User name or ID.
+        user: String,
+    },
+    /// Revoke a user's read access to a store.
+    Revoke {
+        /// Store name.
+        store: String,
+        /// User name or ID.
+        user: String,
     },
 }
 
@@ -614,6 +790,9 @@ fn main() {
         config_env: std::env::var("LOCALDB_CONFIG")
             .ok()
             .map(std::path::PathBuf::from),
+        api_key: std::env::var("LOCALDB_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
     };
 
     match &cli.command {
@@ -625,6 +804,8 @@ fn main() {
             StoreCommand::Add { name } => cli::run_store_add(&ctx, name),
             StoreCommand::List => cli::run_store_list(&ctx),
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
+            StoreCommand::Grant { store, user } => cli::run_store_grant(&ctx, store, user),
+            StoreCommand::Revoke { store, user } => cli::run_store_revoke(&ctx, store, user),
         },
         Command::Source(cmd) => match cmd {
             SourceCommand::Add {
@@ -712,6 +893,49 @@ fn main() {
                 );
             }
         }
+        Command::User(cmd) => match cmd {
+            UserCommand::Add {
+                name,
+                admin,
+                direct_db,
+            } => cli::run_user_add(&ctx, name, *admin, *direct_db),
+            UserCommand::List => cli::run_user_list(&ctx),
+            UserCommand::Remove { name } => cli::run_user_remove(&ctx, name),
+            UserCommand::SetRole { name, role } => cli::run_user_set_role(&ctx, name, role),
+        },
+        Command::Key(cmd) => match cmd {
+            KeyCommand::Create { user, direct_db } => cli::run_key_create(&ctx, user, *direct_db),
+            KeyCommand::List { user } => cli::run_key_list(&ctx, user.as_deref()),
+            KeyCommand::Revoke { id } => cli::run_key_revoke(&ctx, id),
+        },
+        Command::Login {
+            url,
+            setup_code,
+            no_browser,
+            invite,
+            name,
+        } => cli::run_login(
+            &ctx,
+            url.as_deref(),
+            setup_code.as_deref(),
+            *no_browser,
+            invite.as_deref(),
+            name.as_deref(),
+        ),
+        Command::Logout { url } => cli::run_logout(&ctx, url.as_deref()),
+        Command::Invite(cmd) => match cmd {
+            InviteCommand::Create {
+                mode,
+                stores,
+                expires,
+                max_uses,
+            } => cli::run_invite_create(&ctx, mode, stores, expires.as_deref(), *max_uses),
+            InviteCommand::List => cli::run_invite_list(&ctx),
+            InviteCommand::Revoke { id } => cli::run_invite_revoke(&ctx, id),
+            InviteCommand::Requests => cli::run_invite_requests(&ctx),
+            InviteCommand::Approve { request_id } => cli::run_invite_approve(&ctx, request_id),
+            InviteCommand::Deny { request_id } => cli::run_invite_deny(&ctx, request_id),
+        },
         // Unreachable: handled and returned from above, before `ctx` even
         // exists, so these arms never actually dispatch — required only for
         // match exhaustiveness over `Command`.
@@ -725,523 +949,4 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Verify the CLI can be parsed without panicking.
-    #[test]
-    fn cli_help_parses() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
-    }
-
-    /// Verify all top-level subcommand names from specs/05-surfaces.md §2.
-    #[test]
-    fn all_subcommands_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
-
-        for expected in &[
-            "init", "serve", "mcp", "status", "store", "source", "document", "db", "job", "index",
-            "search", "add",
-        ] {
-            assert!(
-                subcommand_names.contains(expected),
-                "subcommand '{}' is missing from the CLI; found: {:?}",
-                expected,
-                subcommand_names,
-            );
-        }
-    }
-
-    /// Verify the store subcommands are present.
-    #[test]
-    fn store_subcommands_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let store_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "store")
-            .expect("store subcommand missing");
-
-        let sub_names: Vec<&str> = store_cmd
-            .get_subcommands()
-            .map(|sc| sc.get_name())
-            .collect();
-
-        for expected in &["add", "list", "remove"] {
-            assert!(
-                sub_names.contains(expected),
-                "store {expected} subcommand missing; found: {sub_names:?}",
-            );
-        }
-    }
-
-    /// Verify the source subcommands are present.
-    #[test]
-    fn source_subcommands_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let source_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "source")
-            .expect("source subcommand missing");
-
-        let sub_names: Vec<&str> = source_cmd
-            .get_subcommands()
-            .map(|sc| sc.get_name())
-            .collect();
-
-        for expected in &["add", "list", "remove"] {
-            assert!(
-                sub_names.contains(expected),
-                "source {expected} subcommand missing; found: {sub_names:?}",
-            );
-        }
-    }
-
-    /// Verify the document subcommands are present.
-    #[test]
-    fn document_subcommands_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let document_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "document")
-            .expect("document subcommand missing");
-
-        let sub_names: Vec<&str> = document_cmd
-            .get_subcommands()
-            .map(|sc| sc.get_name())
-            .collect();
-
-        for expected in &["list", "get"] {
-            assert!(
-                sub_names.contains(expected),
-                "document {expected} subcommand missing; found: {sub_names:?}",
-            );
-        }
-    }
-
-    /// Verify the db subcommands are present.
-    #[test]
-    fn db_subcommands_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let db_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "db")
-            .expect("db subcommand missing");
-
-        let sub_names: Vec<&str> = db_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
-
-        for expected in &["status", "migrate", "downgrade", "vacuum"] {
-            assert!(
-                sub_names.contains(expected),
-                "db {expected} subcommand missing; found: {sub_names:?}",
-            );
-        }
-    }
-
-    /// Verify the job subcommands are present.
-    #[test]
-    fn job_subcommands_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let job_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "job")
-            .expect("job subcommand missing");
-
-        let sub_names: Vec<&str> = job_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
-
-        for expected in &["cancel", "list"] {
-            assert!(
-                sub_names.contains(expected),
-                "job {expected} subcommand missing; found: {sub_names:?}",
-            );
-        }
-    }
-
-    /// `localdb job list` parses with no arguments.
-    #[test]
-    fn job_list_parses() {
-        let cli = Cli::try_parse_from(["localdb", "job", "list"]).unwrap();
-        assert!(matches!(cli.command, Command::Job(JobCommand::List)));
-    }
-
-    /// `localdb job cancel <id>` parses the job id as a positional arg.
-    #[test]
-    fn job_cancel_parses() {
-        let cli = Cli::try_parse_from(["localdb", "job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
-            .unwrap();
-        if let Command::Job(JobCommand::Cancel { id }) = cli.command {
-            assert_eq!(id, "01HRQHB7FN3WMX4AZDV3S9VCTZ");
-        } else {
-            panic!("expected Job(Cancel) command");
-        }
-    }
-
-    /// `localdb db vacuum` parses with no arguments.
-    #[test]
-    fn db_vacuum_parses() {
-        assert!(matches!(
-            Cli::try_parse_from(["localdb", "db", "vacuum"])
-                .unwrap()
-                .command,
-            Command::Db(DbCommand::Vacuum)
-        ));
-    }
-
-    /// `localdb init`/`localdb init --download-model` parse the new flag.
-    #[test]
-    fn init_download_model_flag_parses() {
-        assert!(matches!(
-            Cli::try_parse_from(["localdb", "init"]).unwrap().command,
-            Command::Init {
-                download_model: false
-            }
-        ));
-
-        assert!(matches!(
-            Cli::try_parse_from(["localdb", "init", "--download-model"])
-                .unwrap()
-                .command,
-            Command::Init {
-                download_model: true
-            }
-        ));
-    }
-
-    /// `localdb db downgrade --to N` parses `N` as an `i64`.
-    #[test]
-    fn db_downgrade_to_flag_parses_i64() {
-        let cli = Cli::try_parse_from(["localdb", "db", "downgrade", "--to", "3"]).unwrap();
-        if let Command::Db(DbCommand::Downgrade { to }) = cli.command {
-            assert_eq!(to, Some(3));
-        } else {
-            panic!("expected Db(Downgrade) command");
-        }
-    }
-
-    /// `localdb db downgrade` without `--to` parses to `None` (CLI resolves
-    /// the one-step-back default itself, not the library's baseline default).
-    #[test]
-    fn db_downgrade_without_to_defaults_to_none() {
-        let cli = Cli::try_parse_from(["localdb", "db", "downgrade"]).unwrap();
-        if let Command::Db(DbCommand::Downgrade { to }) = cli.command {
-            assert_eq!(to, None);
-        } else {
-            panic!("expected Db(Downgrade) command");
-        }
-    }
-
-    /// `localdb db status` and `localdb db migrate` parse with no arguments.
-    #[test]
-    fn db_status_and_migrate_parse() {
-        assert!(matches!(
-            Cli::try_parse_from(["localdb", "db", "status"])
-                .unwrap()
-                .command,
-            Command::Db(DbCommand::Status)
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["localdb", "db", "migrate"])
-                .unwrap()
-                .command,
-            Command::Db(DbCommand::Migrate)
-        ));
-    }
-
-    /// Unquoted multi-word query is joined into a single string.
-    #[test]
-    fn search_query_accepts_unquoted_multiple_words() {
-        let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
-        if let Command::Search {
-            query,
-            limit,
-            content_length,
-            ..
-        } = cli.command
-        {
-            assert_eq!(query.join(" "), "machine learning");
-            assert_eq!(limit, 3);
-            assert_eq!(content_length, 1000);
-        } else {
-            panic!("expected Search command");
-        }
-    }
-
-    /// A flag typed *after* the query words must still be parsed as a flag,
-    /// not silently absorbed into the query (issue #224). Before the fix,
-    /// `trailing_var_arg = true` made `--limit 5` here part of the query
-    /// text instead of setting `limit`.
-    #[test]
-    fn search_flags_after_query_words_still_parse() {
-        let cli =
-            Cli::try_parse_from(["localdb", "search", "rank", "fusion", "--limit", "5"]).unwrap();
-        if let Command::Search { query, limit, .. } = cli.command {
-            assert_eq!(query.join(" "), "rank fusion");
-            assert_eq!(limit, 5);
-        } else {
-            panic!("expected Search command");
-        }
-    }
-
-    /// `--limit` before the query words still works (regression guard).
-    #[test]
-    fn search_flags_before_query_words_still_parse() {
-        let cli =
-            Cli::try_parse_from(["localdb", "search", "--limit", "5", "rank", "fusion"]).unwrap();
-        if let Command::Search { query, limit, .. } = cli.command {
-            assert_eq!(query.join(" "), "rank fusion");
-            assert_eq!(limit, 5);
-        } else {
-            panic!("expected Search command");
-        }
-    }
-
-    /// `--` forces everything after it to be literal query text, including
-    /// tokens that look like flags — the escape hatch for a query word that
-    /// legitimately starts with `-`.
-    #[test]
-    fn search_double_dash_escapes_flag_like_query_words() {
-        let cli = Cli::try_parse_from(["localdb", "search", "--", "--limit", "5"]).unwrap();
-        if let Command::Search { query, limit, .. } = cli.command {
-            assert_eq!(query, vec!["--limit".to_string(), "5".to_string()]);
-            assert_eq!(limit, 3);
-        } else {
-            panic!("expected Search command");
-        }
-    }
-
-    /// `localdb add <path>` parses to Command::Add.
-    #[test]
-    fn add_alias_parses() {
-        let cli = Cli::try_parse_from(["localdb", "add", "/some/path"]).unwrap();
-        if let Command::Add { sources, .. } = cli.command {
-            assert_eq!(sources, vec!["/some/path"]);
-        } else {
-            panic!("expected Add command");
-        }
-    }
-
-    /// `--kind`, `--max-entries`, `--no-fetch-full-content` parse on `add`.
-    #[test]
-    fn add_feed_flags_parse() {
-        let cli = Cli::try_parse_from([
-            "localdb",
-            "add",
-            "https://example.com/feed.xml",
-            "--kind",
-            "feed",
-            "--max-entries",
-            "10",
-            "--no-fetch-full-content",
-        ])
-        .unwrap();
-        if let Command::Add {
-            kind,
-            max_entries,
-            no_fetch_full_content,
-            ..
-        } = cli.command
-        {
-            assert_eq!(kind, Some(SourceKindArg::Feed));
-            assert_eq!(max_entries, Some(10));
-            assert!(no_fetch_full_content);
-        } else {
-            panic!("expected Add command");
-        }
-    }
-
-    /// Same flags parse identically on `source add`.
-    #[test]
-    fn source_add_feed_flags_parse() {
-        let cli = Cli::try_parse_from([
-            "localdb",
-            "source",
-            "add",
-            "https://example.com/feed.xml",
-            "--kind",
-            "feed",
-            "--max-entries",
-            "10",
-            "--no-fetch-full-content",
-        ])
-        .unwrap();
-        if let Command::Source(SourceCommand::Add {
-            kind,
-            max_entries,
-            no_fetch_full_content,
-            ..
-        }) = cli.command
-        {
-            assert_eq!(kind, Some(SourceKindArg::Feed));
-            assert_eq!(max_entries, Some(10));
-            assert!(no_fetch_full_content);
-        } else {
-            panic!("expected Source(Add) command");
-        }
-    }
-
-    /// `--kind path|url` also parses (bypasses classification without a
-    /// feed-only implication).
-    #[test]
-    fn kind_path_and_url_parse() {
-        let cli = Cli::try_parse_from(["localdb", "add", "some-arg", "--kind", "path"]).unwrap();
-        if let Command::Add { kind, .. } = cli.command {
-            assert_eq!(kind, Some(SourceKindArg::Path));
-        } else {
-            panic!("expected Add command");
-        }
-
-        let cli = Cli::try_parse_from(["localdb", "add", "some-arg", "--kind", "url"]).unwrap();
-        if let Command::Add { kind, .. } = cli.command {
-            assert_eq!(kind, Some(SourceKindArg::Url));
-        } else {
-            panic!("expected Add command");
-        }
-    }
-
-    /// `Command::Add` and `SourceCommand::Add` must expose identical arg
-    /// names/requirements for the shared flags — they are hand-synced clap
-    /// structs, and drift between them would silently desync `localdb add`
-    /// from `localdb source add` (issue #116).
-    #[test]
-    fn add_and_source_add_flags_are_in_parity() {
-        use clap::CommandFactory;
-        use std::collections::BTreeMap;
-
-        let cmd = Cli::command();
-        let add_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "add")
-            .expect("add subcommand missing");
-        let source_cmd = cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "source")
-            .expect("source subcommand missing");
-        let source_add_cmd = source_cmd
-            .get_subcommands()
-            .find(|sc| sc.get_name() == "add")
-            .expect("source add subcommand missing");
-
-        fn arg_shapes(
-            cmd: &clap::Command,
-        ) -> BTreeMap<String, (bool, Option<clap::builder::ValueRange>)> {
-            cmd.get_arguments()
-                .map(|a| {
-                    (
-                        a.get_id().as_str().to_string(),
-                        (a.is_required_set(), a.get_num_args()),
-                    )
-                })
-                .collect()
-        }
-
-        let add_args = arg_shapes(add_cmd);
-        let source_add_args = arg_shapes(source_add_cmd);
-
-        for flag in &[
-            "sources",
-            "refresh",
-            "kind",
-            "max_entries",
-            "no_fetch_full_content",
-        ] {
-            let add_shape = add_args
-                .get(*flag)
-                .unwrap_or_else(|| panic!("`add` is missing --{flag}"));
-            let source_add_shape = source_add_args
-                .get(*flag)
-                .unwrap_or_else(|| panic!("`source add` is missing --{flag}"));
-            assert_eq!(
-                add_shape, source_add_shape,
-                "`--{flag}` differs between `add` and `source add`: {add_shape:?} vs {source_add_shape:?}"
-            );
-        }
-    }
-
-    /// `-s` short flag populates `stores`.
-    #[test]
-    fn short_store_flag() {
-        let cli = Cli::try_parse_from(["localdb", "-s", "notes", "search", "foo"]).unwrap();
-        assert_eq!(cli.stores, vec!["notes"]);
-    }
-
-    /// `localdb index --dir` is rejected by clap (flag was removed; use `--source` instead).
-    #[test]
-    fn index_dir_arg_is_rejected_by_clap() {
-        let result = Cli::try_parse_from(["localdb", "index", "--dir", "/tmp/foo"]);
-        assert!(
-            result.is_err(),
-            "expected --dir to be rejected, but clap accepted it"
-        );
-    }
-
-    /// `localdb index --refetch` parses and sets the flag.
-    #[test]
-    fn index_refetch_flag_parses() {
-        let cli = Cli::try_parse_from(["localdb", "index", "--refetch"]).unwrap();
-        match cli.command {
-            Command::Index { refetch, .. } => assert!(refetch),
-            other => panic!("expected Index command, got: {other:?}"),
-        }
-    }
-
-    /// `--refetch` is absent by default.
-    #[test]
-    fn index_without_refetch_flag_defaults_to_false() {
-        let cli = Cli::try_parse_from(["localdb", "index"]).unwrap();
-        match cli.command {
-            Command::Index { refetch, .. } => assert!(!refetch),
-            other => panic!("expected Index command, got: {other:?}"),
-        }
-    }
-
-    /// `--refetch` combines with `--delete` and the global `-s` store filter
-    /// without conflict.
-    #[test]
-    fn index_refetch_combined_with_delete_and_store_flag_parses() {
-        let cli = Cli::try_parse_from(["localdb", "-s", "notes", "index", "--refetch", "--delete"])
-            .unwrap();
-        assert_eq!(cli.stores, vec!["notes"]);
-        match cli.command {
-            Command::Index {
-                refetch, delete, ..
-            } => {
-                assert!(refetch);
-                assert!(delete);
-            }
-            other => panic!("expected Index command, got: {other:?}"),
-        }
-    }
-
-    /// `-s` short flag works as a subcommand-level option too.
-    #[test]
-    fn short_store_flag_after_subcommand() {
-        let cli = Cli::try_parse_from(["localdb", "search", "-s", "notes", "neural", "networks"])
-            .unwrap();
-        assert_eq!(cli.stores, vec!["notes"]);
-        if let Command::Search { query, .. } = cli.command {
-            assert_eq!(query.join(" "), "neural networks");
-        } else {
-            panic!("expected Search command");
-        }
-    }
-
-    /// Verify global flags exist.
-    #[test]
-    fn global_flags_present() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let arg_names: Vec<&str> = cmd.get_arguments().map(|a| a.get_id().as_str()).collect();
-
-        assert!(arg_names.contains(&"config"), "missing --config flag");
-        assert!(arg_names.contains(&"json"), "missing --json flag");
-        assert!(arg_names.contains(&"stores"), "missing --store flag");
-        assert!(arg_names.contains(&"yes"), "missing --yes/-y flag");
-    }
-}
+mod tests;

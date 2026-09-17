@@ -220,6 +220,130 @@ fn add_conditional_get_validators_down(_ctx: &MigrationContext) -> Vec<String> {
     ]
 }
 
+/// `v9`: create the auth tables and seed the CLI OAuth client.
+/// `access_requests.collected_at` is deliberately added separately by v10.
+fn create_auth_tables_up(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "CREATE TABLE IF NOT EXISTS users (
+            id         TEXT PRIMARY KEY NOT NULL,
+            name       TEXT NOT NULL UNIQUE,
+            role       TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"
+        .to_string(),
+        "CREATE TABLE IF NOT EXISTS auth_tokens (
+            id            TEXT PRIMARY KEY NOT NULL,
+            user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind          TEXT NOT NULL,
+            secret_hash   TEXT NOT NULL UNIQUE,
+            expires_at    TEXT,
+            last_used_at  TEXT,
+            revoked_at    TEXT,
+            created_at    TEXT NOT NULL,
+            family_id     TEXT,
+            rotated_from  TEXT
+        )"
+        .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_auth_tokens_family ON auth_tokens(family_id)".to_string(),
+        "CREATE TABLE IF NOT EXISTS oauth_clients (
+            id            TEXT PRIMARY KEY NOT NULL,
+            client_name   TEXT,
+            redirect_uris TEXT NOT NULL DEFAULT '[]',
+            created_at    TEXT NOT NULL
+        )"
+        .to_string(),
+        // Seed the built-in `localdb-cli` OAuth2 public client
+        // (`localdb_core::auth::LOCALDB_CLI_CLIENT_ID`) so
+        // `auth_codes.client_id`'s FK constraint is satisfiable the moment
+        // `/authorize` issues a code for it. This is DML, not DDL, so it
+        // produces no `sqlite_master` row and doesn't participate in the
+        // write-twice drift guard — `schema::create_auth_tables` fires the
+        // identical `INSERT OR IGNORE` for a fresh store; every existing v5
+        // store gets it here via `db migrate`. Idempotent, so both firing is
+        // safe regardless of which path a given store took.
+        "INSERT OR IGNORE INTO oauth_clients (id, client_name, redirect_uris, created_at) \
+         VALUES ('localdb-cli', 'localdb CLI', '[]', '1970-01-01T00:00:00Z')"
+            .to_string(),
+        "CREATE TABLE IF NOT EXISTS auth_codes (
+            id                    TEXT PRIMARY KEY NOT NULL,
+            client_id             TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+            user_id               TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            code_hash             TEXT NOT NULL UNIQUE,
+            code_challenge        TEXT NOT NULL,
+            code_challenge_method TEXT NOT NULL DEFAULT 'S256',
+            redirect_uri          TEXT NOT NULL,
+            expires_at            TEXT NOT NULL,
+            consumed_at           TEXT,
+            created_at            TEXT NOT NULL
+        )"
+        .to_string(),
+        "CREATE TABLE IF NOT EXISTS store_grants (
+            store_name TEXT NOT NULL REFERENCES stores(name) ON DELETE CASCADE,
+            user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            granted_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (store_name, user_id)
+        )"
+        .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_store_grants_user ON store_grants(user_id)".to_string(),
+        "CREATE TABLE IF NOT EXISTS invites (
+            id           TEXT PRIMARY KEY NOT NULL,
+            token_hash   TEXT NOT NULL UNIQUE,
+            mode         TEXT NOT NULL,
+            store_grants TEXT NOT NULL DEFAULT '[]',
+            max_uses     INTEGER NOT NULL DEFAULT 1,
+            uses         INTEGER NOT NULL DEFAULT 0,
+            expires_at   TEXT,
+            revoked_at   TEXT,
+            created_by   TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+        )"
+        .to_string(),
+        // v9 shape: `collected_at` is added by v10 below.
+        "CREATE TABLE IF NOT EXISTS access_requests (
+            id                 TEXT PRIMARY KEY NOT NULL,
+            invite_id          TEXT NOT NULL REFERENCES invites(id) ON DELETE CASCADE,
+            requested_name     TEXT NOT NULL,
+            secret_hash        TEXT NOT NULL,
+            state              TEXT NOT NULL DEFAULT 'pending',
+            resulting_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at         TEXT NOT NULL,
+            decided_at         TEXT
+        )"
+        .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_access_requests_invite ON access_requests(invite_id)"
+            .to_string(),
+    ]
+}
+
+/// `v9`'s down: drop the 7 auth tables. `DROP TABLE` drops its own indexes
+/// automatically, so no separate `DROP INDEX` statements are needed.
+/// Children-before-parents ordering (every FK here is in fact
+/// `CASCADE`/`SET NULL`, so order isn't strictly required, but this is
+/// FK-safe regardless) — mirrors
+/// `store-libsql/tests/real_migrations.rs`'s `v5_create_auth_tables_down`.
+fn create_auth_tables_down(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "DROP TABLE auth_codes".to_string(),
+        "DROP TABLE access_requests".to_string(),
+        "DROP TABLE store_grants".to_string(),
+        "DROP TABLE auth_tokens".to_string(),
+        "DROP TABLE invites".to_string(),
+        "DROP TABLE oauth_clients".to_string(),
+        "DROP TABLE users".to_string(),
+    ]
+}
+
+/// `v10`: guard closed-invite credential collection with an atomic marker.
+fn add_access_requests_collected_at_column_up(_ctx: &MigrationContext) -> Vec<String> {
+    vec!["ALTER TABLE access_requests ADD COLUMN collected_at TEXT".to_string()]
+}
+
+fn add_access_requests_collected_at_column_down(_ctx: &MigrationContext) -> Vec<String> {
+    vec!["ALTER TABLE access_requests DROP COLUMN collected_at".to_string()]
+}
+
 /// The real migration registry.
 ///
 /// Consumer branches append entries starting at version `BASELINE_VERSION +
@@ -291,6 +415,35 @@ pub fn migrations() -> Vec<Migration> {
             down: Down::Sql(add_conditional_get_validators_down),
             needs_reindex: false,
         },
+        Migration {
+            version: BASELINE_VERSION + 5,
+            name: "create_auth_tables",
+            summary: "adds the 7 auth tables (users, auth_tokens, oauth_clients, auth_codes, \
+                      store_grants, invites, access_requests) and their indexes, plus the \
+                      built-in localdb-cli OAuth2 client seed row",
+            up: Up::Sql(create_auth_tables_up),
+            down: Down::Sql(create_auth_tables_down),
+            needs_reindex: false,
+        },
+        Migration {
+            version: BASELINE_VERSION + 6,
+            name: "add_access_requests_collected_at_column",
+            summary: "adds access_requests.collected_at, the closed-mode invite-polling \
+                      collected-exactly-once guard",
+            up: Up::Sql(add_access_requests_collected_at_column_up),
+            down: Down::Sql(add_access_requests_collected_at_column_down),
+            needs_reindex: false,
+        },
+        Migration {
+            version: BASELINE_VERSION + 7,
+            name: "add_pending_bootstrap",
+            summary: "retain interrupted first-admin setup for recovery",
+            up: Up::Sql(|_| {
+                vec!["CREATE TABLE IF NOT EXISTS pending_bootstrap (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE)".into()]
+            }),
+            down: Down::Sql(|_| vec!["DROP TABLE pending_bootstrap".into()]),
+            needs_reindex: false,
+        },
     ]
 }
 
@@ -333,95 +486,4 @@ pub fn validate_chain(chain: &[Migration]) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::migrations::{Down, Up};
-
-    fn trivial_up(_ctx: &super::super::MigrationContext) -> Vec<String> {
-        vec!["CREATE TABLE t(x)".into()]
-    }
-
-    fn trivial_down(_ctx: &super::super::MigrationContext) -> Vec<String> {
-        vec!["DROP TABLE t".into()]
-    }
-
-    fn fixture_migration(version: i64, name: &'static str) -> Migration {
-        Migration {
-            version,
-            name,
-            summary: "fixture migration for chain tests",
-            up: Up::Sql(trivial_up),
-            down: Down::Sql(trivial_down),
-            needs_reindex: false,
-        }
-    }
-
-    #[test]
-    fn real_migrations_registry_passes_validation() {
-        validate_chain(&migrations()).expect("real migrations() chain must be contiguous");
-    }
-
-    #[test]
-    fn chain_with_a_gap_is_rejected() {
-        let chain = vec![
-            fixture_migration(BASELINE_VERSION + 1, "first"),
-            fixture_migration(BASELINE_VERSION + 3, "skips_one"),
-        ];
-        let err = validate_chain(&chain).expect_err("gap in versions should be rejected");
-        match err {
-            Error::Internal {
-                message,
-                correlation_id,
-            } => {
-                assert_eq!(correlation_id, "libsql_migrations_invalid_chain");
-                assert!(
-                    message.contains("skips_one"),
-                    "error should name the offending migration: {message}"
-                );
-                assert!(
-                    message.contains(&(BASELINE_VERSION + 2).to_string()),
-                    "error should mention the expected version: {message}"
-                );
-            }
-            other => panic!("expected Error::Internal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn chain_starting_at_wrong_version_is_rejected() {
-        let chain = vec![fixture_migration(BASELINE_VERSION + 2, "wrong_start")];
-        let err = validate_chain(&chain).expect_err("wrong starting version should be rejected");
-        match err {
-            Error::Internal {
-                message,
-                correlation_id,
-            } => {
-                assert_eq!(correlation_id, "libsql_migrations_invalid_chain");
-                assert!(message.contains("wrong_start"));
-                assert!(message.contains(&(BASELINE_VERSION + 1).to_string()));
-            }
-            other => panic!("expected Error::Internal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn head_version_of_real_chain_is_baseline_plus_its_length() {
-        assert_eq!(
-            head_version(&migrations()),
-            BASELINE_VERSION + migrations().len() as i64
-        );
-    }
-
-    #[test]
-    fn head_version_current_matches_head_version_of_real_migrations() {
-        assert_eq!(head_version_current(), head_version(&migrations()));
-    }
-
-    #[test]
-    fn head_version_current_is_eight() {
-        // Pins the concrete number so a chain edit that silently drops or
-        // duplicates an entry fails here, not just via the relative
-        // assertions above.
-        assert_eq!(head_version_current(), 8);
-    }
-}
+mod tests;

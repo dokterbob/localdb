@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use localdb_core::{
-    clamp_search_limit, Citation, Error as CoreError, QueryRequest, SearchFilters,
-    SearchOrchestrator, StoreHandle as CoreStoreHandle,
+    auth::Principal, clamp_search_limit, types::StoreVisibility, Citation, Error as CoreError,
+    QueryRequest, SearchFilters, SearchOrchestrator, StoreHandle as CoreStoreHandle,
 };
 
 use crate::error::ApiError;
@@ -50,7 +50,19 @@ impl SearchService {
         Self { state }
     }
 
-    pub async fn query(&self, req: SearchRequest) -> Result<SearchResponse, ApiError> {
+    /// D7 store scoping: if `req.store_filter` names specific stores, every
+    /// one of them must exist *and* be readable by `principal` — an
+    /// existing-but-unreadable named store is a 403 (the caller asked for it
+    /// by name and was refused), matching `handlers::stores::get_store`'s
+    /// consistency point. With no filter ("search all visible stores"), the
+    /// full store set is silently narrowed to what `principal` can read —
+    /// there is nothing to be "forbidden" from since nothing specific was
+    /// requested.
+    pub async fn query(
+        &self,
+        req: SearchRequest,
+        principal: &Principal,
+    ) -> Result<SearchResponse, ApiError> {
         if req.query.is_empty() {
             return Err(ApiError(CoreError::InvalidRequest {
                 message: "query cannot be empty".to_string(),
@@ -67,12 +79,17 @@ impl SearchService {
 
         let effective = self.state.effective_config().await?;
         for name in &req.store_filter {
-            if !effective.stores.iter().any(|s| s.name == *name) {
+            let Some(store) = effective.stores.iter().find(|s| s.name == *name) else {
                 return Err(ApiError(CoreError::StoreNotFound { id: name.clone() }));
+            };
+            if !can_read(principal, &store.name, &store.visibility) {
+                return Err(ApiError(CoreError::Forbidden {
+                    message: format!("user '{}' cannot read store '{name}'", principal.name),
+                }));
             }
         }
 
-        let yaml = self.state.yaml_config().await;
+        let yaml = self.state.yaml_config();
         let embed_policy = &yaml.defaults.indexing.embedding;
 
         let embedder: Box<dyn localdb_core::Embedder> = embed::create_embedder(
@@ -88,7 +105,11 @@ impl SearchService {
         })?;
 
         let target_stores: Vec<_> = if req.store_filter.is_empty() {
-            effective.stores.iter().collect()
+            effective
+                .stores
+                .iter()
+                .filter(|s| can_read(principal, &s.name, &s.visibility))
+                .collect()
         } else {
             effective
                 .stores
@@ -150,6 +171,14 @@ impl SearchService {
     }
 }
 
+/// D7 read check over an `EffectiveStore`'s string `visibility`, treating an
+/// unrecognized value as `private` (deny by default) — see
+/// `StoreVisibility::parse`'s doc comment.
+fn can_read(principal: &Principal, name: &str, visibility: &str) -> bool {
+    let visibility = StoreVisibility::parse(visibility).unwrap_or(StoreVisibility::Private);
+    principal.can_read_store(name, visibility)
+}
+
 /// Resolve the exclusive end of the requested page (`offset + limit`) as a
 /// single checked computation, reused for `top_n`, the `next_cursor`
 /// comparison, and the `next_cursor` value (issue #187 review, finding G3) —
@@ -171,26 +200,4 @@ fn resolve_page_end(offset: usize, limit: usize) -> Result<usize, ApiError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // `clamp_search_limit`/`SEARCH_MAX_LIMIT` are re-exported from
-    // `localdb_core::search` (issue #187 review) — their own coverage lives
-    // in `localdb_core::search::tests::clamp_search_limit_*` rather than
-    // being duplicated here.
-
-    #[test]
-    fn resolve_page_end_adds_offset_and_limit() {
-        assert_eq!(resolve_page_end(3, 7).unwrap(), 10);
-        assert_eq!(resolve_page_end(0, 0).unwrap(), 0);
-    }
-
-    #[test]
-    fn resolve_page_end_rejects_overflow_as_invalid_request() {
-        let err = resolve_page_end(usize::MAX, 1).expect_err("overflow must be rejected");
-        match err.0 {
-            CoreError::InvalidRequest { .. } => {}
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
-    }
-}
+mod tests;

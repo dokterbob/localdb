@@ -14,6 +14,8 @@ $schema: {{SCHEMA_URL}}
 
 # --- HTTP daemon (`localdb serve`; values below are the defaults) ---
 server:
+  # auth: auto # auto | required | off; off requires a loopback bind
+  # public_url: https://localdb.example.com # OAuth public base URL behind a proxy
   bind: 127.0.0.1   # loopback only; set to 0.0.0.0 to listen on all interfaces
   port: 7700        # set to 0 to let the OS assign an ephemeral port
   job_workers: 1    # daemon job-queue workers; jobs for the same store never run concurrently

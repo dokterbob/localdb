@@ -40,6 +40,7 @@ pub(in crate::job_exec) async fn test_state() -> (TempDir, AppState) {
         dir.path().join("models"),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();
@@ -69,6 +70,8 @@ pub(in crate::job_exec) async fn test_state_with_backend(
     let db_path = dir.path().join("localdb.db");
     let config = localdb_core::StoreBackendConfig::local_path(db_path, dim, encoding);
     let backend = Arc::new(store_libsql::SqliteBackend::open(config).await.unwrap());
+    let auth_context =
+        crate::state::AuthContext::new(Arc::new(backend.auth_store()), crate::auth::AuthMode::Open);
     let state = AppState::from_backend(
         yaml,
         dir.path().to_path_buf(),
@@ -76,6 +79,7 @@ pub(in crate::job_exec) async fn test_state_with_backend(
         backend.clone() as Arc<dyn localdb_core::StoreBackend>,
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        auth_context,
     );
     (dir, state, backend)
 }

@@ -33,7 +33,7 @@ use crate::args::{GetChunksArgs, GetDocumentArgs, ListDocumentsArgs, SearchArgs}
 ///
 /// Content shape: `{"error": {"code": "...", "message": "..."}}`.
 /// Use `localdb_core::Error::code()` for the code when mapping a domain error.
-fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
+pub(crate) fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
     let v = serde_json::json!({
         "error": {
             "code": code,
@@ -190,7 +190,7 @@ fn resolve_content_length(content_length: Option<i64>) -> usize {
 // every `Err(CallToolResult)` call site in this crate is out of scope for
 // that change; allow the lint on the affected functions instead.
 #[allow(clippy::result_large_err)]
-fn select_mcp_stores(
+pub(crate) fn select_mcp_stores(
     stores: &[AvailableStore],
     store_names: &[String],
 ) -> Result<Vec<StoreHandle>, CallToolResult> {

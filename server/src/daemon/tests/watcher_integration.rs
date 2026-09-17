@@ -51,6 +51,7 @@ async fn watcher_file_change_triggers_reindex_visible_in_search() {
         dir_real.join("models"),
         queue.clone(),
         UrlRefreshScheduler::new(queue.clone()),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();
@@ -196,7 +197,12 @@ async fn watcher_file_change_triggers_reindex_visible_in_search() {
     // `vec![]` disables the Host check entirely (see `mcp_allowed_hosts`);
     // this test only drives `/v1/search` via `oneshot`, never `/mcp`, so
     // the allowlist behavior itself is untested here.
-    let app = build_router(state, vec![], Arc::new(FakeEmbedder::new(1)), vec![]);
+    let app = build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        Arc::new(FakeEmbedder::new(1)),
+        vec![],
+    );
 
     use axum::body::Body;
     use axum::http::Request;

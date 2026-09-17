@@ -1,23 +1,27 @@
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+
 use std::sync::Arc;
 
 use axum::{
     extract::Request,
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use localdb_core::{
-    config::{loader::ResolvedPaths, schema::RawConfig},
+    config::{
+        loader::ResolvedPaths,
+        schema::{RawConfig, ServerAuthMode},
+    },
     Embedder, Error,
 };
 
 use crate::{
+    auth::{self, AuthMode},
     handlers,
     job_queue::JobQueue,
     mcp_bridge,
@@ -56,8 +60,8 @@ impl std::fmt::Debug for DaemonHandle {
 /// Steps:
 /// 1. Bind the Unix discovery socket (fails fast if another daemon is running).
 /// 2. Bind the TCP listener at the configured `server.bind`/`server.port`. Any
-///    bind address is accepted (specs/05-surfaces.md §3); binding to all
-///    interfaces logs a warning since the daemon has no authentication.
+///    non-loopback bind requires authentication; binding to all interfaces
+///    logs a warning.
 /// 3. Record the daemon's client-reachable base URL in `daemon.url` so CLI/MCP
 ///    discovery finds it regardless of the configured bind address or port.
 pub async fn start_daemon(
@@ -66,8 +70,14 @@ pub async fn start_daemon(
     let bind_addr = options.config.server.bind.as_str();
     let port = options.config.server.port;
     let socket_guard = bind_socket_guard(&options)?;
-    let (state, url_scheduler) = build_daemon_state(&options).await?;
-    let (mcp_stores, mcp_embedder) = mcp_bridge::build_available_stores(&state).await?;
+    let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
+    warn_if_unspecified(bound_addr);
+    let auth_mode = resolve_auth_mode(bound_addr, options.config.server.auth)?;
+    let (state, url_scheduler) = build_daemon_state(&options, auth_mode).await?;
+    if let Some(code) = auth::generate_setup_code_if_needed(&state).await? {
+        eprintln!("One-time setup code: {code}");
+    }
+    let mcp_embedder = mcp_bridge::build_mcp_embedder(&state);
     // Bind first so `mcp_allowed_hosts` sees the actually-bound address
     // (wildcard aliases like `"0"`/`"[::]"` only resolve to a concrete
     // `SocketAddr` after binding — same reasoning as `warn_if_unspecified`
@@ -75,18 +85,16 @@ pub async fn start_daemon(
     // than the raw config string). `build_available_stores`'s embedder is a
     // `LazyEmbedder` and doesn't block on model loading, so reordering the
     // (cheap) router construction after the bind doesn't delay startup.
-    let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
-    warn_if_unspecified(bound_addr);
+
     let router = build_router(
         state.clone(),
-        mcp_stores,
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state.clone())),
         mcp_embedder,
         mcp_allowed_hosts(bound_addr),
     );
     let url_file_guard =
         UrlFileGuard::new(&options.paths.url_path(), &client_base_url(bound_addr))?;
 
-    spawn_config_watcher(options.paths.config_file.clone(), state.clone());
     spawn_url_scheduler(&state, url_scheduler);
 
     let handle = DaemonHandle {
@@ -104,6 +112,7 @@ fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
 
 async fn build_daemon_state(
     options: &DaemonOptions,
+    auth_mode: AuthMode,
 ) -> Result<(AppState, UrlRefreshScheduler), Error> {
     let queue = JobQueue::with_workers(options.config.server.job_workers);
     let url_scheduler = UrlRefreshScheduler::new(queue.clone());
@@ -113,6 +122,7 @@ async fn build_daemon_state(
         options.paths.models_dir.clone(),
         queue.clone(),
         url_scheduler.clone(),
+        auth_mode,
     )
     .await?;
     // `AppState::new` above requires an already-built `UrlRefreshScheduler`
@@ -142,15 +152,6 @@ async fn bind_tcp_listener(bind_addr: &str, port: u16) -> Result<(TcpListener, S
     info!("daemon listening on {}", bound_addr);
 
     Ok((listener, bound_addr))
-}
-
-fn spawn_config_watcher(config_file_path: PathBuf, state: AppState) {
-    tokio::spawn(async move {
-        let result = run_config_watcher(config_file_path, state).await;
-        if let Err(e) = result {
-            error!("config watcher failed: {}", e);
-        }
-    });
 }
 
 fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
@@ -210,17 +211,10 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///   GET/POST /jobs, GET/DELETE /jobs/{id}, GET /jobs/{id}/events, GET /status,
 ///   GET /config.
 ///
-/// `mcp_stores`/`mcp_embedder` are the startup-time snapshot built by
-/// `mcp_bridge::build_available_stores` (specs/05-surfaces.md §4) — see
-/// that function's doc comment for why `/mcp` doesn't see stores added
-/// later via `/v1/stores` without a restart. `nest_service` (rather than
-/// `route_service`) matches the mount pattern rmcp's own test suite uses
-/// for `StreamableHttpService` and composes fine with a `Router<AppState>`
-/// that also has `.with_state` routes: the mounted service handles
-/// `Request` directly and needs no state extraction.
+/// The MCP provider resolves the current registry on each tool call.
 pub fn build_router(
     state: AppState,
-    mcp_stores: Vec<mcp::AvailableStore>,
+    mcp_provider: Arc<dyn mcp::StoreProvider>,
     mcp_embedder: Arc<dyn Embedder>,
     mcp_allowed_hosts: Vec<String>,
 ) -> Router {
@@ -231,7 +225,9 @@ pub fn build_router(
     // `get_document`/`list_documents` tools see the same document registry
     // as every `/v1` route.
     let mcp_backend = state.backend_arc();
-    Router::new()
+    let default_principal =
+        (state.auth_mode() == AuthMode::Open).then(localdb_core::auth::Principal::local_trust);
+    let protected = Router::new()
         .route(
             "/v1/stores",
             get(handlers::list_stores).post(handlers::create_store),
@@ -261,14 +257,51 @@ pub fn build_router(
         .route("/v1/jobs/{id}/events", get(handlers::job_events))
         .route("/v1/status", get(handlers::get_status))
         .route("/v1/config", get(handlers::get_config))
-        .with_state(state)
+        .route("/v1/auth/me", get(handlers::get_me))
+        .route(
+            "/v1/users",
+            get(handlers::list_users).post(handlers::create_user),
+        )
+        .route(
+            "/v1/users/{id}",
+            patch(handlers::patch_user).delete(handlers::delete_user),
+        )
+        .route(
+            "/v1/users/{id}/keys",
+            get(handlers::list_keys).post(handlers::create_key),
+        )
+        .route("/v1/keys/{id}", delete(handlers::revoke_key))
+        .route(
+            "/v1/stores/{name}/grants",
+            get(handlers::list_grants).post(handlers::create_grant),
+        )
+        .route(
+            "/v1/stores/{name}/grants/{user}",
+            delete(handlers::delete_grant),
+        )
+        .route(
+            "/v1/invites",
+            get(handlers::list_invites).post(handlers::create_invite),
+        )
+        .route("/v1/invites/{id}", delete(handlers::revoke_invite))
+        .route("/v1/invites/requests", get(handlers::list_access_requests))
+        .route(
+            "/v1/invites/requests/{id}/approve",
+            post(handlers::approve_access_request),
+        )
+        .route(
+            "/v1/invites/requests/{id}/deny",
+            post(handlers::deny_access_request),
+        )
+        .with_state(state.clone())
         .nest_service(
             "/mcp",
             mcp::build_streamable_http_service(
-                mcp_stores,
+                mcp_provider,
                 mcp_backend,
                 mcp_embedder,
                 mcp_allowed_hosts,
+                default_principal,
             ),
         )
         // Applied *after* `nest_service` so this layer wraps the whole
@@ -277,6 +310,36 @@ pub fn build_router(
         // `mcp_allowed_hosts`) would otherwise never reach a log at all
         // (issue #147). A layer added before `nest_service` would only wrap
         // the routes already present at that point.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::middleware::require_auth,
+        ));
+    let public = Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(handlers::oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(handlers::oauth_authorization_server),
+        )
+        .route(
+            "/authorize",
+            get(auth::oauth::get_authorize).post(auth::oauth::post_authorize),
+        )
+        .route("/token", post(auth::oauth::post_token))
+        .route("/revoke", post(auth::oauth::post_revoke))
+        .route("/register", post(auth::register::post_register))
+        .route("/v1/invites/redeem", post(handlers::redeem_invite_public))
+        .route(
+            "/v1/invites/requests/{id}",
+            get(handlers::poll_access_request),
+        )
+        .layer(middleware::from_fn(auth::middleware::protect_auth_response))
+        .with_state(state);
+
+    public
+        .merge(protected)
         .layer(middleware::from_fn(log_rejected_responses))
 }
 
@@ -320,24 +383,22 @@ async fn log_rejected_responses(request: Request, next: Next) -> Response {
     response
 }
 
-/// Warn when the actually-bound address is unspecified (all interfaces).
-///
-/// Per specs/05-surfaces.md §3: the daemon has no authentication, so binding to
-/// all interfaces makes it reachable from any network the machine is on. Binding
-/// to a specific non-loopback address (e.g. a LAN/VPN IP) is treated as a
-/// deliberate trust decision and doesn't warn.
-///
-/// This checks the address the OS actually bound (`SocketAddr::ip().is_unspecified()`)
-/// rather than the raw config string, so wildcard aliases the string form can't see —
-/// `"0"`, `"[::]"`, `"000.000.000.000"` — are still caught.
-fn warn_if_unspecified(bound_addr: SocketAddr) {
-    if bound_addr.ip().is_unspecified() {
-        warn!(
-            bind = %bound_addr.ip(),
-            "binding to all interfaces ({}); the daemon has no authentication and will be \
-             reachable from any network this machine is on",
-            bound_addr.ip()
-        );
+/// Resolve authentication against the actual bound address.
+pub fn resolve_auth_mode(bound: SocketAddr, mode_cfg: ServerAuthMode) -> Result<AuthMode, Error> {
+    let loopback = bound.ip().is_loopback();
+    match mode_cfg {
+        ServerAuthMode::Required => Ok(AuthMode::Enforced),
+        ServerAuthMode::Auto if loopback => Ok(AuthMode::Open),
+        ServerAuthMode::Auto => Ok(AuthMode::Enforced),
+        ServerAuthMode::Off if loopback => Ok(AuthMode::Open),
+        ServerAuthMode::Off => Err(Error::InvalidConfig {
+            message: format!(
+                "server.auth is 'off' but the daemon is bound to the non-loopback address {} — \
+                 refusing to expose an unauthenticated surface to a network. Use a loopback \
+                 bind, or set server.auth to 'auto' or 'required'.",
+                bound.ip()
+            ),
+        }),
     }
 }
 
@@ -397,47 +458,9 @@ fn client_base_url(bound_addr: SocketAddr) -> String {
     }
 }
 
-/// Watch the config file for changes and reload the YAML config snapshot.
-///
-/// Non-fatal: logs errors but does not stop the daemon.
-async fn run_config_watcher(config_file: PathBuf, state: AppState) -> Result<(), Error> {
-    let parent = config_file.parent().ok_or_else(|| Error::InvalidConfig {
-        message: "config file has no parent directory".to_string(),
-    })?;
+#[cfg(test)]
+mod tests;
 
-    let (mut rx, _handle) =
-        crate::watcher::watch_path(parent, 300).map_err(|e| Error::Internal {
-            message: format!(
-                "cannot start config watcher for '{}': {e}",
-                config_file.display()
-            ),
-            correlation_id: "daemon_config_reload".into(),
-        })?;
-
-    info!("config watcher started for: {}", config_file.display());
-
-    while let Some(event) = rx.recv().await {
-        if event.path == config_file {
-            info!("config file changed, reloading: {}", config_file.display());
-            match reload_config_file(&config_file) {
-                Ok(new_config) => {
-                    state.reload_yaml_config(new_config).await;
-                    info!("config reloaded successfully");
-                }
-                Err(e) => {
-                    error!("config reload failed: {}", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Parse a human-readable refresh interval string (e.g. "24h", "30m", "3600s") to seconds.
-///
-/// Returns `None` if the string is unparseable, empty, or would overflow `u64`.
-/// Uses checked arithmetic to guard against integer overflow for very large values.
 pub fn parse_refresh_interval(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -454,24 +477,13 @@ pub fn parse_refresh_interval(s: &str) -> Option<u64> {
     }
 }
 
-/// Read, parse **and validate** the config file.
-///
-/// `load_config_from_str`, not a bare `serde_yaml::from_str`: hot-reload has
-/// to apply the same validation the startup path does, or a value that is
-/// syntactically fine but semantically rejected (`http.rate_limit.burst: 0`,
-/// an `http.user_agent` that is not a legal header value) enters a running
-/// daemon through the file watcher and fails later, opaquely, at the point of
-/// use — which is precisely what validating at load time exists to prevent.
-fn reload_config_file(path: &Path) -> Result<RawConfig, Error> {
-    let contents = std::fs::read_to_string(path).map_err(|e| Error::Internal {
-        message: format!("cannot read config file '{}': {e}", path.display()),
-        correlation_id: "daemon_config_reload".into(),
-    })?;
-    localdb_core::config::load_config_from_str(&contents).map_err(|e| Error::Internal {
-        message: format!("cannot load config file '{}': {e}", path.display()),
-        correlation_id: "daemon_config_reload".into(),
-    })
+fn warn_if_unspecified(bound_addr: SocketAddr) {
+    if bound_addr.ip().is_unspecified() {
+        warn!(
+            bind = %bound_addr.ip(),
+            "binding to all interfaces ({}); the daemon will be reachable from any network \
+             this machine is on",
+            bound_addr.ip()
+        );
+    }
 }
-
-#[cfg(test)]
-mod tests;

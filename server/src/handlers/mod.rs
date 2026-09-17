@@ -21,30 +21,69 @@
 //!   DELETE /jobs/:id              — cancel a queued or running job
 //!   GET  /jobs/:id/events         — stream live job progress (SSE)
 //!   GET  /status                  — daemon status
-//!   GET  /config                  — resolved config
+//!   GET  /config                  — resolved config (startup snapshot; no hot-reload)
+//!   GET  /auth/me                 — the caller's authenticated principal
 
+use axum::Extension;
 use serde::{Deserialize, Serialize};
+
+use localdb_core::{auth::Principal, Error as CoreError};
 
 use crate::error::ApiError;
 
+mod auth;
 mod config;
+mod discovery;
 mod documents;
+mod grants;
+mod invites;
 mod jobs;
+mod keys;
 mod search;
 mod sources;
 mod status;
 mod stores;
+mod users;
 
+pub use auth::get_me;
 pub use config::get_config;
+pub use discovery::{oauth_authorization_server, oauth_protected_resource};
+
+pub use grants::{create_grant, delete_grant, list_grants};
+pub use invites::{
+    approve_request as approve_access_request, create_invite, deny_request as deny_access_request,
+    list_access_requests, list_invites, poll_request as poll_access_request,
+    redeem_invite as redeem_invite_public, revoke_invite,
+};
+
 pub use documents::{get_document, list_documents};
 pub use jobs::{cancel_job, create_job, get_job, job_events, list_jobs};
+pub use keys::{create_key, list_keys, revoke_key};
 pub use search::search;
 pub use sources::{create_source, delete_source, list_sources};
 pub use status::get_status;
 pub use stores::{create_store, delete_store, get_store, list_stores, patch_store};
+pub use users::{create_user, delete_user, list_users, patch_user};
 
 #[cfg(test)]
 mod tests;
+
+/// Pull the `Principal` the `require_auth` middleware inserted out of the
+/// request extensions, failing closed (`Unauthorized`) if it is absent —
+/// mirrors `handlers::auth::get_me`'s existing convention. A missing
+/// extension means this route was reached without the auth layer running
+/// (e.g. a handler unit test that builds a bare router with no
+/// `require_auth` layer); every real request path always carries one,
+/// `Principal::local_trust()` included in open mode.
+pub(crate) fn require_principal(
+    principal: Option<Extension<Principal>>,
+) -> Result<Principal, ApiError> {
+    principal.map(|Extension(p)| p).ok_or_else(|| {
+        ApiError(CoreError::Unauthorized {
+            message: "no authenticated principal on this request".to_string(),
+        })
+    })
+}
 
 /// Cursor-based pagination parameters (from specs/05-surfaces.md §3).
 #[derive(Debug, Deserialize)]
@@ -168,4 +207,27 @@ mod paginated_list_tests {
         let list = PaginatedList::new(Vec::<&str>::new(), 10, usize::MAX, 5);
         assert_eq!(list.next_cursor, None);
     }
+}
+
+pub(super) async fn readable_store_names(
+    state: &crate::state::AppState,
+    principal: &localdb_core::auth::Principal,
+    requested: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let stores = state.backend().list_stores().await?;
+    for name in requested {
+        let store = stores
+            .iter()
+            .find(|s| &s.name == name)
+            .ok_or_else(|| localdb_core::Error::StoreNotFound { id: name.clone() })?;
+        principal.require_read_store(&store.name, store.visibility.clone())?;
+    }
+    Ok(stores
+        .into_iter()
+        .filter(|s| {
+            (requested.is_empty() || requested.contains(&s.name))
+                && principal.can_read_store(&s.name, s.visibility.clone())
+        })
+        .map(|s| s.name)
+        .collect())
 }

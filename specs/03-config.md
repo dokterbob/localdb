@@ -13,6 +13,14 @@ version: 1
 server:
   bind: 127.0.0.1 # local-only by default; see 05-surfaces.md §3
   port: 7700
+  auth:
+    auto # auto | required | off — default auto: enforced iff bound non-loopback;
+    #   required: always enforced; off: hard error if bind is non-loopback.
+    #   See 05-surfaces.md §3.1.
+  # public_url: https://localdb.example.com   # optional; only set behind a TLS-terminating
+  #   reverse proxy — used as the OAuth issuer/resource identifier in
+  #   the .well-known responses (05-surfaces.md §3.1). Must be an absolute HTTP(S) URL
+  #   without credentials, query, or fragment; optional path prefixes are allowed.
   job_workers: 1 # daemon job-queue workers; see §5
 
 paths: # all optional; platform defaults in §4
@@ -186,6 +194,14 @@ unified database, keyed by `(ingestor_kind, source_id, key)`. The values are sto
 (details TBD per ingestor). Interactive credential setup is handled by the ingestor's setup flow in
 `cli`, not by YAML config.
 
+**`credentials.json`** (auth, [05-surfaces.md](05-surfaces.md) §3.1): a separate file, `0600`
+permissions, living next to `config.yaml` (§4), that caches locally-issued API keys/tokens the CLI
+uses to authenticate to a given daemon. Keyed by the daemon's base URL, so a machine talking to
+multiple daemons keeps a separate cached credential per one. Written by `localdb login` (planned,
+§3.1) and read by every daemon-attached command. Never written into or read from the YAML config —
+it is credential material, not declarative config. The `LOCALDB_API_KEY` environment variable, when
+set, overrides the cached credential for that invocation.
+
 ## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx`)
 
 The default local model `pplx-embed-context-v1-0.6b` can run on two backends; three `provider`
@@ -246,8 +262,8 @@ no store here yet" instead of surfacing it.
 (`config.yaml.tmp-<pid>-<ulid>`) in the same directory as the target, then hard-linked into place; a
 concurrent racer that loses the link race (`AlreadyExists`) is treated as success rather than an
 error, since every racer is writing byte-identical content. The temp file is removed in every case
-(success, lost race, or hard failure). This guarantees a concurrent reader — in particular the
-daemon's config file watcher — never observes partial content.
+(success, lost race, or hard failure). This guarantees a concurrent reader — in particular the next
+config reader — never observes partial content. Configuration changes require a daemon restart.
 
 **An explicit `--config` with a missing parent directory is still a hard failure, exit 2, on every
 surface that scaffolds** — not only `init`. Previously the CLI's lenient path silently fell back to

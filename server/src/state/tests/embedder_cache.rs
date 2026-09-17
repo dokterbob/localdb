@@ -12,7 +12,7 @@ use super::common::make_state;
 #[tokio::test]
 async fn get_or_build_embedder_builds_once_across_repeated_calls() {
     let (_dir, state) = make_state().await;
-    let yaml = state.yaml_config().await;
+    let yaml = state.yaml_config().clone();
 
     let a = state.get_or_build_embedder(&yaml).await.unwrap();
     let b = state.get_or_build_embedder(&yaml).await.unwrap();
@@ -38,7 +38,7 @@ async fn get_or_build_embedder_builds_once_across_repeated_calls() {
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_on_policy_change() {
     let (_dir, state) = make_state().await;
-    let mut yaml = state.yaml_config().await;
+    let mut yaml = state.yaml_config().clone();
 
     let first = state.get_or_build_embedder(&yaml).await.unwrap();
 
@@ -64,14 +64,13 @@ async fn get_or_build_embedder_rebuilds_on_policy_change() {
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_once_after_config_reload() {
     let (_dir, state) = make_state().await;
-    let old_yaml = state.yaml_config().await;
+    let old_yaml = state.yaml_config().clone();
     let old = state.get_or_build_embedder(&old_yaml).await.unwrap();
 
     let mut new_yaml = old_yaml.clone();
     new_yaml.defaults.indexing.embedding.model = "reloaded-model".to_string();
-    state.reload_yaml_config(new_yaml).await;
 
-    let reloaded_yaml = state.yaml_config().await;
+    let reloaded_yaml = new_yaml.clone();
     let rebuilt = state.get_or_build_embedder(&reloaded_yaml).await.unwrap();
     let rebuilt_again = state.get_or_build_embedder(&reloaded_yaml).await.unwrap();
 
@@ -98,19 +97,17 @@ async fn get_or_build_embedder_rebuilds_once_after_config_reload() {
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_on_provider_settings_change() {
     let (_dir, state) = make_state().await;
-    let mut old_yaml = state.yaml_config().await;
+    let mut old_yaml = state.yaml_config().clone();
     old_yaml.providers = vec![localdb_core::config::schema::ProviderConfig {
         name: "hosted".to_string(),
         kind: "openai-compatible".to_string(),
         base_url: Some("https://old.example.com".to_string()),
         api_key_env: Some("OLD_API_KEY".to_string()),
     }];
-    state.reload_yaml_config(old_yaml.clone()).await;
     let first = state.get_or_build_embedder(&old_yaml).await.unwrap();
 
     let mut new_yaml = old_yaml.clone();
     new_yaml.providers[0].base_url = Some("https://new.example.com".to_string());
-    state.reload_yaml_config(new_yaml.clone()).await;
     let second = state.get_or_build_embedder(&new_yaml).await.unwrap();
 
     assert_eq!(
@@ -135,12 +132,11 @@ async fn get_or_build_embedder_rebuilds_on_provider_settings_change() {
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_on_http_config_change() {
     let (_dir, state) = make_state().await;
-    let old_yaml = state.yaml_config().await;
+    let old_yaml = state.yaml_config().clone();
     let first = state.get_or_build_embedder(&old_yaml).await.unwrap();
 
     let mut new_yaml = old_yaml.clone();
     new_yaml.http.max_retries = old_yaml.http.max_retries + 1;
-    state.reload_yaml_config(new_yaml.clone()).await;
     let second = state.get_or_build_embedder(&new_yaml).await.unwrap();
 
     assert_eq!(

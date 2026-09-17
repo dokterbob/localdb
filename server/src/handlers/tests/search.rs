@@ -120,8 +120,8 @@ async fn search_returns_citations_after_indexing() {
     .await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -160,8 +160,8 @@ async fn search_with_nonexistent_store_filter_returns_empty() {
     .await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -190,8 +190,8 @@ async fn search_pagination_page_two_is_disjoint_from_page_one() {
     seed_many_chunks(&state, 30).await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -224,8 +224,8 @@ async fn search_limit_is_silently_clamped_to_the_max_instead_of_erroring() {
     seed_many_chunks(&state, 210).await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -264,8 +264,8 @@ async fn search_pagination_walk_to_exhaustion_covers_all_results_without_duplica
     let seeded_set: HashSet<_> = seeded_ids.into_iter().collect();
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -353,8 +353,8 @@ async fn search_path_filter_narrows_to_matching_uri_prefix() {
     .await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );

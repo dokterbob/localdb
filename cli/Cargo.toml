@@ -23,12 +23,17 @@ localdb-fetch = { path = "../fetch", version = "0.2.0" }
 localdb-mcp = { path = "../mcp", version = "0.2.0" }
 localdb-server = { path = "../server", version = "0.2.0" }
 tokio = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 indicatif = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+webbrowser = "1"
+fs2 = "0.4"
 percent-encoding = { workspace = true }
 # `bytes_stream()` on a `reqwest::Response` yields a `futures_util::Stream`
 # (re-exported by `futures`, already a pinned workspace dependency used by

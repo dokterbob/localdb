@@ -96,7 +96,7 @@ async fn vacuum_shrinks_store_file_after_bulk_delete_and_search_still_works() {
                 backend: "libsql".to_string(),
                 indexing_policy: "{}".to_string(),
                 policy_version: "v1".to_string(),
-                acl: "{}".to_string(),
+
                 created_at: "2026-06-25T12:00:00Z".to_string(),
             })
             .await
