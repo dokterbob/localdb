@@ -2,41 +2,11 @@ use super::super::*;
 
 use tempfile::TempDir;
 
-#[test]
-fn base_url_of_extracts_origin_with_port() {
-    assert_eq!(
-        base_url_of("http://127.0.0.1:7700/v1/stores").as_deref(),
-        Some("http://127.0.0.1:7700")
-    );
-}
-
-#[test]
-fn base_url_of_preserves_bracketed_ipv6() {
-    assert_eq!(
-        base_url_of("http://[::1]:7700/v1/status").as_deref(),
-        Some("http://[::1]:7700")
-    );
-}
-
-#[test]
-fn base_url_of_without_port() {
-    assert_eq!(
-        base_url_of("https://daemon.example.com/v1/search").as_deref(),
-        Some("https://daemon.example.com")
-    );
-}
-
-/// Regression test for a reviewer claim that an IPv6 daemon origin key
-/// might be written one way (e.g. by `login`, from the raw base URL
-/// `probe_daemon`/`daemon.url` hand out) and looked up another way (via
-/// `base_url_of` on the constructed request URL), causing a bracket
-/// mismatch and a spurious 401. Both sides in fact go through the same
-/// canonical `scheme://[host]:port` shape — `daemon.url` is written from
-/// `std::net::SocketAddr`'s `Display` impl, which already brackets IPv6
-/// (`[::1]:7700`), and `base_url_of` reserializes via `url::Url`, which
-/// also brackets IPv6 host_str. This test writes a credential keyed by
-/// the raw bracketed base URL (as `login` would) and confirms
-/// `bearer_for_request` on a URL built from that same base URL finds it.
+/// `bearer_for_request` matches the stored key against the full request
+/// URL by string prefix, with no URL reparsing on either side — a
+/// credential keyed by a bracketed IPv6 base URL (as `login` writes it,
+/// from `daemon.url`'s `SocketAddr` display) is found for a request built
+/// from that same base URL.
 #[test]
 fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
     let dir = TempDir::new().unwrap();
@@ -72,16 +42,22 @@ fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
 // -----------------------------------------------------------------
 
 /// A minimal stateful mock daemon (hand-rolled raw TCP, mirroring
-/// `localdb/tests/auth_cli.rs`'s style): any non-`/token` route answers
-/// 401 unless `Authorization: Bearer new_access` is presented; `POST
-/// /token` with `grant_type=refresh_token&refresh_token=old_refresh`
-/// answers a fresh `new_access`/`new_refresh` pair, anything else
-/// `invalid_grant`.
+/// `localdb/tests/auth_cli.rs`'s style): any route under `{token_prefix}/token`
+/// answers a refresh grant; every other route answers 401 unless
+/// `Authorization: Bearer new_access` is presented. `token_prefix` is empty
+/// for a bare-origin daemon, or a path like `/team` for a path-prefixed one.
 fn start_refresh_mock_daemon() -> u16 {
+    start_refresh_mock_daemon_with_prefix("")
+}
+
+/// `POST {token_prefix}/token` with `grant_type=refresh_token&refresh_token=old_refresh`
+/// answers a fresh `new_access`/`new_refresh` pair, anything else `invalid_grant`.
+fn start_refresh_mock_daemon_with_prefix(token_prefix: &str) -> u16 {
     use std::io::{BufRead, BufReader, Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock daemon");
     let port = listener.local_addr().unwrap().port();
+    let token_path = format!("{token_prefix}/token");
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -118,7 +94,7 @@ fn start_refresh_mock_daemon() -> u16 {
             }
             let body = String::from_utf8_lossy(&body).to_string();
 
-            let response = if path.starts_with("/token") {
+            let response = if path.starts_with(&token_path) {
                 if body.contains("grant_type=refresh_token")
                     && body.contains("refresh_token=old_refresh")
                 {
@@ -203,6 +179,52 @@ async fn expired_access_token_is_retried_once_with_refreshed_token() {
     assert!(
         result.is_ok(),
         "expired-token retry should succeed: {:?}",
+        result.err()
+    );
+
+    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+    assert_eq!(entry.access_token.as_deref(), Some("new_access"));
+    assert_eq!(entry.refresh_token.as_deref(), Some("new_refresh"));
+}
+
+/// A daemon served behind a path prefix: the credential is keyed by the
+/// prefixed base URL (`.../team`), not its bare origin. The first request's
+/// bearer lookup finds it by prefix match, the 401 retry's refresh grant
+/// posts to `.../team/token`, and the rotated pair is written back under
+/// that same `.../team` key.
+#[tokio::test]
+async fn path_prefixed_daemon_credential_is_found_and_refreshed_under_the_same_key() {
+    let dir = TempDir::new().unwrap();
+    let config_file = dir.path().join("config.yaml");
+    std::fs::write(&config_file, "version: 1\n").unwrap();
+    let port = start_refresh_mock_daemon_with_prefix("/team");
+    let base_url = format!("http://127.0.0.1:{port}/team");
+
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    crate::credentials::write_entry(
+        &credentials_file,
+        &base_url,
+        crate::credentials::CredentialEntry {
+            secret: None,
+            access_token: Some("old_access".to_string()),
+            refresh_token: Some("old_refresh".to_string()),
+            access_expires_at: None,
+        },
+    )
+    .unwrap();
+
+    let ctx = ctx_with_config(&config_file);
+    let result = daemon_request_async(
+        &ctx,
+        reqwest::Method::GET,
+        &format!("{base_url}/v1/status"),
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "the path-prefixed credential must be found and refreshed: {:?}",
         result.err()
     );
 

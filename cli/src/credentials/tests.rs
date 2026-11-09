@@ -301,6 +301,93 @@ fn legacy_secret_only_file_still_reads_via_lookup_entry() {
     assert!(entry.access_token.is_none());
 }
 
+// -----------------------------------------------------------------
+// Path-prefixed daemon credentials: a stored key is the longest
+// path-segment prefix of the request URL, not just its origin.
+// -----------------------------------------------------------------
+
+#[test]
+fn lookup_entry_for_url_matches_a_path_prefixed_daemon() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"https://example.com/team":{"secret":"ldb_team"}}}"#,
+    );
+    let (key, entry) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
+    assert_eq!(key, "https://example.com/team");
+    assert_eq!(entry.secret.as_deref(), Some("ldb_team"));
+}
+
+#[test]
+fn lookup_entry_for_url_requires_a_path_segment_boundary() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"https://example.com/team":{"secret":"ldb_team"}}}"#,
+    );
+    assert!(
+        lookup_entry_for_url(&path, "https://example.com/teamX/v1").is_none(),
+        "a sibling path that merely shares a string prefix must not match"
+    );
+}
+
+#[test]
+fn lookup_entry_for_url_prefers_the_longest_matching_prefix() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        concat!(
+            r#"{"version":1,"credentials":{"#,
+            r#""https://example.com":{"secret":"ldb_origin"},"#,
+            r#""https://example.com/team":{"secret":"ldb_team"}"#,
+            r#"}}"#
+        ),
+    );
+    let (key, entry) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
+    assert_eq!(key, "https://example.com/team");
+    assert_eq!(entry.secret.as_deref(), Some("ldb_team"));
+}
+
+#[test]
+fn lookup_entry_for_url_trailing_slash_on_stored_key_is_equivalent() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"https://example.com/team/":{"secret":"ldb_team"}}}"#,
+    );
+    let (key, entry) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
+    assert_eq!(key, "https://example.com/team/");
+    assert_eq!(entry.secret.as_deref(), Some("ldb_team"));
+}
+
+#[test]
+fn lookup_entry_for_url_origin_only_entry_still_matches_origin_requests() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"http://127.0.0.1:7700":{"secret":"ldb_cached"}}}"#,
+    );
+    let (key, entry) = lookup_entry_for_url(&path, "http://127.0.0.1:7700/v1/status").unwrap();
+    assert_eq!(key, "http://127.0.0.1:7700");
+    assert_eq!(entry.secret.as_deref(), Some("ldb_cached"));
+}
+
+#[test]
+fn resolve_bearer_matches_a_path_prefixed_daemon_request() {
+    let dir = TempDir::new().unwrap();
+    write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"https://example.com/team":{"secret":"ldb_team"}}}"#,
+    );
+    let config_file = dir.path().join("config.yaml");
+    let resolved = resolve_bearer(
+        None,
+        Some(&config_file),
+        "https://example.com/team/v1/stores",
+    );
+    assert_eq!(resolved.as_deref(), Some("ldb_team"));
+}
+
 #[tokio::test]
 async fn locked_mutations_preserve_concurrent_origins_and_release_on_drop() {
     let dir = TempDir::new().unwrap();

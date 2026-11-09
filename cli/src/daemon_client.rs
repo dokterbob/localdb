@@ -138,30 +138,16 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
 // writing directly to the embedded store. This thin client issues the
 // appropriate HTTP requests and maps responses to exit codes.
 
-/// The `credentials.json` key for a request URL: its origin
-/// (`scheme://host[:port]`), matching the base URLs `probe_daemon` hands
-/// out (which always carry an explicit port). The port is preserved exactly
-/// as written rather than normalized to a scheme default, so the key
-/// round-trips byte-for-byte with what the daemon recorded in `daemon.url`.
-fn base_url_of(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    let scheme = parsed.scheme();
-    Some(match parsed.port() {
-        Some(port) => format!("{scheme}://{host}:{port}"),
-        None => format!("{scheme}://{host}"),
-    })
-}
-
 /// Resolve the bearer secret for a daemon request per specs/03-config.md §6:
 /// `LOCALDB_API_KEY` (read once into `ctx.api_key`) wins; otherwise the
-/// `credentials.json` next to the resolved config file, keyed by the
-/// request's base URL. `None` sends the request without an Authorization
-/// header (fine against an open-mode daemon).
+/// `credentials.json` next to the resolved config file, whose key is the
+/// longest path-segment prefix of `url` — covering both a bare-origin
+/// daemon and one served behind a path (e.g. `https://example.com/team`).
+/// `None` sends the request without an Authorization header (fine against
+/// an open-mode daemon).
 fn bearer_for_request(ctx: &CliContext, url: &str) -> Option<String> {
-    let base_url = base_url_of(url)?;
     let config_file = resolved_config_file(ctx);
-    crate::credentials::resolve_bearer(ctx.api_key.as_deref(), config_file.as_deref(), &base_url)
+    crate::credentials::resolve_bearer(ctx.api_key.as_deref(), config_file.as_deref(), url)
 }
 
 pub(crate) fn resolved_config_file(ctx: &CliContext) -> Option<std::path::PathBuf> {
@@ -251,9 +237,13 @@ async fn redeem_refresh_token(
 }
 
 /// Attempt a refresh-grant exchange for the stored refresh token (if any)
-/// against `base_url`'s `/token` endpoint, persisting the rotated pair on
-/// success. Returns the new access token to retry with, or `None` if there
-/// was nothing to refresh or the refresh itself failed — either way the
+/// against the matching credentials-file key's `/token` endpoint,
+/// persisting the rotated pair on success. The key is resolved from `url`
+/// by the same longest-path-segment-prefix match `bearer_for_request` uses,
+/// so a path-prefixed daemon refreshes under the key its credential was
+/// written under rather than a re-derived origin. Returns the new access
+/// token to retry with, or `None` if there was nothing to refresh, no
+/// stored key matched `url`, or the refresh itself failed — either way the
 /// caller falls through to surfacing the original 401.
 ///
 /// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
@@ -264,8 +254,10 @@ async fn try_refresh_and_persist(
     url: &str,
     rejected: Option<&str>,
 ) -> Option<String> {
-    let base_url = base_url_of(url)?;
-    refresh_cached_bearer(ctx, &base_url, rejected).await
+    let config_file = resolved_config_file(ctx)?;
+    let path = crate::credentials::credentials_path(&config_file);
+    let (key, _) = crate::credentials::lookup_entry_for_url(&path, url)?;
+    refresh_cached_bearer(ctx, &key, rejected).await
 }
 
 /// One serialized path for reactive HTTP refresh and proactive MCP refresh.

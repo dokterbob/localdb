@@ -97,12 +97,60 @@ pub(crate) fn lookup_entry(credentials_file: &Path, base_url: &str) -> Option<Cr
     file.credentials.get(normalize_base_url(base_url)).cloned()
 }
 
-/// Look up the cached secret for `base_url`: an `access_token` (from
-/// `localdb login`) is preferred when present, falling back to the legacy
-/// `secret` (API key) field. Any failure (missing file, malformed JSON,
-/// absent key) is a silent `None` — a missing credential simply means the
-/// request goes out without a bearer token, and the daemon answers 401 with
-/// a clear message if it needed one.
+/// Normalize a request URL for prefix matching against a stored
+/// credentials-file key: drop any query string or fragment, then a trailing
+/// slash, so `https://x/team?foo=1` and `https://x/team/` compare the same
+/// way `https://x/team` does.
+fn normalize_request_url(url: &str) -> &str {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.trim_end_matches('/')
+}
+
+/// Find the stored key that is the longest path-segment prefix of `url`: an
+/// exact match, or a stored key immediately followed by `/` in `url` — so a
+/// daemon served at `https://example.com/team` matches a request to
+/// `https://example.com/team/v1/stores` but not to
+/// `https://example.com/teamX/v1`. A daemon served at a bare origin is
+/// covered the same way, since the origin is then the whole key. When
+/// several stored keys match (e.g. both an origin and a path under it), the
+/// longest one wins.
+fn match_key<'a>(file: &'a CredentialsFile, url: &str) -> Option<&'a str> {
+    let url = normalize_request_url(url);
+    file.credentials
+        .keys()
+        .filter(|key| {
+            let key = key.trim_end_matches('/');
+            url == key || (url.starts_with(key) && url[key.len()..].starts_with('/'))
+        })
+        .max_by_key(|key| key.trim_end_matches('/').len())
+        .map(String::as_str)
+}
+
+/// Look up the cached entry whose key matches `url` by the longest
+/// path-segment prefix (see [`match_key`]), returning the matched key
+/// alongside the entry so a caller that refreshes and writes back a token
+/// writes under the same key the request matched, not a re-derived one.
+pub(crate) fn lookup_entry_for_url(
+    credentials_file: &Path,
+    url: &str,
+) -> Option<(String, CredentialEntry)> {
+    let file = load_file(credentials_file);
+    let key = match_key(&file, url)?.to_string();
+    let entry = file.credentials.get(&key)?.clone();
+    Some((key, entry))
+}
+
+/// Look up the cached secret for an exact `base_url` key: an `access_token`
+/// (from `localdb login`) is preferred when present, falling back to the
+/// legacy `secret` (API key) field. Any failure (missing file, malformed
+/// JSON, absent key) is a silent `None`. A test helper for asserting what a
+/// known key round-trips to; production code resolves a request's bearer
+/// through [`resolve_bearer`]'s path-segment-prefix match instead.
+#[cfg(test)]
 pub(crate) fn lookup_secret(credentials_file: &Path, base_url: &str) -> Option<String> {
     let entry = lookup_entry(credentials_file, base_url)?;
     entry.access_token.or(entry.secret)
@@ -110,13 +158,15 @@ pub(crate) fn lookup_secret(credentials_file: &Path, base_url: &str) -> Option<S
 
 /// Resolve the bearer secret for a daemon request:
 /// 1. `api_key` (from `LOCALDB_API_KEY`, read once at startup) if set;
-/// 2. else the `credentials.json` entry next to `config_file` keyed by
-///    `base_url`;
+/// 2. else the `credentials.json` entry next to `config_file` whose key is
+///    the longest path-segment prefix of `request_url` — so a daemon served
+///    behind a path (e.g. `https://example.com/team`) matches a request to
+///    `https://example.com/team/v1/stores` rather than only its bare origin;
 /// 3. else `None` (send no Authorization header).
 pub(crate) fn resolve_bearer(
     api_key: Option<&str>,
     config_file: Option<&Path>,
-    base_url: &str,
+    request_url: &str,
 ) -> Option<String> {
     if let Some(key) = api_key {
         if !key.is_empty() {
@@ -124,7 +174,8 @@ pub(crate) fn resolve_bearer(
         }
     }
     let config_file = config_file?;
-    lookup_secret(&credentials_path(config_file), base_url)
+    let (_, entry) = lookup_entry_for_url(&credentials_path(config_file), request_url)?;
+    entry.access_token.or(entry.secret)
 }
 
 /// A stable sibling lock survives replacement of credentials.json. Hold it across
