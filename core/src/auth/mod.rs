@@ -23,7 +23,7 @@ pub use client::{
     MAX_REGISTRATION_REDIRECT_URIS, MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI,
     SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
 };
-pub use principal::{Principal, Role, StoreAccess};
+pub use principal::{Principal, Role, SessionOrigin, StoreAccess};
 pub use service::{
     AuthService, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome, RedeemOutcome,
 };

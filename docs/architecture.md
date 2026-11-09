@@ -230,8 +230,10 @@ setup code. Established accounts do not reopen setup. These operations live in t
 service, independent of terminal, browser, or future native UI presentation.
 
 **Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a blake3
-hash. Access tokens are short-lived (1h); refresh tokens (30d) rotate on every use with reuse
-detection (presenting an already-rotated refresh token revokes its whole family). API keys
+hash. A login session mints an access token (1h) and a refresh token (30d) sharing one rotation
+family; refresh tokens rotate on every use with reuse detection — presenting an already-rotated
+refresh token revokes its whole family, which covers every access token issued under that session
+(not just later rotations) plus any API key minted while authenticated by it. API keys
 (`localdb key create`) share the same token table, never expire by default, and track
 `last_used_at`.
 

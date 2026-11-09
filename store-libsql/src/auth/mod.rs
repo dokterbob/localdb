@@ -132,6 +132,11 @@ impl AuthStore for LibsqlAuthStore {
         tokens::revoke_token_family(&self.conn, family_id, &now).await
     }
 
+    async fn revoke_compromised_family(&self, family_id: &str) -> Result<u64, Error> {
+        let now = localdb_core::ingestion::now_rfc3339();
+        tokens::revoke_compromised_family(&self.conn, family_id, &now).await
+    }
+
     async fn mark_token_used(&self, id: &str, used_at: &str) -> Result<(), Error> {
         tokens::mark_token_used(&self.conn, id, used_at).await
     }

@@ -92,6 +92,59 @@ async fn revoke_token_family_revokes_all_members_only() {
 }
 
 #[tokio::test]
+async fn revoke_compromised_family_hits_family_members_and_tainted_rows_only() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
+        .await
+        .unwrap();
+
+    let mut refresh = make_token("t1", "u1", TokenKind::Refresh, "hash-a");
+    refresh.family_id = Some("fam-1".to_string());
+    let mut access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    access.family_id = Some("fam-1".to_string());
+    let mut tainted_key = make_token("t3", "u1", TokenKind::ApiKey, "hash-c");
+    tainted_key.minted_by_family = Some("fam-1".to_string());
+    let mut other_family = make_token("t4", "u1", TokenKind::Refresh, "hash-d");
+    other_family.family_id = Some("fam-2".to_string());
+    let untainted_key = make_token("t5", "u1", TokenKind::ApiKey, "hash-e");
+
+    store.insert_token(&refresh).await.unwrap();
+    store.insert_token(&access).await.unwrap();
+    store.insert_token(&tainted_key).await.unwrap();
+    store.insert_token(&other_family).await.unwrap();
+    store.insert_token(&untainted_key).await.unwrap();
+
+    let revoked_count = store.revoke_compromised_family("fam-1").await.unwrap();
+    assert_eq!(revoked_count, 3, "refresh + access + the tainted key");
+
+    for hash in ["hash-a", "hash-b", "hash-c"] {
+        assert!(
+            store
+                .find_token_by_hash(hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some(),
+            "{hash} must be revoked"
+        );
+    }
+    for hash in ["hash-d", "hash-e"] {
+        assert!(
+            store
+                .find_token_by_hash(hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none(),
+            "{hash} must be left alone"
+        );
+    }
+}
+
+#[tokio::test]
 async fn mark_token_used_sets_last_used_at() {
     let (_dir, _backend, store) = make_store().await;
     store

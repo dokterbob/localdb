@@ -1385,8 +1385,8 @@ framework entirely, is reportable state, not an error.
 
 ```
 $ localdb db status
-schema version: 4 (this binary's head: 11, baseline: 4)
-7 pending migrations; run `localdb db migrate`
+schema version: 4 (this binary's head: 12, baseline: 4)
+8 pending migrations; run `localdb db migrate`
 history:
   v4 baseline  applied 2026-08-25T17:07:04Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
 ```
@@ -1402,8 +1402,8 @@ reported distinctly, never as "up to date":
 
 ```
 $ localdb db status
-schema version: 0 (this binary's head: 11, baseline: 4)
-store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v11
+schema version: 0 (this binary's head: 12, baseline: 4)
+store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v12
 ```
 
 `--json` sets `"uninitialized": true` for this case. `pending` stays `0` rather than reporting
@@ -1460,11 +1460,11 @@ lost — so it prompts first:
 ```
 $ localdb db migrate
 This store's schema (v2) predates the migration baseline (v4); migrating it erases ALL indexed data and rebuilds from scratch. Continue? [y/N] y
-rebuilt legacy store: v2 -> v11 (all indexed data erased)
+rebuilt legacy store: v2 -> v12 (all indexed data erased)
 hint: run `localdb index` to re-index stale content
 ```
 
-(the rebuild drops and recreates the schema directly at this binary's head version — v11 here — not
+(the rebuild drops and recreates the schema directly at this binary's head version — v12 here — not
 at the baseline; a legacy rebuild always marks derived data stale, so the re-index hint always
 follows it)
 
@@ -1499,10 +1499,11 @@ non-interactive rule as `migrate`):
 ```
 $ localdb db downgrade --to 8
 This reverses the store's schema to version 8, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
+downgraded migration v12 'add_auth_tokens_minted_by_family' in 1ms
 downgraded migration v11 'add_pending_bootstrap' in 1ms
 downgraded migration v10 'add_access_requests_collected_at_column' in 3ms
 downgraded migration v9 'create_auth_tables' in 8ms
-downgraded: v11 -> v8 (3 steps)
+downgraded: v12 -> v8 (4 steps)
 ```
 
 An **impossible** target is checked and refused — exit `2`, store untouched — before that

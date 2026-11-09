@@ -344,6 +344,15 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
+    // The trailing `, minted_by_family TEXT)` (rather than a normally
+    // formatted `minted_by_family TEXT` column on its own indented line) is
+    // deliberate, not a typo: `PRAGMA user_version`-migrated stores get
+    // this column via chain.rs's `ALTER TABLE auth_tokens ADD COLUMN
+    // minted_by_family TEXT`, and SQLite's `ADD COLUMN` splices the new
+    // column definition in verbatim immediately before the original
+    // statement's closing parenthesis rather than reformatting the whole
+    // statement — see the identical convention on `access_requests` below
+    // for the fuller explanation.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS auth_tokens (
             id            TEXT PRIMARY KEY NOT NULL,
@@ -356,7 +365,7 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
             created_at    TEXT NOT NULL,
             family_id     TEXT,
             rotated_from  TEXT
-        )",
+        , minted_by_family TEXT)",
         (),
     )
     .await?;
@@ -369,6 +378,13 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_auth_tokens_family ON auth_tokens(family_id)",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_tokens_minted_by_family \
+         ON auth_tokens(minted_by_family)",
         (),
     )
     .await?;

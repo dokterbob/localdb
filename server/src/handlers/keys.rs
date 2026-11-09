@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use localdb_core::auth::{AuthStore as _, Principal, TokenKind};
+use localdb_core::auth::{AuthStore as _, Principal, SessionOrigin, TokenKind};
 use localdb_core::Error as CoreError;
 
 use super::require_principal;
@@ -76,9 +76,19 @@ pub struct CreateKeyResponse {
 /// `POST /v1/users/{id}/keys`: admin-only for another user, but a caller
 /// may always mint a key for *themselves* — the one self-service carve-out
 /// among the admin-only management routes (specs/05-surfaces.md §3.1).
+///
+/// The caller's `SessionOrigin` (absent in open mode, or when the
+/// caller's own credential carries no session ancestry) is threaded into
+/// the minted key as `minted_by_family`, so a key minted while authenticated
+/// by a session — or by a key already tainted by one — is revoked alongside
+/// it on reuse-detected family revocation. This also covers an admin
+/// minting a key for *another* user from a stolen session: that key is
+/// tainted too, deliberately (the session itself is compromised either
+/// way).
 pub async fn create_key(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    origin: Option<Extension<SessionOrigin>>,
     Path(user_id): Path<String>,
 ) -> Result<(StatusCode, Json<CreateKeyResponse>), ApiError> {
     let principal = require_principal(principal)?;
@@ -90,7 +100,11 @@ pub async fn create_key(
             message: format!("user '{user_id}' not found"),
         }));
     }
-    let issued = state.auth().issue_api_key(&user_id).await?;
+    let minted_by_family = origin.and_then(|Extension(SessionOrigin(family))| family);
+    let issued = state
+        .auth()
+        .issue_api_key_minted_by(&user_id, minted_by_family)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(CreateKeyResponse {

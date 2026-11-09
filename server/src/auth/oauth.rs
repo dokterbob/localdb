@@ -662,12 +662,11 @@ async fn handle_refresh_grant(state: &AppState, form: TokenForm) -> Response {
 }
 
 async fn issue_token_pair(state: &AppState, user_id: &str) -> Response {
-    let access = match state.auth().issue_access_token(user_id).await {
-        Ok(a) => a,
-        Err(e) => return token_error_for_failure(e, "the token request could not be completed"),
-    };
-    let refresh = match state.auth().issue_refresh_token(user_id).await {
-        Ok(r) => r,
+    // `issue_session` shares one family between the access and refresh
+    // token, so reuse detection on the refresh token revokes this very
+    // access token too — not just later-rotated replacements.
+    let (access, refresh) = match state.auth().issue_session(user_id).await {
+        Ok(pair) => pair,
         Err(e) => return token_error_for_failure(e, "the token request could not be completed"),
     };
     Json(TokenResponse {

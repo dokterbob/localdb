@@ -40,6 +40,21 @@ pub struct Principal {
     pub access: StoreAccess,
 }
 
+/// Which login-session family (if any) ultimately backs an authenticated
+/// principal's bearer credential — resolved alongside `Principal` by
+/// `AuthService::authenticate_with_origin`.
+///
+/// `None` for a credential with no session ancestry: the local-trust
+/// principal, or an API key minted with no `minted_by_family` (e.g. via
+/// `issue_api_key`, an invite redemption, or an admin-minted key with no
+/// session in scope). A separate type rather than a field on `Principal`
+/// itself, so the many existing `Principal` struct literals across core,
+/// server, and mcp tests don't all need updating, and so `Principal`'s
+/// `PartialEq` semantics (used in tests to compare identities) stay
+/// unaffected by session bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOrigin(pub Option<String>);
+
 impl Principal {
     /// The principal used when auth is not enforced: embedded mode, or a
     /// daemon with `server.auth: off` on a loopback bind

@@ -108,6 +108,7 @@ pub(super) fn row_to_token(row: &libsql::Row) -> Result<AuthTokenRow, Error> {
     let created_at: String = row.get(7).map_err(map_libsql_err)?;
     let family_id: Option<String> = row.get(8).map_err(map_libsql_err)?;
     let rotated_from: Option<String> = row.get(9).map_err(map_libsql_err)?;
+    let minted_by_family: Option<String> = row.get(10).map_err(map_libsql_err)?;
     Ok(AuthTokenRow {
         id,
         user_id,
@@ -119,6 +120,7 @@ pub(super) fn row_to_token(row: &libsql::Row) -> Result<AuthTokenRow, Error> {
         created_at,
         family_id,
         rotated_from,
+        minted_by_family,
     })
 }
 

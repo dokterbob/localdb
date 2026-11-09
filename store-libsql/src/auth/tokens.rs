@@ -5,7 +5,7 @@ use super::sql::{row_to_token, token_kind_to_sql};
 use crate::connection::{map_libsql_err, LibsqlDb};
 
 const TOKEN_COLUMNS: &str = "id, user_id, kind, secret_hash, expires_at, last_used_at, \
-    revoked_at, created_at, family_id, rotated_from";
+    revoked_at, created_at, family_id, rotated_from, minted_by_family";
 
 pub(crate) async fn insert_token(db: &LibsqlDb, token: &AuthTokenRow) -> Result<(), Error> {
     let conn = db.writer().await;
@@ -19,8 +19,8 @@ pub(super) async fn insert_token_on(
     conn.execute(
         "INSERT INTO auth_tokens
             (id, user_id, kind, secret_hash, expires_at, last_used_at, revoked_at,
-             created_at, family_id, rotated_from)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             created_at, family_id, rotated_from, minted_by_family)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         libsql::params![
             token.id.clone(),
             token.user_id.clone(),
@@ -32,6 +32,7 @@ pub(super) async fn insert_token_on(
             token.created_at.clone(),
             token.family_id.clone(),
             token.rotated_from.clone(),
+            token.minted_by_family.clone(),
         ],
     )
     .await
@@ -95,6 +96,27 @@ pub(crate) async fn revoke_token_family(
             "UPDATE auth_tokens SET revoked_at = ? \
              WHERE family_id = ? AND revoked_at IS NULL",
             libsql::params![revoked_at.to_string(), family_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n as u64)
+}
+
+pub(crate) async fn revoke_compromised_family(
+    db: &LibsqlDb,
+    family_id: &str,
+    revoked_at: &str,
+) -> Result<u64, Error> {
+    let conn = db.writer().await;
+    let n = conn
+        .execute(
+            "UPDATE auth_tokens SET revoked_at = ? \
+             WHERE (family_id = ? OR minted_by_family = ?) AND revoked_at IS NULL",
+            libsql::params![
+                revoked_at.to_string(),
+                family_id.to_string(),
+                family_id.to_string()
+            ],
         )
         .await
         .map_err(map_libsql_err)?;

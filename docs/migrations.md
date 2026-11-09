@@ -65,8 +65,8 @@ Read-only, never refuses — reports state even for a too-new or legacy store:
 
 ```
 $ localdb db status
-schema version: 4 (this binary's head: 11, baseline: 4)
-7 pending migrations; run `localdb db migrate`
+schema version: 4 (this binary's head: 12, baseline: 4)
+8 pending migrations; run `localdb db migrate`
 history:
   v4 baseline  applied 2026-01-01T00:00:00Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
 ```
@@ -86,7 +86,7 @@ stderr (`applied migration v9 'create_auth_tables' in 12ms`). If already at head
 
 ```
 $ localdb db migrate
-already at head (v11)
+already at head (v12)
 ```
 
 If the store is a **legacy** (pre-baseline, v1–v3) store, migrating it means an unconditional
@@ -126,7 +126,7 @@ or structure introduced by later migrations. Continue? [y/N]
 
 ```
 $ localdb db downgrade --to 8
-downgraded: v11 -> v8 (3 steps)
+downgraded: v12 -> v8 (4 steps)
 ```
 
 If a migration on the path to `--to` has `down_unsupported_reason` set, the whole downgrade is
@@ -367,3 +367,10 @@ Auth migration v11 (`add_pending_bootstrap`) adds the first-admin recovery marke
 reindexing. Downgrading v11 to v10 removes only that marker, preserving users, credentials, grants,
 invites, and indexed content. Finish pending setup before downgrading; v10 cannot resume an
 interrupted v11 bootstrap automatically.
+
+Auth migration v12 (`add_auth_tokens_minted_by_family`) adds `auth_tokens.minted_by_family` and its
+index — the session family (if any) active when an API key was minted, so refresh-token
+reuse-detected family revocation also burns keys minted under a now-compromised session. No
+reindexing. Downgrading v12 to v11 drops the column and index, which means an existing API key's
+taint is forgotten: a key minted under a session that gets compromised _after_ the downgrade is no
+longer revoked alongside it.

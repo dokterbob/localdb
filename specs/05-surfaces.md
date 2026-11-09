@@ -599,13 +599,17 @@ account never becomes eligible merely because its credentials are gone. Shared a
 operations own this lifecycle; terminal/browser/native clients own presentation.
 
 **Token model:** opaque 32-byte secrets minted from `OsRng`, `ldb_`-prefixed, shown once at issuance
-and stored at rest only as a blake3 hash — never a password anywhere. Access tokens are short-lived
-(1h); refresh tokens (30d) rotate on every use with reuse detection — presenting an already-rotated
-refresh token revokes its entire token family. API keys share the same `auth_tokens` table
-(`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2 authorization-code +
-PKCE (S256) is the flow behind `/authorize` and `/token`. Verifiers require 43–128 ASCII unreserved
-characters. Refresh-token revocation and replacement tokens commit atomically. CLI refresh and cache
-mutations use one cross-process lock per credentials file.
+and stored at rest only as a blake3 hash — never a password anywhere. A login session mints an
+access token (1h) and a refresh token (30d) sharing one rotation family; refresh tokens rotate on
+every use with reuse detection — presenting an already-rotated refresh token revokes its entire
+family, which now includes every access token issued alongside it (the initial one and every rotated
+replacement), plus any API key minted while authenticated by that session or by a key already
+tainted by one (`minted_by_family`). Logout (`POST /revoke` on a refresh token) revokes only the
+session's own access and refresh tokens, never a key minted under it. API keys share the same
+`auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2
+authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`. Verifiers require
+43–128 ASCII unreserved characters. Refresh-token revocation and replacement tokens commit
+atomically. CLI refresh and cache mutations use one cross-process lock per credentials file.
 
 **Dynamic Client Registration (T7, RFC 7591):** `POST /register` is public/unauthenticated, so it
 enforces per-request size caps on registration metadata — at most 5 `redirect_uris`, each at most

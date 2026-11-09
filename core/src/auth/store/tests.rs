@@ -38,6 +38,7 @@ async fn poison_next_revoke_makes_revoke_token_report_false_once() {
         created_at: "2026-06-10T12:00:00Z".to_string(),
         family_id: None,
         rotated_from: None,
+        minted_by_family: None,
     };
     store.insert_token(&token).await.unwrap();
 
@@ -104,6 +105,7 @@ async fn try_delete_user_unless_last_admin_cascades_tokens_and_grants() {
             created_at: "2026-06-10T12:00:00Z".to_string(),
             family_id: None,
             rotated_from: None,
+            minted_by_family: None,
         })
         .await
         .unwrap();
@@ -319,6 +321,7 @@ async fn poison_next_insert_token_fails_the_next_insert_only() {
         created_at: "2026-06-10T12:00:00Z".to_string(),
         family_id: None,
         rotated_from: None,
+        minted_by_family: None,
     };
 
     store.poison_next_insert_token().await;

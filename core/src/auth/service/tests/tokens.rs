@@ -25,6 +25,7 @@ async fn expired_token_rejected() {
         created_at: now_rfc3339(),
         family_id: None,
         rotated_from: None,
+        minted_by_family: None,
     };
     svc.store.insert_token(&row).await.unwrap();
     let err = svc.authenticate(&minted.secret).await.unwrap_err();
@@ -127,6 +128,116 @@ async fn reused_rotated_refresh_token_revokes_family_and_fails() {
     // The now-revoked replacement can no longer authenticate either.
     let err = svc.authenticate(&new_refresh.secret).await.unwrap_err();
     assert!(matches!(err, Error::Unauthorized { .. }));
+}
+
+#[tokio::test]
+async fn reuse_revokes_initial_and_rotated_access_tokens() {
+    // A login's very first access token (minted by `issue_session`
+    // alongside the refresh token) must be revoked on reuse detection, not
+    // just later-rotated replacements.
+    let svc = service();
+    let user = svc.create_user("quentin", Role::Admin).await.unwrap();
+    let (initial_access, refresh) = svc.issue_session(&user.id).await.unwrap();
+    assert_eq!(initial_access.row.family_id, refresh.row.family_id);
+
+    let (rotated_access, rotated_refresh) =
+        svc.rotate_refresh_token(&refresh.secret).await.unwrap();
+
+    // Reuse the old (now-rotated-away) refresh secret — theft.
+    let err = svc.rotate_refresh_token(&refresh.secret).await.unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+
+    assert!(
+        svc.authenticate(&initial_access.secret).await.is_err(),
+        "the initial login's access token must be revoked, not just later rotations"
+    );
+    assert!(svc.authenticate(&rotated_access.secret).await.is_err());
+    assert!(svc
+        .rotate_refresh_token(&rotated_refresh.secret)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn reuse_revokes_tainted_api_keys_transitively_but_not_untainted_ones() {
+    let svc = service();
+    let user = svc.create_user("rosa", Role::Admin).await.unwrap();
+    let (_access, refresh) = svc.issue_session(&user.id).await.unwrap();
+    let family = refresh.row.family_id.clone().unwrap();
+
+    // A key minted directly under the session family.
+    let tainted = svc
+        .issue_api_key_minted_by(&user.id, Some(family))
+        .await
+        .unwrap();
+    // A key minted by a principal whose own origin IS that tainted key —
+    // i.e. a key derived from it — must inherit the taint transitively.
+    let (_principal, origin) = svc.authenticate_with_origin(&tainted.secret).await.unwrap();
+    let derived = svc
+        .issue_api_key_minted_by(&user.id, origin.0.clone())
+        .await
+        .unwrap();
+    // An untainted key, minted with no session in scope.
+    let untainted = svc.issue_api_key(&user.id).await.unwrap();
+
+    let (_new_access, _new_refresh) = svc.rotate_refresh_token(&refresh.secret).await.unwrap();
+    let err = svc.rotate_refresh_token(&refresh.secret).await.unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+
+    assert!(svc.authenticate(&tainted.secret).await.is_err());
+    assert!(
+        svc.authenticate(&derived.secret).await.is_err(),
+        "a key minted by a tainted principal must inherit the taint"
+    );
+    assert!(svc.authenticate(&untainted.secret).await.is_ok());
+}
+
+#[tokio::test]
+async fn revoke_by_secret_on_refresh_revokes_access_but_not_a_tainted_key() {
+    // Logout (RFC 7009) ends the session's own access/refresh tokens, never
+    // a key the user minted on purpose — even one minted under that same
+    // session. `revoke_compromised_family` is reuse-detection-only.
+    let svc = service();
+    let user = svc.create_user("sam", Role::Admin).await.unwrap();
+    let (access, refresh) = svc.issue_session(&user.id).await.unwrap();
+    let family = refresh.row.family_id.clone().unwrap();
+    let tainted = svc
+        .issue_api_key_minted_by(&user.id, Some(family))
+        .await
+        .unwrap();
+
+    assert!(svc.revoke_by_secret(&refresh.secret).await.unwrap());
+
+    assert!(svc.authenticate(&access.secret).await.is_err());
+    assert!(svc.authenticate(&tainted.secret).await.is_ok());
+}
+
+#[tokio::test]
+async fn authenticate_with_origin_resolves_origin_per_token_kind() {
+    let svc = service();
+    let user = svc.create_user("tina", Role::Admin).await.unwrap();
+    let (access, _refresh) = svc.issue_session(&user.id).await.unwrap();
+    let family = access.row.family_id.clone().unwrap();
+
+    let (_principal, origin) = svc.authenticate_with_origin(&access.secret).await.unwrap();
+    assert_eq!(origin.0, Some(family.clone()));
+
+    let tainted_key = svc
+        .issue_api_key_minted_by(&user.id, Some(family.clone()))
+        .await
+        .unwrap();
+    let (_principal, origin) = svc
+        .authenticate_with_origin(&tainted_key.secret)
+        .await
+        .unwrap();
+    assert_eq!(origin.0, Some(family));
+
+    let untainted_key = svc.issue_api_key(&user.id).await.unwrap();
+    let (_principal, origin) = svc
+        .authenticate_with_origin(&untainted_key.secret)
+        .await
+        .unwrap();
+    assert_eq!(origin.0, None);
 }
 
 #[tokio::test]

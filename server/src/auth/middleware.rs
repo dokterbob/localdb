@@ -9,9 +9,11 @@
 //! - [`AuthMode::Open`]: inserts `Principal::local_trust()` into the request
 //!   extensions and passes through — same trust boundary as daemonless use.
 //! - [`AuthMode::Enforced`]: extracts `Authorization: Bearer <secret>`,
-//!   resolves it via `AuthService::authenticate`, and inserts the resulting
-//!   `Principal`. Missing/invalid credentials → 401 with the standard error
-//!   envelope plus `WWW-Authenticate: Bearer` (D6, added by
+//!   resolves it via `AuthService::authenticate_with_origin`, and inserts
+//!   both the resulting `Principal` and its `SessionOrigin` — the latter
+//!   lets `POST /v1/users/{id}/keys` taint a key minted under this request's
+//!   session. Missing/invalid credentials → 401 with the standard
+//!   error envelope plus `WWW-Authenticate: Bearer` (D6, added by
 //!   `ApiError::into_response`), upgraded here to carry
 //!   `resource_metadata="<base>/.well-known/oauth-protected-resource"` (T7,
 //!   RFC 9728 §5.1) — the trigger a stock MCP client uses to discover this
@@ -79,6 +81,9 @@ fn bearer_secret(headers: &axum::http::HeaderMap) -> Option<&str> {
 pub async fn require_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     match state.auth_mode() {
         AuthMode::Open => {
+            // No `SessionOrigin` extension here: there is no session to
+            // taint anything with, and its absence is itself the signal an
+            // extractor reads as "untainted" (`Option<Extension<...>>`).
             req.extensions_mut().insert(Principal::local_trust());
             next.run(req).await
         }
@@ -96,7 +101,7 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
                 add_resource_metadata_challenge(&mut response, &state, host_header.as_deref());
                 return response;
             };
-            let principal = match state.auth().authenticate(secret).await {
+            let (principal, origin) = match state.auth().authenticate_with_origin(secret).await {
                 Ok(p) => p,
                 Err(e) => {
                     let mut response = ApiError(e).into_response();
@@ -112,6 +117,10 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
             // scoping, admin-only management routes) is enforced by the
             // handlers themselves.
             req.extensions_mut().insert(principal);
+            // Carried alongside `Principal` so `POST /v1/users/{id}/keys`
+            // can taint a key minted under this session
+            // (`handlers::keys::create_key`).
+            req.extensions_mut().insert(origin);
             next.run(req).await
         }
     }

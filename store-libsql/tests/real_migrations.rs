@@ -735,7 +735,8 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
             BASELINE_VERSION + 4,
             BASELINE_VERSION + 5,
             BASELINE_VERSION + 6,
-            BASELINE_VERSION + 7
+            BASELINE_VERSION + 7,
+            BASELINE_VERSION + 8
         ],
         "a v4 store steps through the whole compiled chain, not just v5"
     );
@@ -1174,7 +1175,7 @@ async fn auth_migrations_round_trip_preserves_populated_v8_database() {
             .await
             .unwrap();
         assert_eq!(report.from_version, 8);
-        assert_eq!(report.to_version, 11);
+        assert_eq!(report.to_version, 12);
         assert!(!report.staleness_marked);
         {
             let (_db, conn) = open_conn(&path).await;
@@ -1236,7 +1237,7 @@ async fn pending_bootstrap_migration_round_trip_preserves_users_tokens_and_conte
         let report = store_libsql::migrate_store(&path, &ctx(), false)
             .await
             .unwrap();
-        assert_eq!((report.from_version, report.to_version), (10, 11));
+        assert_eq!((report.from_version, report.to_version), (10, 12));
         {
             let (_db, conn) = open_conn(&path).await;
             conn.execute("INSERT INTO pending_bootstrap VALUES (1,'admin')", ())

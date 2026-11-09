@@ -388,6 +388,22 @@ impl AuthStore for FakeAuthStore {
         Ok(count)
     }
 
+    async fn revoke_compromised_family(&self, family_id: &str) -> Result<u64, Error> {
+        let mut inner = self.inner.write().await;
+        let now = crate::ingestion::now_rfc3339();
+        let mut count = 0u64;
+        for t in inner.tokens.iter_mut() {
+            if t.revoked_at.is_none()
+                && (t.family_id.as_deref() == Some(family_id)
+                    || t.minted_by_family.as_deref() == Some(family_id))
+            {
+                t.revoked_at = Some(now.clone());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     async fn mark_token_used(&self, id: &str, used_at: &str) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
         if let Some(t) = inner.tokens.iter_mut().find(|t| t.id == id) {

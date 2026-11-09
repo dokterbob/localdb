@@ -70,6 +70,7 @@ fn make_token(id: &str, user_id: &str, kind: TokenKind, secret_hash: &str) -> Au
         created_at: "2026-06-10T12:00:00Z".to_string(),
         family_id: None,
         rotated_from: None,
+        minted_by_family: None,
     }
 }
 

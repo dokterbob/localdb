@@ -13,7 +13,7 @@ use crate::types::StoreVisibility;
 use crate::Error;
 
 use super::client;
-use super::principal::{Principal, Role, StoreAccess};
+use super::principal::{Principal, Role, SessionOrigin, StoreAccess};
 use super::store::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
     InviteRow, OAuthClientRow, StoreGrantRow, TokenKind, UserRow,
@@ -104,13 +104,39 @@ impl<S: AuthStore> AuthService<S> {
     }
 
     /// Mint a long-lived API key (D1): no default expiry; `last_used_at` is
-    /// tracked on every successful `authenticate`.
+    /// tracked on every successful `authenticate`. Not tied to any session
+    /// — see `issue_api_key_minted_by` for a key minted on behalf of an
+    /// active session, which is tainted alongside it on reuse detection.
     pub async fn issue_api_key(&self, user_id: &str) -> Result<IssuedToken, Error> {
-        self.issue_token(user_id, TokenKind::ApiKey, None, None, None)
-            .await
+        self.issue_api_key_minted_by(user_id, None).await
     }
 
-    /// Mint a 1-hour access token (D1).
+    /// Mint a long-lived API key, recording `minted_by_family` as the
+    /// session family (if any) active when it was minted
+    /// (`AuthTokenRow::minted_by_family`). `server::handlers::keys::create_key`
+    /// passes the caller's `SessionOrigin` here so a key minted while
+    /// authenticated by a session (or by a key already tainted by one) is
+    /// revoked alongside it on reuse-detected family revocation.
+    pub async fn issue_api_key_minted_by(
+        &self,
+        user_id: &str,
+        minted_by_family: Option<String>,
+    ) -> Result<IssuedToken, Error> {
+        self.issue_token(
+            user_id,
+            TokenKind::ApiKey,
+            None,
+            None,
+            None,
+            minted_by_family,
+        )
+        .await
+    }
+
+    /// Mint a 1-hour access token (D1), not tied to any session family. Use
+    /// `issue_session` for the normal login path, which shares one family
+    /// between the access and refresh token so reuse detection revokes
+    /// both.
     pub async fn issue_access_token(&self, user_id: &str) -> Result<IssuedToken, Error> {
         self.issue_token(
             user_id,
@@ -118,11 +144,14 @@ impl<S: AuthStore> AuthService<S> {
             Some(rfc3339_from_now(ACCESS_TOKEN_TTL_SECS)),
             None,
             None,
+            None,
         )
         .await
     }
 
-    /// Mint a 30-day refresh token (D1), starting a new rotation family.
+    /// Mint a 30-day refresh token (D1), starting a new rotation family, not
+    /// tied to an access token. Use `issue_session` for the normal login
+    /// path.
     pub async fn issue_refresh_token(&self, user_id: &str) -> Result<IssuedToken, Error> {
         let family = new_ulid();
         self.issue_token(
@@ -131,8 +160,42 @@ impl<S: AuthStore> AuthService<S> {
             Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
             Some(family),
             None,
+            None,
         )
         .await
+    }
+
+    /// Mint a fresh login session (D1): a 1-hour access token and a 30-day
+    /// refresh token sharing one new rotation family, so reuse detection on
+    /// the refresh token (`rotate_refresh_token`) revokes the access token
+    /// minted alongside it too — not just later-rotated replacements. The
+    /// OAuth2 token endpoint (`server::auth::oauth::issue_token_pair`) calls
+    /// this for the authorization-code grant; every access token a caller
+    /// can present either comes from here or from a later
+    /// `rotate_refresh_token` call, both of which carry a `family_id`.
+    pub async fn issue_session(&self, user_id: &str) -> Result<(IssuedToken, IssuedToken), Error> {
+        let family = new_ulid();
+        let access = self
+            .issue_token(
+                user_id,
+                TokenKind::Access,
+                Some(rfc3339_from_now(ACCESS_TOKEN_TTL_SECS)),
+                Some(family.clone()),
+                None,
+                None,
+            )
+            .await?;
+        let refresh = self
+            .issue_token(
+                user_id,
+                TokenKind::Refresh,
+                Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
+                Some(family),
+                None,
+                None,
+            )
+            .await?;
+        Ok((access, refresh))
     }
 
     async fn issue_token(
@@ -142,8 +205,16 @@ impl<S: AuthStore> AuthService<S> {
         expires_at: Option<String>,
         family_id: Option<String>,
         rotated_from: Option<String>,
+        minted_by_family: Option<String>,
     ) -> Result<IssuedToken, Error> {
-        let issued = Self::prepare_token(user_id, kind, expires_at, family_id, rotated_from);
+        let issued = Self::prepare_token(
+            user_id,
+            kind,
+            expires_at,
+            family_id,
+            rotated_from,
+            minted_by_family,
+        );
         self.store.insert_token(&issued.row).await?;
         Ok(issued)
     }
@@ -154,6 +225,7 @@ impl<S: AuthStore> AuthService<S> {
         expires_at: Option<String>,
         family_id: Option<String>,
         rotated_from: Option<String>,
+        minted_by_family: Option<String>,
     ) -> IssuedToken {
         let minted = mint_secret();
         let row = AuthTokenRow {
@@ -167,6 +239,7 @@ impl<S: AuthStore> AuthService<S> {
             created_at: now_rfc3339(),
             family_id,
             rotated_from,
+            minted_by_family,
         };
         IssuedToken {
             row,
@@ -176,8 +249,29 @@ impl<S: AuthStore> AuthService<S> {
 
     /// Resolve a bearer secret to a `Principal`: validates the hash,
     /// expiry, and revocation state; updates `last_used_at` for API keys;
-    /// and builds `StoreAccess` from the user's role + grants (D7).
+    /// and builds `StoreAccess` from the user's role + grants (D7). A thin
+    /// wrapper over `authenticate_with_origin` that drops the session
+    /// origin — use that directly when the caller needs to know (and
+    /// propagate) which session family, if any, backs this credential.
     pub async fn authenticate(&self, bearer_secret: &str) -> Result<Principal, Error> {
+        self.authenticate_with_origin(bearer_secret)
+            .await
+            .map(|(principal, _origin)| principal)
+    }
+
+    /// Like `authenticate`, but also resolves the credential's
+    /// `SessionOrigin`: the access token's own `family_id` for an
+    /// access token, or the API key's `minted_by_family` for an API key —
+    /// `None` for a key minted with no session in scope. A key minted by a
+    /// principal whose own origin was tainted inherits that same family
+    /// (`server::handlers::keys::create_key` passes the caller's
+    /// `SessionOrigin` straight through to `issue_api_key_minted_by`), so
+    /// the taint propagates transitively through any chain of
+    /// session-minted keys.
+    pub async fn authenticate_with_origin(
+        &self,
+        bearer_secret: &str,
+    ) -> Result<(Principal, SessionOrigin), Error> {
         let hash = hash_secret(bearer_secret);
         let token =
             self.store
@@ -225,13 +319,25 @@ impl<S: AuthStore> AuthService<S> {
                 .await?;
         }
 
+        let origin = SessionOrigin(match token.kind {
+            TokenKind::Access => token.family_id.clone(),
+            TokenKind::ApiKey => token.minted_by_family.clone(),
+            // Refresh tokens are rejected above and never reach this match;
+            // `None` rather than a panic keeps this auth path fail-safe if
+            // that invariant is ever loosened.
+            TokenKind::Refresh => None,
+        });
+
         let access = self.build_store_access(&user).await?;
-        Ok(Principal {
-            user_id: user.id,
-            name: user.name,
-            role: user.role,
-            access,
-        })
+        Ok((
+            Principal {
+                user_id: user.id,
+                name: user.name,
+                role: user.role,
+                access,
+            },
+            origin,
+        ))
     }
 
     async fn build_store_access(&self, user: &UserRow) -> Result<StoreAccess, Error> {
@@ -272,9 +378,11 @@ impl<S: AuthStore> AuthService<S> {
         if token.revoked_at.is_some() {
             // Someone presented a refresh token that was already rotated
             // away (or explicitly revoked) — treat as theft and burn the
-            // whole family so a stolen token can't be replayed indefinitely.
+            // whole family, plus any API key minted under it, so a
+            // stolen session can't be replayed indefinitely or escalated
+            // into a permanent key.
             if let Some(family) = &token.family_id {
-                self.store.revoke_token_family(family).await?;
+                self.store.revoke_compromised_family(family).await?;
             }
             return Err(Error::Unauthorized {
                 message: "refresh token reuse detected; session revoked".to_string(),
@@ -296,11 +404,17 @@ impl<S: AuthStore> AuthService<S> {
             Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
             Some(family.clone()),
             Some(token.id.clone()),
+            None,
         );
+        // The rotated access token joins the same family as the refresh
+        // token it was minted alongside, so reuse detection below (and any
+        // later rotation in this chain) revokes it too — not just the
+        // refresh token and later replacements.
         let new_access = Self::prepare_token(
             &token.user_id,
             TokenKind::Access,
             Some(rfc3339_from_now(ACCESS_TOKEN_TTL_SECS)),
+            Some(family.clone()),
             None,
             None,
         );
@@ -309,7 +423,7 @@ impl<S: AuthStore> AuthService<S> {
             .rotate_tokens(&token.id, &new_access.row, &new_refresh.row)
             .await?
         {
-            self.store.revoke_token_family(&family).await?;
+            self.store.revoke_compromised_family(&family).await?;
             return Err(Error::Unauthorized {
                 message: "refresh token reuse detected; session revoked".into(),
             });

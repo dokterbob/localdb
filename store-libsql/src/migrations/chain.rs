@@ -344,6 +344,28 @@ fn add_access_requests_collected_at_column_down(_ctx: &MigrationContext) -> Vec<
     vec!["ALTER TABLE access_requests DROP COLUMN collected_at".to_string()]
 }
 
+/// `v12`: tags an API key with the session family (if any) active
+/// when it was minted, so reuse-detected family revocation
+/// (`AuthStore::revoke_compromised_family`) can also burn a key minted
+/// while a now-compromised session (or a key already tainted by one) was
+/// the caller's credential — closing the residual gap where a stolen
+/// session could mint a permanent, un-revocable API key.
+fn add_auth_tokens_minted_by_family_up(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "ALTER TABLE auth_tokens ADD COLUMN minted_by_family TEXT".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_auth_tokens_minted_by_family \
+         ON auth_tokens(minted_by_family)"
+            .to_string(),
+    ]
+}
+
+fn add_auth_tokens_minted_by_family_down(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "DROP INDEX IF EXISTS idx_auth_tokens_minted_by_family".to_string(),
+        "ALTER TABLE auth_tokens DROP COLUMN minted_by_family".to_string(),
+    ]
+}
+
 /// The real migration registry.
 ///
 /// Consumer branches append entries starting at version `BASELINE_VERSION +
@@ -442,6 +464,17 @@ pub fn migrations() -> Vec<Migration> {
                 vec!["CREATE TABLE IF NOT EXISTS pending_bootstrap (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE)".into()]
             }),
             down: Down::Sql(|_| vec!["DROP TABLE pending_bootstrap".into()]),
+            needs_reindex: false,
+        },
+        Migration {
+            version: BASELINE_VERSION + 8,
+            name: "add_auth_tokens_minted_by_family",
+            summary: "adds auth_tokens.minted_by_family (the session family active when an API \
+                      key was minted, if any) and its index, so reuse-detected family revocation \
+                      also burns API keys minted while a now-compromised session was the \
+                      caller's credential",
+            up: Up::Sql(add_auth_tokens_minted_by_family_up),
+            down: Down::Sql(add_auth_tokens_minted_by_family_down),
             needs_reindex: false,
         },
     ]

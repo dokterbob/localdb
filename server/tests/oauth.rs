@@ -534,6 +534,111 @@ async fn refresh_grant_rotates_and_reuse_revokes_family() {
     );
 }
 
+/// Refresh-token reuse detection must revoke every credential born under
+/// the compromised session, not just the refresh family: the session's
+/// initial access token (minted once, at authorization-code exchange,
+/// outside the rotation chain entirely) and any API key minted while
+/// authenticated by it. Drives the real `authorization_code` +
+/// `refresh_token` grants through the full router (not `AuthService`
+/// directly), mints a key through `POST /v1/users/{id}/keys` while
+/// authenticated by the session, then rotates and replays the stale
+/// refresh token — every credential born under that session must come back
+/// `401` afterwards.
+#[tokio::test]
+async fn reuse_detection_revokes_initial_access_token_and_keys_minted_under_the_session() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_key = seed_admin_with_key(&state, "wendy").await;
+
+    let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
+    let (code, _) = do_authorize(app.clone(), REDIRECT_URI, "s", &challenge, &admin_key).await;
+
+    let token_resp = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    assert_eq!(token_resp.status(), StatusCode::OK);
+    let body = json_body(token_resp.into_body()).await;
+    let initial_access = body["access_token"].as_str().unwrap().to_string();
+    let initial_refresh = body["refresh_token"].as_str().unwrap().to_string();
+
+    // The session's initial access token authenticates.
+    let me = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        "/v1/auth/me",
+        None,
+        Some(&initial_access),
+    )
+    .await;
+    assert_eq!(me.status(), StatusCode::OK);
+    let user_id = json_body(me.into_body()).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Mint a key while authenticated by this session.
+    let key_resp = request_with_bearer(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/users/{user_id}/keys"),
+        None,
+        Some(&initial_access),
+    )
+    .await;
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let minted_key = json_body(key_resp.into_body()).await["secret"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Rotate once.
+    let rotate_resp = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &initial_refresh),
+        ],
+    )
+    .await;
+    assert_eq!(rotate_resp.status(), StatusCode::OK);
+    let rotated_access = json_body(rotate_resp.into_body()).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Replay the stale refresh token — theft.
+    let reuse_resp = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &initial_refresh),
+        ],
+    )
+    .await;
+    assert_eq!(reuse_resp.status(), StatusCode::BAD_REQUEST);
+
+    // Every credential born under this session must now be dead.
+    for secret in [&initial_access, &rotated_access, &minted_key] {
+        let resp =
+            request_with_bearer(app.clone(), Method::GET, "/v1/auth/me", None, Some(secret)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "credential must be revoked after reuse detection"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // Public-route check
 // ---------------------------------------------------------------------
