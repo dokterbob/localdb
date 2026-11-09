@@ -232,10 +232,14 @@ service, independent of terminal, browser, or future native UI presentation.
 **Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a blake3
 hash. A login session mints an access token (1h) and a refresh token (30d) sharing one rotation
 family; refresh tokens rotate on every use with reuse detection — presenting an already-rotated
-refresh token revokes its whole family, which covers every access token issued under that session
-(not just later rotations) plus any API key minted while authenticated by it. API keys
-(`localdb key create`) share the same token table, never expire by default, and track
-`last_used_at`.
+refresh token revokes the whole _compromise closure_ of its family: every access token issued under
+that session (not just later rotations), any API key minted while authenticated by it, and —
+transitively — any other session created by authorizing an `/authorize` request with a credential
+from that family, plus everything minted under that descendant session in turn. Every family swept
+this way is also recorded as compromised, so a token insert naming one as its ancestor is refused
+rather than slipping in after the fact. Logout revokes only the session's own access and refresh
+tokens, with no such marker. API keys (`localdb key create`) share the same token table, never
+expire by default, and track `last_used_at`.
 
 **OAuth2 authorization-code + PKCE (S256)** is the flow behind `GET/POST /authorize` (an inline-HTML
 consent page) and `POST /token`. `POST /revoke` implements RFC 7009 (always `200`, even for an

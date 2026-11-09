@@ -417,7 +417,11 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
-    // OAuth2 authorization codes (code+PKCE flow, later ticket).
+    // OAuth2 authorization codes (code+PKCE flow, later ticket). The
+    // trailing `, minted_by_family TEXT)` follows the same splice
+    // convention as `auth_tokens.minted_by_family` above: a
+    // `PRAGMA user_version`-migrated store gets this column via chain.rs's
+    // `ALTER TABLE auth_codes ADD COLUMN minted_by_family TEXT`.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS auth_codes (
             id                    TEXT PRIMARY KEY NOT NULL,
@@ -430,6 +434,20 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
             expires_at            TEXT NOT NULL,
             consumed_at           TEXT,
             created_at            TEXT NOT NULL
+        , minted_by_family TEXT)",
+        (),
+    )
+    .await?;
+
+    // Durable marker of every family whose compromise closure
+    // `revoke_compromised_family` has already swept — `insert_token`
+    // consults it so a token insert naming a compromised ancestor as its
+    // `minted_by_family` is refused even when it races the sweep or arrives
+    // later via an in-flight OAuth exchange.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS auth_compromised_families (
+            family_id      TEXT PRIMARY KEY NOT NULL,
+            compromised_at TEXT NOT NULL
         )",
         (),
     )

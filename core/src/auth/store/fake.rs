@@ -26,6 +26,11 @@ struct FakeAuthStoreInner {
     /// simulates a transient store failure partway through a multi-step
     /// mint (T6 finding #6/#7 regression tests).
     poison_next_insert_token: bool,
+    /// Every family ever recorded as compromised by `revoke_compromised_family`
+    /// (mirrors the real store's `auth_compromised_families` table): a token
+    /// insert naming one of these as `minted_by_family` is refused, even
+    /// after the sweep that populated it has finished.
+    compromised_families: std::collections::HashSet<String>,
 }
 
 pub struct FakeAuthStore {
@@ -189,6 +194,15 @@ impl AuthStore for FakeAuthStore {
                 correlation_id: "fake_rotate_tokens".into(),
             });
         }
+        // Mirrors the real store's conditional insert: a rotation whose new
+        // rows inherit a `minted_by_family` that was compromised in the
+        // meantime must not mint anything, even though the old refresh row
+        // above is already (tentatively) revoked.
+        if let Some(parent) = &refresh.minted_by_family {
+            if inner.compromised_families.contains(parent) {
+                return Ok(false);
+            }
+        }
         inner.tokens[index].revoked_at = Some(crate::auth::rfc3339_from_now(0));
         inner.tokens.extend([refresh.clone(), access.clone()]);
         Ok(true)
@@ -333,6 +347,13 @@ impl AuthStore for FakeAuthStore {
                 correlation_id: "fake_auth_store_poison_insert_token".to_string(),
             });
         }
+        if let Some(parent) = &token.minted_by_family {
+            if inner.compromised_families.contains(parent) {
+                return Err(Error::Unauthorized {
+                    message: "session revoked".to_string(),
+                });
+            }
+        }
         inner.tokens.push(token.clone());
         Ok(())
     }
@@ -391,11 +412,36 @@ impl AuthStore for FakeAuthStore {
     async fn revoke_compromised_family(&self, family_id: &str) -> Result<u64, Error> {
         let mut inner = self.inner.write().await;
         let now = crate::ingestion::now_rfc3339();
+
+        // The transitive closure of `family_id`: itself, plus the family of
+        // every token minted by a credential already in the closure —
+        // repeated until a pass adds nothing new, mirroring the real
+        // store's recursive CTE.
+        let mut closure: std::collections::HashSet<String> = std::collections::HashSet::new();
+        closure.insert(family_id.to_string());
+        loop {
+            let mut grew = false;
+            for t in &inner.tokens {
+                if let (Some(parent), Some(family)) = (&t.minted_by_family, &t.family_id) {
+                    if closure.contains(parent) && closure.insert(family.clone()) {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        inner.compromised_families.extend(closure.iter().cloned());
+
         let mut count = 0u64;
         for t in inner.tokens.iter_mut() {
             if t.revoked_at.is_none()
-                && (t.family_id.as_deref() == Some(family_id)
-                    || t.minted_by_family.as_deref() == Some(family_id))
+                && (t.family_id.as_deref().is_some_and(|f| closure.contains(f))
+                    || t.minted_by_family
+                        .as_deref()
+                        .is_some_and(|f| closure.contains(f)))
             {
                 t.revoked_at = Some(now.clone());
                 count += 1;

@@ -135,6 +135,7 @@ pub(super) fn row_to_auth_code(row: &libsql::Row) -> Result<AuthCodeRow, Error> 
     let expires_at: String = row.get(7).map_err(map_libsql_err)?;
     let consumed_at: Option<String> = row.get(8).map_err(map_libsql_err)?;
     let created_at: String = row.get(9).map_err(map_libsql_err)?;
+    let minted_by_family: Option<String> = row.get(10).map_err(map_libsql_err)?;
     Ok(AuthCodeRow {
         id,
         client_id,
@@ -146,6 +147,7 @@ pub(super) fn row_to_auth_code(row: &libsql::Row) -> Result<AuthCodeRow, Error> 
         expires_at,
         consumed_at,
         created_at,
+        minted_by_family,
     })
 }
 

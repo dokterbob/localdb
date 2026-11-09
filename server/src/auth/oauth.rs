@@ -367,14 +367,14 @@ pub async fn post_authorize(
             .into_response();
     }
 
-    let user_id = match resolve_credential(&state, credential.trim()).await {
-        Ok(id) => id,
+    let (user_id, origin) = match resolve_credential(&state, credential.trim()).await {
+        Ok(resolved) => resolved,
         Err(message) => {
             return render_consent_page(&params, "", None, Some(&message)).into_response()
         }
     };
 
-    issue_code_and_continue(&state, &params, &user_id).await
+    issue_code_and_continue(&state, &params, &user_id, origin).await
 }
 
 /// T6: handle a consent-page submission that carries an invite token rather
@@ -403,7 +403,8 @@ async fn handle_invite_authorize(
         .await
     {
         Ok(RedeemOutcome::Open { user, .. }) => {
-            issue_code_and_continue(state, params, &user.id).await
+            // An invite mints a fresh, untainted user — no session ancestry.
+            issue_code_and_continue(state, params, &user.id, None).await
         }
         Ok(RedeemOutcome::Closed {
             request_id,
@@ -418,10 +419,16 @@ async fn handle_invite_authorize(
 /// single-use authorization code for `user_id` and either redirect to
 /// `redirect_uri` with it, or (the `--no-browser` oob sentinel) render it
 /// inline for copy/paste.
+///
+/// `minted_by_family` is the authorizing credential's own session ancestry
+/// (resolved by `resolve_credential`, or `None` for an invite redemption),
+/// carried onto the code so the session it ultimately mints
+/// (`issue_token_pair`) inherits it too.
 async fn issue_code_and_continue(
     state: &AppState,
     params: &ValidParams,
     user_id: &str,
+    minted_by_family: Option<String>,
 ) -> Response {
     let issued = match state
         .auth()
@@ -430,6 +437,7 @@ async fn issue_code_and_continue(
             user_id,
             &params.redirect_uri,
             &params.code_challenge,
+            minted_by_family,
         )
         .await
     {
@@ -474,27 +482,36 @@ code {{ font-size: 1.1rem; user-select: all; background: #f0f0f0; padding: 4px 8
     ))
 }
 
-/// Resolve a presented consent-form credential to a user id: try the
-/// one-time setup code first (bootstrap path — creates the first admin user
-/// and consumes the code), then fall back to treating it as an existing
-/// bearer secret (API key or access token) via `AuthService::authenticate`.
+/// Resolve a presented consent-form credential to a user id and its session
+/// ancestry: try the one-time setup code first (bootstrap path — creates the
+/// first admin user and consumes the code, with no ancestry of its own),
+/// then fall back to treating it as an existing bearer secret (API key or
+/// access token) via `AuthService::authenticate_with_origin` — an access
+/// token's own family, or a tainted API key's, becomes the new authorization
+/// code's `minted_by_family`, so a session created by authorizing with a
+/// stolen credential is itself reachable from reuse detection on the
+/// original: revoking the original also revokes that new session and
+/// anything minted under it.
 ///
 /// T6 seam: an invite-token redemption branch belongs here, tried alongside
 /// (not necessarily before/after) the API-key fallback — invites identify a
 /// *new* user the way the setup code identifies the *first* one.
-async fn resolve_credential(state: &AppState, credential: &str) -> Result<String, String> {
+async fn resolve_credential(
+    state: &AppState,
+    credential: &str,
+) -> Result<(String, Option<String>), String> {
     let presented_hash = auth::hash_secret(credential);
     if state.setup_code_hash().as_deref() == Some(&presented_hash) {
         return state
             .auth()
             .begin_bootstrap()
             .await
-            .map(|user| user.id)
+            .map(|user| (user.id, None))
             .map_err(|e| e.to_string());
     }
 
-    match state.auth().authenticate(credential).await {
-        Ok(principal) => Ok(principal.user_id),
+    match state.auth().authenticate_with_origin(credential).await {
+        Ok((principal, origin)) => Ok((principal.user_id, origin.0)),
         Err(_) => Err("invalid setup code or API key".to_string()),
     }
 }
@@ -633,12 +650,12 @@ async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
         );
     }
 
-    let user = match state
+    let (user, origin) = match state
         .auth()
         .redeem_auth_code(&code, &client_id, &redirect_uri, &code_verifier)
         .await
     {
-        Ok(user) => user,
+        Ok(redeemed) => redeemed,
         Err(e) => {
             return token_error_for_failure(
                 e,
@@ -648,7 +665,7 @@ async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
         }
     };
 
-    issue_token_pair(state, &user.id).await
+    issue_token_pair(state, &user.id, origin).await
 }
 
 async fn handle_refresh_grant(state: &AppState, form: TokenForm) -> Response {
@@ -674,11 +691,18 @@ async fn handle_refresh_grant(state: &AppState, form: TokenForm) -> Response {
     }
 }
 
-async fn issue_token_pair(state: &AppState, user_id: &str) -> Response {
+async fn issue_token_pair(
+    state: &AppState,
+    user_id: &str,
+    minted_by_family: Option<String>,
+) -> Response {
     // `issue_session` shares one family between the access and refresh
     // token, so reuse detection on the refresh token revokes this very
     // access token too — not just later-rotated replacements.
-    let (access, refresh) = match state.auth().issue_session(user_id).await {
+    // `minted_by_family` is the authorizing credential's own ancestry (see
+    // `resolve_credential`), so reuse detection on *that* credential's
+    // family reaches this session too, however many hops away.
+    let (access, refresh) = match state.auth().issue_session(user_id, minted_by_family).await {
         Ok(pair) => pair,
         Err(e) => return token_error_for_failure(e, "the token request could not be completed"),
     };

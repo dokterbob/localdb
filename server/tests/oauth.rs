@@ -323,6 +323,7 @@ async fn expired_authorization_code_is_invalid_grant() {
         expires_at: localdb_core::auth::rfc3339_from_now(-10),
         consumed_at: None,
         created_at: localdb_core::auth::rfc3339_from_now(-700),
+        minted_by_family: None,
     };
     state.auth_store().create_auth_code(&row).await.unwrap();
 
@@ -635,6 +636,124 @@ async fn reuse_detection_revokes_initial_access_token_and_keys_minted_under_the_
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "credential must be revoked after reuse detection"
+        );
+    }
+}
+
+/// An attacker holding session A's access token can run a normal
+/// `/authorize` -> `/token` flow with it as the consent-form credential,
+/// minting an entirely new session B (and anything minted under B).
+/// Reuse detection on A's refresh token must still reach B's access token
+/// and a key minted under B — not just A's own tokens — because the
+/// `/authorize` credential's session ancestry is carried onto the
+/// authorization code and then onto B itself.
+#[tokio::test]
+async fn reuse_detection_on_a_revokes_a_session_created_by_authorizing_with_as_credential() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_key = seed_admin_with_key(&state, "yusuf").await;
+
+    // Log in as A.
+    let (verifier_a, challenge_a) = localdb_core::auth::generate_pkce_pair();
+    let (code_a, _) = do_authorize(app.clone(), REDIRECT_URI, "s", &challenge_a, &admin_key).await;
+    let token_resp_a = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code_a),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier_a),
+        ],
+    )
+    .await;
+    assert_eq!(token_resp_a.status(), StatusCode::OK);
+    let body_a = json_body(token_resp_a.into_body()).await;
+    let access_a = body_a["access_token"].as_str().unwrap().to_string();
+    let refresh_a = body_a["refresh_token"].as_str().unwrap().to_string();
+
+    // Authorize again, this time presenting A's own access token as the
+    // consent-form credential — the attacker's move. This mints session B.
+    let (verifier_b, challenge_b) = localdb_core::auth::generate_pkce_pair();
+    let (code_b, _) = do_authorize(app.clone(), REDIRECT_URI, "s", &challenge_b, &access_a).await;
+    let token_resp_b = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code_b),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier_b),
+        ],
+    )
+    .await;
+    assert_eq!(token_resp_b.status(), StatusCode::OK);
+    let body_b = json_body(token_resp_b.into_body()).await;
+    let access_b = body_b["access_token"].as_str().unwrap().to_string();
+
+    let me_b = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        "/v1/auth/me",
+        None,
+        Some(&access_b),
+    )
+    .await;
+    assert_eq!(me_b.status(), StatusCode::OK, "B authenticates on its own");
+    let user_id = json_body(me_b.into_body()).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Mint a key while authenticated by session B.
+    let key_resp = request_with_bearer(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/users/{user_id}/keys"),
+        None,
+        Some(&access_b),
+    )
+    .await;
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let key_under_b = json_body(key_resp.into_body()).await["secret"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Rotate A once, then replay the stale refresh token — theft, reuse
+    // detection on A.
+    let rotate_resp = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_a),
+        ],
+    )
+    .await;
+    assert_eq!(rotate_resp.status(), StatusCode::OK);
+
+    let reuse_resp = post_form(
+        app.clone(),
+        "/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_a),
+        ],
+    )
+    .await;
+    assert_eq!(reuse_resp.status(), StatusCode::BAD_REQUEST);
+
+    // B's access token and the key minted under it must both be dead, even
+    // though neither was ever presented to the refresh endpoint.
+    for secret in [&access_b, &key_under_b] {
+        let resp =
+            request_with_bearer(app.clone(), Method::GET, "/v1/auth/me", None, Some(secret)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a credential descended from A must die when A is revoked"
         );
     }
 }

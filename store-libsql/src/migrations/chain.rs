@@ -344,23 +344,40 @@ fn add_access_requests_collected_at_column_down(_ctx: &MigrationContext) -> Vec<
     vec!["ALTER TABLE access_requests DROP COLUMN collected_at".to_string()]
 }
 
-/// `v12`: tags an API key with the session family (if any) active
-/// when it was minted, so reuse-detected family revocation
-/// (`AuthStore::revoke_compromised_family`) can also burn a key minted
-/// while a now-compromised session (or a key already tainted by one) was
-/// the caller's credential — closing the residual gap where a stolen
-/// session could mint a permanent, un-revocable API key.
-fn add_auth_tokens_minted_by_family_up(_ctx: &MigrationContext) -> Vec<String> {
+/// `v12`: tags an API key or session with the session family (if any)
+/// active when it was minted, carries that same ancestry onto an
+/// authorization code so a session created by redeeming one inherits it,
+/// and records every family a compromise sweep has already revoked so a
+/// racing or later insert under it is refused
+/// (`AuthStore::revoke_compromised_family`, `AuthStore::insert_token`) —
+/// closing the residual gaps where a stolen session could mint a
+/// permanent, un-revocable API key, or authorize a whole new session that
+/// reuse detection on the original couldn't reach.
+fn add_session_ancestry_up(_ctx: &MigrationContext) -> Vec<String> {
     vec![
         "ALTER TABLE auth_tokens ADD COLUMN minted_by_family TEXT".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_auth_tokens_minted_by_family \
          ON auth_tokens(minted_by_family)"
             .to_string(),
+        "ALTER TABLE auth_codes ADD COLUMN minted_by_family TEXT".to_string(),
+        // Byte-for-byte identical to `schema::create_auth_tables`'s literal
+        // (the write-twice drift guard compares `sqlite_master.sql` as
+        // SQLite stored it, which is this exact source text, not a
+        // normalized form) — unlike the `ALTER TABLE` splices above, a
+        // brand-new `CREATE TABLE` has no SQLite-rewritten shape to match,
+        // so the two copies must simply agree verbatim.
+        "CREATE TABLE IF NOT EXISTS auth_compromised_families (
+            family_id      TEXT PRIMARY KEY NOT NULL,
+            compromised_at TEXT NOT NULL
+        )"
+        .to_string(),
     ]
 }
 
-fn add_auth_tokens_minted_by_family_down(_ctx: &MigrationContext) -> Vec<String> {
+fn add_session_ancestry_down(_ctx: &MigrationContext) -> Vec<String> {
     vec![
+        "DROP TABLE auth_compromised_families".to_string(),
+        "ALTER TABLE auth_codes DROP COLUMN minted_by_family".to_string(),
         "DROP INDEX IF EXISTS idx_auth_tokens_minted_by_family".to_string(),
         "ALTER TABLE auth_tokens DROP COLUMN minted_by_family".to_string(),
     ]
@@ -468,13 +485,17 @@ pub fn migrations() -> Vec<Migration> {
         },
         Migration {
             version: BASELINE_VERSION + 8,
-            name: "add_auth_tokens_minted_by_family",
-            summary: "adds auth_tokens.minted_by_family (the session family active when an API \
-                      key was minted, if any) and its index, so reuse-detected family revocation \
-                      also burns API keys minted while a now-compromised session was the \
-                      caller's credential",
-            up: Up::Sql(add_auth_tokens_minted_by_family_up),
-            down: Down::Sql(add_auth_tokens_minted_by_family_down),
+            name: "add_session_ancestry",
+            summary: "adds auth_tokens.minted_by_family and its index (the session family active \
+                      when an API key or session was minted, if any), auth_codes.minted_by_family \
+                      (the same ancestry carried on an authorization code), and \
+                      auth_compromised_families (a durable marker of every family a compromise \
+                      sweep has already revoked), so reuse-detected family revocation reaches \
+                      every session and key descended from a stolen credential — including a \
+                      session created by authorizing with it — and refuses to mint a new one \
+                      from an already-compromised ancestor",
+            up: Up::Sql(add_session_ancestry_up),
+            down: Down::Sql(add_session_ancestry_down),
             needs_reindex: false,
         },
     ]

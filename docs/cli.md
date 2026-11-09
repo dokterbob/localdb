@@ -1500,7 +1500,7 @@ non-interactive rule as `migrate`):
 ```
 $ localdb db downgrade --to 8
 This reverses the store's schema to version 8, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
-downgraded migration v12 'add_auth_tokens_minted_by_family' in 1ms
+downgraded migration v12 'add_session_ancestry' in 1ms
 downgraded migration v11 'add_pending_bootstrap' in 1ms
 downgraded migration v10 'add_access_requests_collected_at_column' in 3ms
 downgraded migration v9 'create_auth_tables' in 8ms

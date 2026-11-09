@@ -601,15 +601,23 @@ operations own this lifecycle; terminal/browser/native clients own presentation.
 **Token model:** opaque 32-byte secrets minted from `OsRng`, `ldb_`-prefixed, shown once at issuance
 and stored at rest only as a blake3 hash — never a password anywhere. A login session mints an
 access token (1h) and a refresh token (30d) sharing one rotation family; refresh tokens rotate on
-every use with reuse detection — presenting an already-rotated refresh token revokes its entire
-family, which now includes every access token issued alongside it (the initial one and every rotated
-replacement), plus any API key minted while authenticated by that session or by a key already
-tainted by one (`minted_by_family`). Logout (`POST /revoke` on a refresh token) revokes only the
-session's own access and refresh tokens, never a key minted under it. API keys share the same
-`auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2
-authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`. Verifiers require
-43–128 ASCII unreserved characters. Refresh-token revocation and replacement tokens commit
-atomically. CLI refresh and cache mutations use one cross-process lock per credentials file.
+every use with reuse detection — presenting an already-rotated refresh token revokes the entire
+_compromise closure_ of its family: the family itself (every access token issued alongside it, the
+initial one and every rotated replacement), any API key minted while authenticated by that session
+or by a key already tainted by one (`minted_by_family`), and — transitively — any _other_ session
+created by authorizing an `/authorize` request with a credential from that family (`/authorize`
+carries the presented credential's own session ancestry onto the authorization code it issues, and
+`/token` carries it onto the session it mints from that code), plus everything minted under any of
+those descendant sessions in turn. Every family swept this way is also durably marked compromised,
+so a token insert naming one as its `minted_by_family` — racing the sweep, or arriving later via an
+in-flight OAuth exchange — is refused rather than slipping in after the fact. Logout (`POST /revoke`
+on a refresh token) revokes only the session's own access and refresh tokens, never a key minted
+under it, and writes no compromise marker — a key minted from a tainted key after an ordinary logout
+still works. API keys share the same `auth_tokens` table (`kind = 'api_key'`), have no default
+expiry, and track `last_used_at`. OAuth2 authorization-code + PKCE (S256) is the flow behind
+`/authorize` and `/token`. Verifiers require 43–128 ASCII unreserved characters. Refresh-token
+revocation and replacement tokens commit atomically. CLI refresh and cache mutations use one
+cross-process lock per credentials file.
 
 **Dynamic Client Registration (T7, RFC 7591):** `POST /register` is public/unauthenticated, so it
 enforces per-request size caps on registration metadata — at most 5 `redirect_uris`, each at most

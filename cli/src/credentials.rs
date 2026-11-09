@@ -69,6 +69,30 @@ impl Default for CredentialsFile {
     }
 }
 
+impl CredentialsFile {
+    /// Canonicalize every stored key by trimming a trailing `/`, so a file
+    /// that holds a legacy or hand-edited slash-suffixed key behaves exactly
+    /// like one that doesn't: every reader and writer goes through
+    /// [`load_file`], so canonicalizing here is the single place that
+    /// decides it. When two spellings of the same key collide, the entry
+    /// stored under the already-canonical key wins, regardless of which one
+    /// was read first.
+    fn canonicalized(self) -> Self {
+        let mut credentials: BTreeMap<String, CredentialEntry> = BTreeMap::new();
+        for (key, entry) in self.credentials {
+            let is_canonical = normalize_base_url(&key) == key;
+            let canonical_key = normalize_base_url(&key).to_string();
+            if is_canonical || !credentials.contains_key(&canonical_key) {
+                credentials.insert(canonical_key, entry);
+            }
+        }
+        Self {
+            version: self.version,
+            credentials,
+        }
+    }
+}
+
 /// The `credentials.json` path for a given config file path (sibling file).
 pub(crate) fn credentials_path(config_file: &Path) -> PathBuf {
     config_file.with_file_name("credentials.json")
@@ -86,8 +110,9 @@ fn normalize_base_url(base_url: &str) -> &str {
 fn load_file(credentials_file: &Path) -> CredentialsFile {
     std::fs::read_to_string(credentials_file)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<CredentialsFile>(&s).ok())
         .unwrap_or_default()
+        .canonicalized()
 }
 
 /// Look up the cached entry for `base_url`, if the file exists, parses, and
@@ -117,16 +142,18 @@ fn normalize_request_url(url: &str) -> &str {
 /// `https://example.com/teamX/v1`. A daemon served at a bare origin is
 /// covered the same way, since the origin is then the whole key. When
 /// several stored keys match (e.g. both an origin and a path under it), the
-/// longest one wins.
+/// longest one wins. Stored keys are already canonical (see
+/// [`CredentialsFile::canonicalized`]), so no further trimming is needed
+/// here.
 fn match_key<'a>(file: &'a CredentialsFile, url: &str) -> Option<&'a str> {
     let url = normalize_request_url(url);
     file.credentials
         .keys()
         .filter(|key| {
-            let key = key.trim_end_matches('/');
+            let key = key.as_str();
             url == key || (url.starts_with(key) && url[key.len()..].starts_with('/'))
         })
-        .max_by_key(|key| key.trim_end_matches('/').len())
+        .max_by_key(|key| key.len())
         .map(String::as_str)
 }
 

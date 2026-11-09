@@ -16,6 +16,7 @@ fn make_auth_code(id: &str, user_id: &str, code_hash: &str) -> AuthCodeRow {
         expires_at: "2026-06-10T12:10:00Z".to_string(),
         consumed_at: None,
         created_at: "2026-06-10T12:00:00Z".to_string(),
+        minted_by_family: None,
     }
 }
 
@@ -40,6 +41,25 @@ async fn create_and_find_auth_code_round_trips() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn auth_code_minted_by_family_round_trips() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
+        .await
+        .unwrap();
+    let mut code = make_auth_code("c1", "u1", "code-hash-ancestry");
+    code.minted_by_family = Some("fam-1".to_string());
+    store.create_auth_code(&code).await.unwrap();
+
+    let found = store
+        .find_auth_code_by_hash("code-hash-ancestry")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.minted_by_family, Some("fam-1".to_string()));
 }
 
 #[tokio::test]

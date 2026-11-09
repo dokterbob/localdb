@@ -87,6 +87,14 @@ pub struct AuthCodeRow {
     pub expires_at: String,
     pub consumed_at: Option<String>,
     pub created_at: String,
+    /// The session family of the credential that authorized issuing this
+    /// code (`AuthService::issue_auth_code`), i.e. its parent — `None` for
+    /// the setup-code/bootstrap branch, which has no session ancestry.
+    /// `AuthService::redeem_auth_code` hands this back so the session it
+    /// creates (`AuthService::issue_session`) carries it forward as its own
+    /// `minted_by_family`, letting reuse detection on the authorizing
+    /// credential's family revoke this descendant session too.
+    pub minted_by_family: Option<String>,
 }
 
 /// A dynamically registered OAuth2 client (RFC 7591, T7).
@@ -237,6 +245,14 @@ pub trait AuthStore: Send + Sync + 'static {
     // ------------------------------------------------------------------
     // Tokens
     // ------------------------------------------------------------------
+    /// Insert `token`. Refuses with `Error::Unauthorized` — persisting
+    /// nothing — if `token.minted_by_family` is `Some` and that family has
+    /// already been recorded as compromised (by a concurrent or prior
+    /// `revoke_compromised_family` call): the atomic guard against minting a
+    /// key or session from a credential whose session is revoked between an
+    /// OAuth authorization and the token exchange that redeems it, or
+    /// concurrently with a reuse-detected revocation racing the same insert.
+    /// A `None` `minted_by_family` is never refused.
     async fn insert_token(&self, token: &AuthTokenRow) -> Result<(), Error>;
     /// Consume the old refresh token and insert both replacements atomically.
     /// False means the token is no longer eligible; errors leave all three rows unchanged.
@@ -259,13 +275,17 @@ pub trait AuthStore: Send + Sync + 'static {
     /// `revoke_compromised_family`: logout ends the session's own access
     /// and refresh tokens, never a key the user minted on purpose.
     async fn revoke_token_family(&self, family_id: &str) -> Result<u64, Error>;
-    /// Revoke every token sharing `family_id` **or** minted by it
-    /// (`minted_by_family = family_id`). Called on rotated-refresh-token
-    /// reuse detection (D1): a stolen session's access/refresh tokens *and*
-    /// any API key minted while that session (or a key derived from it) was
-    /// the caller's credential are all burned together, including keys
-    /// minted for other users by an admin whose own session was stolen —
-    /// deliberate, since the session itself is compromised either way.
+    /// Revoke `family_id`'s entire *compromise closure*: `family_id`
+    /// itself, plus the family of every token minted by a credential
+    /// already in the closure, transitively — a chain of sessions created
+    /// by authorizing one with another's credential, and the API keys
+    /// minted under any of them, are all burned together. Every closure
+    /// member is also durably recorded (so a token insert racing this call,
+    /// or arriving later via an in-flight OAuth exchange, is refused by
+    /// `insert_token` rather than slipping in after the sweep). Called on
+    /// rotated-refresh-token reuse detection (D1); deliberately includes
+    /// keys minted for other users by an admin whose own session was
+    /// stolen, since the session itself is compromised either way.
     async fn revoke_compromised_family(&self, family_id: &str) -> Result<u64, Error>;
     async fn mark_token_used(&self, id: &str, used_at: &str) -> Result<(), Error>;
     async fn list_tokens_for_user(&self, user_id: &str) -> Result<Vec<AuthTokenRow>, Error>;

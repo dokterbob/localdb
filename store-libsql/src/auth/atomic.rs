@@ -7,7 +7,7 @@ use super::{
 };
 use crate::connection::{map_libsql_err, LibsqlDb, WriteTx};
 
-async fn finish<T>(tx: WriteTx<'_>, result: Result<T, Error>) -> Result<T, Error> {
+pub(super) async fn finish<T>(tx: WriteTx<'_>, result: Result<T, Error>) -> Result<T, Error> {
     match result {
         Ok(value) => {
             tx.commit().await?;
@@ -96,8 +96,16 @@ pub(super) async fn rotate_tokens(
         if changed == 0 {
             return Ok(false);
         }
-        insert_token_on(&tx, refresh).await?;
-        insert_token_on(&tx, access).await?;
+        // A compromised ancestor revokes this whole family before marking
+        // it, so the conditional revoke above normally fails first. A
+        // refused insert still aborts the rotation (rolling back the
+        // revoke) rather than committing a revoked token with no
+        // replacement.
+        if !insert_token_on(&tx, refresh).await? || !insert_token_on(&tx, access).await? {
+            return Err(Error::Unauthorized {
+                message: "session revoked".to_string(),
+            });
+        }
         Ok(true)
     }
     .await;

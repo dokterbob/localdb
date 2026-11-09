@@ -356,8 +356,78 @@ fn lookup_entry_for_url_trailing_slash_on_stored_key_is_equivalent() {
         r#"{"version":1,"credentials":{"https://example.com/team/":{"secret":"ldb_team"}}}"#,
     );
     let (key, entry) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
-    assert_eq!(key, "https://example.com/team/");
+    assert_eq!(
+        key, "https://example.com/team",
+        "the matched key is always returned in its canonical (no trailing slash) spelling"
+    );
     assert_eq!(entry.secret.as_deref(), Some("ldb_team"));
+}
+
+#[test]
+fn lookup_entry_for_url_matched_key_round_trips_through_lookup_entry() {
+    // `refresh_cached_bearer` passes the key `lookup_entry_for_url` returns
+    // straight into an exact `lookup_entry`/`CredentialLock::lookup` call, so
+    // the two must agree on spelling even when the file only ever stored the
+    // legacy trailing-slash form.
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"https://example.com/team/":{"secret":"ldb_team"}}}"#,
+    );
+    let (key, _) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
+    assert!(
+        lookup_entry(&path, &key).is_some(),
+        "the key returned by lookup_entry_for_url must be found by an exact lookup_entry call"
+    );
+}
+
+#[test]
+fn resolve_bearer_prefers_canonical_entry_when_both_spellings_stored() {
+    let dir = TempDir::new().unwrap();
+    write_credentials(
+        &dir,
+        concat!(
+            r#"{"version":1,"credentials":{"#,
+            r#""https://example.com/team":{"secret":"ldb_canonical"},"#,
+            r#""https://example.com/team/":{"secret":"ldb_slash"}"#,
+            r#"}}"#
+        ),
+    );
+    let config_file = dir.path().join("config.yaml");
+    let resolved = resolve_bearer(
+        None,
+        Some(&config_file),
+        "https://example.com/team/v1/stores",
+    );
+    assert_eq!(
+        resolved.as_deref(),
+        Some("ldb_canonical"),
+        "when both spellings of a key are stored, the already-canonical entry wins deterministically"
+    );
+}
+
+#[test]
+fn write_entry_canonicalizes_a_pre_existing_legacy_trailing_slash_key() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"https://example.com/team/":{"secret":"ldb_team"}}}"#,
+    );
+    write_entry(
+        &path,
+        "https://other.example",
+        CredentialEntry {
+            secret: Some("ldb_other".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        lookup_secret(&path, "https://example.com/team").as_deref(),
+        Some("ldb_team"),
+        "an unrelated write canonicalizes every stored key, including one it didn't touch"
+    );
 }
 
 #[test]

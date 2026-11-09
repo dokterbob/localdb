@@ -137,7 +137,7 @@ async fn reuse_revokes_initial_and_rotated_access_tokens() {
     // just later-rotated replacements.
     let svc = service();
     let user = svc.create_user("quentin", Role::Admin).await.unwrap();
-    let (initial_access, refresh) = svc.issue_session(&user.id).await.unwrap();
+    let (initial_access, refresh) = svc.issue_session(&user.id, None).await.unwrap();
     assert_eq!(initial_access.row.family_id, refresh.row.family_id);
 
     let (rotated_access, rotated_refresh) =
@@ -162,7 +162,7 @@ async fn reuse_revokes_initial_and_rotated_access_tokens() {
 async fn reuse_revokes_tainted_api_keys_transitively_but_not_untainted_ones() {
     let svc = service();
     let user = svc.create_user("rosa", Role::Admin).await.unwrap();
-    let (_access, refresh) = svc.issue_session(&user.id).await.unwrap();
+    let (_access, refresh) = svc.issue_session(&user.id, None).await.unwrap();
     let family = refresh.row.family_id.clone().unwrap();
 
     // A key minted directly under the session family.
@@ -199,7 +199,7 @@ async fn revoke_by_secret_on_refresh_revokes_access_but_not_a_tainted_key() {
     // session. `revoke_compromised_family` is reuse-detection-only.
     let svc = service();
     let user = svc.create_user("sam", Role::Admin).await.unwrap();
-    let (access, refresh) = svc.issue_session(&user.id).await.unwrap();
+    let (access, refresh) = svc.issue_session(&user.id, None).await.unwrap();
     let family = refresh.row.family_id.clone().unwrap();
     let tainted = svc
         .issue_api_key_minted_by(&user.id, Some(family))
@@ -216,7 +216,7 @@ async fn revoke_by_secret_on_refresh_revokes_access_but_not_a_tainted_key() {
 async fn authenticate_with_origin_resolves_origin_per_token_kind() {
     let svc = service();
     let user = svc.create_user("tina", Role::Admin).await.unwrap();
-    let (access, _refresh) = svc.issue_session(&user.id).await.unwrap();
+    let (access, _refresh) = svc.issue_session(&user.id, None).await.unwrap();
     let family = access.row.family_id.clone().unwrap();
 
     let (_principal, origin) = svc.authenticate_with_origin(&access.secret).await.unwrap();
@@ -321,11 +321,12 @@ async fn issue_and_redeem_auth_code_happy_path() {
             &user.id,
             "http://127.0.0.1:1234/cb",
             &challenge,
+            None,
         )
         .await
         .unwrap();
 
-    let redeemed = svc
+    let (redeemed, origin) = svc
         .redeem_auth_code(
             &issued.secret,
             "localdb-cli",
@@ -335,6 +336,7 @@ async fn issue_and_redeem_auth_code_happy_path() {
         .await
         .unwrap();
     assert_eq!(redeemed.id, user.id);
+    assert_eq!(origin, None, "a code issued with no ancestry redeems none");
 }
 
 #[tokio::test]
@@ -343,7 +345,13 @@ async fn redeem_auth_code_wrong_verifier_fails() {
     let user = svc.create_user("jack", Role::Admin).await.unwrap();
     let (_verifier, challenge) = crate::auth::generate_pkce_pair();
     let issued = svc
-        .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+        .issue_auth_code(
+            "localdb-cli",
+            &user.id,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+            None,
+        )
         .await
         .unwrap();
 
@@ -365,7 +373,13 @@ async fn redeem_auth_code_is_single_use() {
     let user = svc.create_user("kim", Role::Admin).await.unwrap();
     let (verifier, challenge) = crate::auth::generate_pkce_pair();
     let issued = svc
-        .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+        .issue_auth_code(
+            "localdb-cli",
+            &user.id,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+            None,
+        )
         .await
         .unwrap();
 
@@ -407,6 +421,7 @@ async fn redeem_auth_code_expired_fails() {
         expires_at: rfc3339_from_now(-10),
         consumed_at: None,
         created_at: now_rfc3339(),
+        minted_by_family: None,
     };
     svc.store.create_auth_code(&row).await.unwrap();
 
@@ -428,7 +443,13 @@ async fn redeem_auth_code_client_id_mismatch_fails() {
     let user = svc.create_user("mona", Role::Admin).await.unwrap();
     let (verifier, challenge) = crate::auth::generate_pkce_pair();
     let issued = svc
-        .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+        .issue_auth_code(
+            "localdb-cli",
+            &user.id,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+            None,
+        )
         .await
         .unwrap();
 
@@ -450,7 +471,13 @@ async fn redeem_auth_code_redirect_uri_mismatch_fails() {
     let user = svc.create_user("nora", Role::Admin).await.unwrap();
     let (verifier, challenge) = crate::auth::generate_pkce_pair();
     let issued = svc
-        .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+        .issue_auth_code(
+            "localdb-cli",
+            &user.id,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+            None,
+        )
         .await
         .unwrap();
 
@@ -631,4 +658,157 @@ async fn failed_rotation_keeps_original_refresh_usable() {
         1
     );
     assert!(svc.rotate_refresh_token(&refresh.secret).await.is_ok());
+}
+
+// -----------------------------------------------------------------
+// Compromise closure: a session created by authorizing with another
+// session's credential, and every key minted under it, is reachable from
+// reuse detection on the original session — and a marked family refuses to
+// mint anything new, even racing the sweep that marked it.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn compromised_family_refuses_a_new_key_mint_after_the_sweep() {
+    let svc = service();
+    let user = svc.create_user("uma", Role::Admin).await.unwrap();
+    let (access, _refresh) = svc.issue_session(&user.id, None).await.unwrap();
+    let family = access.row.family_id.clone().unwrap();
+
+    svc.store.revoke_compromised_family(&family).await.unwrap();
+
+    let err = svc
+        .issue_api_key_minted_by(&user.id, Some(family))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+    assert_eq!(
+        svc.store
+            .list_tokens_for_user(&user.id)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the refused mint must not have inserted anything"
+    );
+}
+
+/// A session (B) created by authorizing with session A's own access token
+/// as the `/authorize` credential — the service-level shape of
+/// `server::auth::oauth::handle_auth_code_grant` — carries A's family as
+/// its ancestry. Reuse detection on A must reach B's access and refresh
+/// tokens, and any key minted under B, not just A's own tokens.
+#[tokio::test]
+async fn reuse_detection_on_a_revokes_a_descendant_session_and_its_keys() {
+    let svc = service();
+    let user = svc.create_user("victor", Role::Admin).await.unwrap();
+    let (access_a, refresh_a) = svc.issue_session(&user.id, None).await.unwrap();
+    let family_a = access_a.row.family_id.clone().unwrap();
+
+    // Authorize with A's access token: the auth code inherits A's family as
+    // its own ancestry, exactly as `authenticate_with_origin` would resolve
+    // it for that credential.
+    let (verifier, challenge) = crate::auth::generate_pkce_pair();
+    let issued_code = svc
+        .issue_auth_code(
+            "localdb-cli",
+            &user.id,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+            Some(family_a.clone()),
+        )
+        .await
+        .unwrap();
+    let (_redeemed_user, origin) = svc
+        .redeem_auth_code(
+            &issued_code.secret,
+            "localdb-cli",
+            "http://127.0.0.1:1/cb",
+            &verifier,
+        )
+        .await
+        .unwrap();
+    assert_eq!(origin, Some(family_a.clone()));
+
+    let (access_b, refresh_b) = svc.issue_session(&user.id, origin).await.unwrap();
+    let family_b = access_b.row.family_id.clone().unwrap();
+    assert_ne!(family_a, family_b, "B is its own, distinct session");
+
+    let key_under_b = svc
+        .issue_api_key_minted_by(&user.id, Some(family_b))
+        .await
+        .unwrap();
+
+    // Reuse detection on A's own refresh token.
+    let (rotated_access_a, rotated_refresh_a) =
+        svc.rotate_refresh_token(&refresh_a.secret).await.unwrap();
+    let err = svc
+        .rotate_refresh_token(&refresh_a.secret)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+
+    assert!(
+        svc.authenticate(&rotated_access_a.secret).await.is_err(),
+        "A's own rotated access token must die too"
+    );
+    assert!(svc.authenticate(&access_b.secret).await.is_err());
+    assert!(svc.rotate_refresh_token(&refresh_b.secret).await.is_err());
+    assert!(svc.authenticate(&key_under_b.secret).await.is_err());
+    assert!(svc
+        .rotate_refresh_token(&rotated_refresh_a.secret)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn logout_of_a_leaves_b_and_its_keys_working_and_later_mints_under_a_still_succeed() {
+    let svc = service();
+    let user = svc.create_user("wendy", Role::Admin).await.unwrap();
+    let (_access_a, refresh_a) = svc.issue_session(&user.id, None).await.unwrap();
+    let family_a = refresh_a.row.family_id.clone().unwrap();
+
+    let (access_b, refresh_b) = svc
+        .issue_session(&user.id, Some(family_a.clone()))
+        .await
+        .unwrap();
+    let key_under_b = svc
+        .issue_api_key_minted_by(&user.id, access_b.row.family_id.clone())
+        .await
+        .unwrap();
+
+    // Logout (RFC 7009) ends only A's own session.
+    assert!(svc.revoke_by_secret(&refresh_a.secret).await.unwrap());
+
+    assert!(svc.authenticate(&access_b.secret).await.is_ok());
+    assert!(svc.authenticate(&key_under_b.secret).await.is_ok());
+    assert!(svc.rotate_refresh_token(&refresh_b.secret).await.is_ok());
+
+    // A's family was never marked compromised by an ordinary logout, so a
+    // later mint under it still succeeds.
+    let later_key = svc
+        .issue_api_key_minted_by(&user.id, Some(family_a))
+        .await
+        .unwrap();
+    assert!(svc.authenticate(&later_key.secret).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_rotated_descendant_token_still_carries_the_ancestor_family() {
+    let svc = service();
+    let user = svc.create_user("xena", Role::Admin).await.unwrap();
+    let (_access_a, refresh_a) = svc.issue_session(&user.id, None).await.unwrap();
+    let family_a = refresh_a.row.family_id.clone().unwrap();
+
+    let (_access_b, refresh_b) = svc
+        .issue_session(&user.id, Some(family_a.clone()))
+        .await
+        .unwrap();
+
+    let (rotated_access_b, rotated_refresh_b) =
+        svc.rotate_refresh_token(&refresh_b.secret).await.unwrap();
+    assert_eq!(
+        rotated_access_b.row.minted_by_family,
+        Some(family_a.clone())
+    );
+    assert_eq!(rotated_refresh_b.row.minted_by_family, Some(family_a));
 }

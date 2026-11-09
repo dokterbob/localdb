@@ -368,9 +368,14 @@ reindexing. Downgrading v11 to v10 removes only that marker, preserving users, c
 invites, and indexed content. Finish pending setup before downgrading; v10 cannot resume an
 interrupted v11 bootstrap automatically.
 
-Auth migration v12 (`add_auth_tokens_minted_by_family`) adds `auth_tokens.minted_by_family` and its
-index — the session family (if any) active when an API key was minted, so refresh-token
-reuse-detected family revocation also burns keys minted under a now-compromised session. No
-reindexing. Downgrading v12 to v11 drops the column and index, which means an existing API key's
-taint is forgotten: a key minted under a session that gets compromised _after_ the downgrade is no
-longer revoked alongside it.
+Auth migration v12 (`add_session_ancestry`) adds `auth_tokens.minted_by_family` and its index (the
+session family active when an API key or session was minted, if any), `auth_codes.minted_by_family`
+(the same ancestry carried on an authorization code so a session created by redeeming one inherits
+it), and `auth_compromised_families` (a durable marker of every family a compromise sweep has
+already revoked). Together these let refresh-token reuse-detected family revocation reach every
+session and key descended from a stolen credential — including a whole new session created by
+authorizing with it — and refuse to mint anything new from an already-compromised ancestor. No
+reindexing. Downgrading v12 to v11 drops the table and both columns, which means all of this
+ancestry is forgotten: a session or key minted under a credential that gets compromised _after_ the
+downgrade is no longer revoked alongside it, and a revoked family no longer refuses new mints under
+it.

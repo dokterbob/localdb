@@ -10,15 +10,15 @@ use super::sql::row_to_auth_code;
 use crate::connection::{map_libsql_err, LibsqlDb};
 
 const AUTH_CODE_COLUMNS: &str = "id, client_id, user_id, code_hash, code_challenge, \
-    code_challenge_method, redirect_uri, expires_at, consumed_at, created_at";
+    code_challenge_method, redirect_uri, expires_at, consumed_at, created_at, minted_by_family";
 
 pub(crate) async fn create_auth_code(db: &LibsqlDb, code: &AuthCodeRow) -> Result<(), Error> {
     let conn = db.writer().await;
     conn.execute(
         "INSERT INTO auth_codes
             (id, client_id, user_id, code_hash, code_challenge, code_challenge_method,
-             redirect_uri, expires_at, consumed_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             redirect_uri, expires_at, consumed_at, created_at, minted_by_family)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         libsql::params![
             code.id.clone(),
             code.client_id.clone(),
@@ -30,6 +30,7 @@ pub(crate) async fn create_auth_code(db: &LibsqlDb, code: &AuthCodeRow) -> Resul
             code.expires_at.clone(),
             code.consumed_at.clone(),
             code.created_at.clone(),
+            code.minted_by_family.clone(),
         ],
     )
     .await

@@ -927,7 +927,10 @@ async fn proxy_refreshes_a_revoked_bearer_mid_session_and_retries_once() {
 }
 
 /// When the bearer source has no replacement to offer, the rejected call
-/// surfaces as an error instead of retrying forever.
+/// surfaces as an error instead of retrying forever. The tool-call channel
+/// and the upstream's own persistent notification stream each independently
+/// ask the source to refresh when they see the stale token rejected, but
+/// neither ever retries more than once per rejection.
 #[tokio::test]
 async fn proxy_surfaces_the_auth_error_when_the_bearer_source_cannot_refresh() {
     let (_dir, state, app) = common::make_enforced_app().await;
@@ -972,10 +975,12 @@ async fn proxy_surfaces_the_auth_error_when_the_bearer_source_cannot_refresh() {
         result.is_err(),
         "an unrecoverable auth failure must surface as an error, not a silent empty success"
     );
-    assert_eq!(
-        source.refresh_attempts.load(Ordering::SeqCst),
-        1,
-        "exactly one refresh attempt, never a retry loop"
+    let refresh_attempts = source.refresh_attempts.load(Ordering::SeqCst);
+    // The POST and the GET stream each ask for at most one refresh, so the
+    // count is bounded: a retry loop would push it past 2.
+    assert!(
+        (1..=2).contains(&refresh_attempts),
+        "each channel asks the source to refresh at most once before giving up; got {refresh_attempts}"
     );
 
     let _ = client.cancel().await;

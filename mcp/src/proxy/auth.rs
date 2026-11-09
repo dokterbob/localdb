@@ -109,7 +109,7 @@ impl StreamableHttpClient for RefreshingHttpClient {
         )
         .await;
         match first {
-            Err(StreamableHttpError::AuthRequired(e)) => match self.retry_token(sent).await {
+            Err(err) if is_auth_rejection(&err) => match self.retry_token(sent).await {
                 Some(new) => {
                     <reqwest::Client as StreamableHttpClient>::post_message(
                         &self.inner,
@@ -121,7 +121,7 @@ impl StreamableHttpClient for RefreshingHttpClient {
                     )
                     .await
                 }
-                None => Err(StreamableHttpError::AuthRequired(e)),
+                None => Err(err),
             },
             other => other,
         }
@@ -167,7 +167,7 @@ impl StreamableHttpClient for RefreshingHttpClient {
         )
         .await;
         match first {
-            Err(StreamableHttpError::AuthRequired(e)) => match self.retry_token(sent).await {
+            Err(err) if is_auth_rejection(&err) => match self.retry_token(sent).await {
                 Some(new) => {
                     <reqwest::Client as StreamableHttpClient>::get_stream(
                         &self.inner,
@@ -179,10 +179,25 @@ impl StreamableHttpClient for RefreshingHttpClient {
                     )
                     .await
                 }
-                None => Err(StreamableHttpError::AuthRequired(e)),
+                None => Err(err),
             },
             other => other,
         }
+    }
+}
+
+/// True when a request failed because the upstream rejected its bearer
+/// token, in either of the two shapes rmcp's reqwest client produces for a
+/// 401: `AuthRequired` (from `post_message`, which recognizes a 401 that
+/// carries `WWW-Authenticate`) or a bare `Client` error (from `get_stream`,
+/// whose `response.error_for_status()` call turns any 401 into one,
+/// `WWW-Authenticate` or not). Either way, asking the source for a fresh
+/// token and retrying once is the right response.
+fn is_auth_rejection(error: &StreamableHttpError<reqwest::Error>) -> bool {
+    match error {
+        StreamableHttpError::AuthRequired(_) => true,
+        StreamableHttpError::Client(e) => e.status() == Some(reqwest::StatusCode::UNAUTHORIZED),
+        _ => false,
     }
 }
 

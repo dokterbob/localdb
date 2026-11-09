@@ -173,7 +173,23 @@ impl<S: AuthStore> AuthService<S> {
     /// this for the authorization-code grant; every access token a caller
     /// can present either comes from here or from a later
     /// `rotate_refresh_token` call, both of which carry a `family_id`.
-    pub async fn issue_session(&self, user_id: &str) -> Result<(IssuedToken, IssuedToken), Error> {
+    ///
+    /// `minted_by_family` is this session's own ancestry: the family of the
+    /// credential that authorized the OAuth exchange creating it (the auth
+    /// code's own `minted_by_family`, carried by
+    /// `server::auth::oauth::handle_auth_code_grant` from
+    /// `redeem_auth_code`), or `None` for a login with no session ancestry
+    /// (the setup code, an invite redemption, or a plain API key). Both new
+    /// tokens carry it, so reuse detection on the ancestor family revokes
+    /// this entire descendant session too (`AuthStore::revoke_compromised_family`'s
+    /// closure) — and `AuthStore::insert_token` refuses to mint this session
+    /// at all if that ancestor was already compromised before the exchange
+    /// completed.
+    pub async fn issue_session(
+        &self,
+        user_id: &str,
+        minted_by_family: Option<String>,
+    ) -> Result<(IssuedToken, IssuedToken), Error> {
         let family = new_ulid();
         let access = self
             .issue_token(
@@ -182,7 +198,7 @@ impl<S: AuthStore> AuthService<S> {
                 Some(rfc3339_from_now(ACCESS_TOKEN_TTL_SECS)),
                 Some(family.clone()),
                 None,
-                None,
+                minted_by_family.clone(),
             )
             .await?;
         let refresh = self
@@ -192,7 +208,7 @@ impl<S: AuthStore> AuthService<S> {
                 Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
                 Some(family),
                 None,
-                None,
+                minted_by_family,
             )
             .await?;
         Ok((access, refresh))
@@ -398,13 +414,19 @@ impl<S: AuthStore> AuthService<S> {
         }
 
         let family = token.family_id.clone().unwrap_or_else(new_ulid);
+        // Both replacements inherit the rotated-away token's own ancestry
+        // (`minted_by_family`), so every row of a session created by
+        // authorizing with another session's credential keeps carrying that
+        // ancestor forward through every rotation — reuse detection on the
+        // ancestor's family still reaches this session's current tokens,
+        // however many times it has rotated since.
         let new_refresh = Self::prepare_token(
             &token.user_id,
             TokenKind::Refresh,
             Some(rfc3339_from_now(REFRESH_TOKEN_TTL_SECS)),
             Some(family.clone()),
             Some(token.id.clone()),
-            None,
+            token.minted_by_family.clone(),
         );
         // The rotated access token joins the same family as the refresh
         // token it was minted alongside, so reuse detection below (and any
@@ -416,7 +438,7 @@ impl<S: AuthStore> AuthService<S> {
             Some(rfc3339_from_now(ACCESS_TOKEN_TTL_SECS)),
             Some(family.clone()),
             None,
-            None,
+            token.minted_by_family.clone(),
         );
         if !self
             .store
@@ -438,12 +460,21 @@ impl<S: AuthStore> AuthService<S> {
     /// §3.1 R5). Redirect-uri validation policy is the caller's
     /// responsibility (`core::auth::validate_redirect_uri`, checked by
     /// `server/src/auth/oauth.rs` before calling this).
+    ///
+    /// `minted_by_family` is the session family (if any) of the credential
+    /// that authorized this `/authorize` request — `server::auth::oauth`
+    /// resolves it via `authenticate_with_origin` for the setup-code/API-key
+    /// branch, and passes `None` for the setup-code branch itself and for an
+    /// invite redemption, both of which have no session ancestry. Carried
+    /// on the code so `redeem_auth_code` can hand it to the session this
+    /// code ultimately mints.
     pub async fn issue_auth_code(
         &self,
         client_id: &str,
         user_id: &str,
         redirect_uri: &str,
         code_challenge: &str,
+        minted_by_family: Option<String>,
     ) -> Result<IssuedAuthCode, Error> {
         let minted = mint_secret();
         let row = AuthCodeRow {
@@ -457,6 +488,7 @@ impl<S: AuthStore> AuthService<S> {
             expires_at: rfc3339_from_now(AUTH_CODE_TTL_SECS),
             consumed_at: None,
             created_at: now_rfc3339(),
+            minted_by_family,
         };
         self.store.create_auth_code(&row).await?;
         Ok(IssuedAuthCode {
@@ -553,13 +585,18 @@ impl<S: AuthStore> AuthService<S> {
     /// uniformly to the RFC 6749 §5.2 `invalid_grant` JSON error — none of
     /// these messages are meant to leak which specific check failed to an
     /// untrusted caller.
+    ///
+    /// Returns the code's own `minted_by_family` alongside the user, so the
+    /// caller (`server::auth::oauth::handle_auth_code_grant`) can pass it to
+    /// `issue_session`, carrying the authorizing credential's session
+    /// ancestry forward onto the new session.
     pub async fn redeem_auth_code(
         &self,
         code: &str,
         client_id: &str,
         redirect_uri: &str,
         code_verifier: &str,
-    ) -> Result<UserRow, Error> {
+    ) -> Result<(UserRow, Option<String>), Error> {
         let hash = hash_secret(code);
         let row = self
             .store
@@ -605,12 +642,14 @@ impl<S: AuthStore> AuthService<S> {
             });
         }
 
-        self.store
+        let user = self
+            .store
             .get_user(&row.user_id)
             .await?
             .ok_or_else(|| Error::Unauthorized {
                 message: "authorization code's user no longer exists".to_string(),
-            })
+            })?;
+        Ok((user, row.minted_by_family))
     }
 
     /// RFC 7009 token revocation: revoke whatever bearer secret `secret`
