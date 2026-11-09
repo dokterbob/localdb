@@ -96,7 +96,7 @@ fn start_invite_mock_daemon(
             } else if method == "POST" && path == "/v1/invites" {
                 (
                     "201 Created",
-                    r#"{"id":"inv1","mode":"open","store_grants":[],"max_uses":1,"expires_at":null,"created_at":"2026-07-07T00:00:00Z","token":"ldb_mock_invite_token","consent_url":"http://127.0.0.1:1/authorize?invite=ldb_mock_invite_token"}"#.to_string(),
+                    r#"{"id":"inv1","mode":"open","store_grants":[],"max_uses":1,"expires_at":null,"created_at":"2026-07-07T00:00:00Z","token":"ldb_mock_invite_token","consent_url":"http://127.0.0.1:1/join?invite=ldb_mock_invite_token"}"#.to_string(),
                 )
             } else if method == "GET" && path == "/v1/invites" {
                 (

@@ -1,26 +1,38 @@
 <p id="request-status" role="status">Waiting for an administrator to approve your access…</p>
 <button id="retry" type="button" hidden>Retry</button>
+<div id="approved-key" hidden>
+  <p>Approved. Your API key (shown once — store it now, it cannot be recovered):</p>
+  <code id="api-key"></code>
+  <p class="hint">Paste it at the consent page your MCP client opens, or set <code>LOCALDB_API_KEY</code>.</p>
+</div>
 <noscript>Enable JavaScript to check approval and finish signing in.</noscript>
 <script>
 (() => {
   const status = document.getElementById('request-status');
   const retry = document.getElementById('retry');
   const form = document.querySelector('form');
-  const { requestId, requestSecret } = document.body.dataset;
-  const url = window.location.pathname.replace(/\/authorize$/, '/v1/invites/requests/') + encodeURIComponent(requestId) + '?secret=' + encodeURIComponent(requestSecret);
+  const approvedKey = document.getElementById('approved-key');
+  const apiKeyEl = document.getElementById('api-key');
+  const { pollUrl, onApprove } = document.body.dataset;
   async function poll() {
     retry.hidden = true;
     try {
-      const response = await fetch(url, { cache: 'no-store', referrerPolicy: 'no-referrer' });
+      const response = await fetch(pollUrl, { cache: 'no-store', referrerPolicy: 'no-referrer' });
       if (!response.ok) throw new Error('Could not check approval. Please retry.');
       const result = await response.json();
       if (result.state === 'pending') {
         status.textContent = 'Waiting for an administrator to approve your access…';
         setTimeout(poll, 1000);
       } else if (result.state === 'approved' && result.api_key) {
-        status.textContent = 'Approved. Finishing sign-in…';
-        form.elements.credential.value = result.api_key;
-        form.submit();
+        if (onApprove === 'show') {
+          status.textContent = 'Approved.';
+          apiKeyEl.textContent = result.api_key;
+          approvedKey.hidden = false;
+        } else {
+          status.textContent = 'Approved. Finishing sign-in…';
+          form.elements.credential.value = result.api_key;
+          form.submit();
+        }
       } else if (result.state === 'denied') {
         status.textContent = 'Your access request was declined. Contact your administrator.';
       } else if (result.state === 'collected') {

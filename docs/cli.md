@@ -634,13 +634,14 @@ Options:
       --max-uses <MAX_USES>  How many times this invite may be redeemed [default: 1]
 ```
 
-Prints a show-once plaintext token plus a ready-made consent URL (`{base}/authorize?invite=<token>`)
-a human can open directly in a browser.
+Prints a show-once plaintext token plus a ready-made join URL (`{base}/join?invite=<token>`) a human
+can open directly in a browser — the standalone join page, not the OAuth consent page, since the
+invitee has no OAuth client and needs no CLI.
 
 ```
 $ localdb invite create --mode open --store shared-docs --expires 7d
 Invite created: ldb_...
-Consent URL: http://127.0.0.1:7700/authorize?invite=ldb_...
+Consent URL: http://127.0.0.1:7700/join?invite=ldb_...
 ```
 
 ### `localdb invite list` / `revoke` / `requests` / `approve` / `deny`

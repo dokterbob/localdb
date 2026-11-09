@@ -88,10 +88,10 @@ plus busy-timeout already make concurrent access with a live daemon safe (the sa
 refusing outright would only get in the way of the one scenario this flag exists for. `invite` (T6)
 follows the same daemon-routed-first, direct-DB-fallback pattern as `user`/`key` (no `--direct-db`
 escape hatch, though — invites aren't a lockout-recovery primitive, so there is no reason to force
-past a running daemon). `invite create` prints the show-once plaintext token plus a ready-made
-consent URL (`{base}/authorize?invite=<token>`, built from the request's own `Host` header in the
-daemon-routed case, or a placeholder pointing at "start a daemon" in the direct-DB case, since there
-is no base URL to build one from without a running daemon).
+past a running daemon). `invite create` prints the show-once plaintext token plus a ready-made join
+URL (`{base}/join?invite=<token>`, built from the request's own `Host` header in the daemon-routed
+case, or a placeholder pointing at "start a daemon" in the direct-DB case, since there is no base
+URL to build one from without a running daemon).
 
 ### 2.1 Schema migrations
 
@@ -569,13 +569,13 @@ route) gets `403`. See §5 for the `unauthorized` (401) / `forbidden` (403) erro
 
 **Route table:**
 
-| Routes                                                                                                                                                                                                                          | Auth                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `GET /v1/invites/requests/{id}` | Public — no bearer token required (these routes _are_ the auth flow, or are the deliberately open invite-redemption/status-check surface).                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `GET /v1/stores/{name}/documents`, `GET /v1/status`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp`                         | Bearer token required once auth is enforced (§3). Results/visibility are scoped by the principal's store access (D7, [02-domain-model.md](02-domain-model.md) §2): admins see every store; members see only `shared` stores they hold a grant for. A named-but-unreadable store (a direct `GET`, or an explicit `store_filter`/MCP `stores` entry naming one) is **403, not 404** — consistent with the filtered list views, and chosen over 404 so a caller can't use the distinction to fish for private store names; see `handlers::stores::get_store`'s doc comment. |
-| `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `GET/POST /v1/jobs`, `GET/DELETE /v1/jobs/{id}`, `GET /v1/jobs/{id}/events`, `GET /v1/config`                                      | Bearer token **and** `role = admin`. Members are readers only in this phase — every mutation, plus `GET /v1/config` (server configuration, not store-scoped content), is admin-only regardless of any store grant.                                                                                                                                                                                                                                                                                                                                                       |
-| `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}`                                           | Bearer token **and** `role = admin` (`Principal::require_admin`), with one carve-out: `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key **for themselves** (`id` equal to the caller's own `user_id`) — every other combination (another user's keys, any user/grant list or mutation) is admin-only.                                                                                                                                                                                                                                           |
-| `GET/POST /v1/invites`, `DELETE /v1/invites/{id}`, `GET /v1/invites/requests`, `POST /v1/invites/requests/{id}/approve`, `POST /v1/invites/requests/{id}/deny` (T6)                                                             | Bearer token **and** `role = admin`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Routes                                                                                                                                                                                                                                             | Auth                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `GET\|POST /join`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `GET /v1/invites/requests/{id}` | Public — no bearer token required (these routes _are_ the auth flow, or are the deliberately open invite-redemption/status-check surface).                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `GET /v1/stores/{name}/documents`, `GET /v1/status`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp`                                            | Bearer token required once auth is enforced (§3). Results/visibility are scoped by the principal's store access (D7, [02-domain-model.md](02-domain-model.md) §2): admins see every store; members see only `shared` stores they hold a grant for. A named-but-unreadable store (a direct `GET`, or an explicit `store_filter`/MCP `stores` entry naming one) is **403, not 404** — consistent with the filtered list views, and chosen over 404 so a caller can't use the distinction to fish for private store names; see `handlers::stores::get_store`'s doc comment. |
+| `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `GET/POST /v1/jobs`, `GET/DELETE /v1/jobs/{id}`, `GET /v1/jobs/{id}/events`, `GET /v1/config`                                                         | Bearer token **and** `role = admin`. Members are readers only in this phase — every mutation, plus `GET /v1/config` (server configuration, not store-scoped content), is admin-only regardless of any store grant.                                                                                                                                                                                                                                                                                                                                                       |
+| `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}`                                                              | Bearer token **and** `role = admin` (`Principal::require_admin`), with one carve-out: `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key **for themselves** (`id` equal to the caller's own `user_id`) — every other combination (another user's keys, any user/grant list or mutation) is admin-only.                                                                                                                                                                                                                                           |
+| `GET/POST /v1/invites`, `DELETE /v1/invites/{id}`, `GET /v1/invites/requests`, `POST /v1/invites/requests/{id}/approve`, `POST /v1/invites/requests/{id}/deny` (T6)                                                                                | Bearer token **and** `role = admin`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 **Status scope:** members receive counts and store details only for their readable stores, including
 job counts restricted to those stores. The shared `database` object (path, size, table statistics)
@@ -640,15 +640,16 @@ lives entirely in `core::auth::AuthService` (no domain logic in `server`/`cli`, 
   "expires_at": null,
   "created_at": "...",
   "token": "ldb_...",
-  "consent_url": "http://<host>/authorize?invite=ldb_..."
+  "consent_url": "http://<host>/join?invite=ldb_..."
 }
 ```
 
 `token` is the show-once plaintext invite secret (blake3-hashed at rest, D1); `consent_url` is built
 from the request's own `Host` header (correct for any bind address/port with no extra `AppState`
-plumbing) and is a ready-made link to the T4 consent page's invite-redemption variant (§below).
-`GET /v1/invites` (admin) lists every invite with no secrets; `DELETE /v1/invites/{id}` (admin)
-revokes one.
+plumbing) and is a ready-made link to the standalone join page (§below) — the field name predates
+that page and stays stable API, even though the link it carries no longer points at the OAuth
+consent page. `GET /v1/invites` (admin) lists every invite with no secrets;
+`DELETE /v1/invites/{id}` (admin) revokes one.
 
 **`POST /v1/invites/redeem`** (public — no bearer, D9 device-authorization-grant pattern): body
 `{"token": "<invite secret>", "name": "<requested user name>"}`.
@@ -697,13 +698,22 @@ UNIQUE constraint) never permanently burns that use — a caller can retry with 
 against the same `max_uses = 1` invite. See `AuthService::redeem_invite`'s doc comment for the full
 reasoning.
 
-**Consent page:** `GET /authorize?invite=<token>` renders an invite-redemption variant of the
-consent form (a "your name" field instead of the setup-code/API-key credential field). Submitting it
-redeems the invite: `open` mode continues OAuth as the newly created user; `closed` mode retains the
-request secret and original OAuth parameters in the waiting page. JavaScript polls the existing
-collection endpoint and resumes authorization after approval. Denial ends the wait; request errors
-offer an explicit retry. The invited user needs no CLI. OAuth and invite responses disable caching
-and referrers.
+**Join page:** `GET /join?invite=<token>` is where `consent_url` points — a standalone page for a
+browser invitee with no OAuth client and no CLI running (an MCP user following an invite link, say).
+A missing or empty `invite` is a `400` HTML error page. Submitting the name form redeems the invite:
+`open` mode ends in a show-once page with the new API key and the granted stores; `closed` mode
+shows a waiting page that polls the same collection endpoint as the consent page below and displays
+the collected key once approved, rather than resuming anything. An empty name or a redemption
+failure re-renders the form with the error. The invited user needs no CLI; OAuth and invite
+responses disable caching and referrers.
+
+**Consent page:** `GET /authorize?invite=<token>` carries an OAuth client's own authorization
+request alongside the invite token, and renders an invite-redemption variant of the consent form (a
+"your name" field instead of the setup-code/API-key credential field). Submitting it redeems the
+invite: `open` mode continues OAuth as the newly created user; `closed` mode retains the request
+secret and original OAuth parameters in the waiting page. JavaScript polls the existing collection
+endpoint and resumes authorization after approval. Denial ends the wait; request errors offer an
+explicit retry. OAuth and invite responses disable caching and referrers.
 
 The CLI's `login --invite` redeems and polls the same JSON endpoints directly. Redemption and
 polling preserve server error codes; only explicit successful `pending` responses keep polling.

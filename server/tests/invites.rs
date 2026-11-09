@@ -154,7 +154,7 @@ async fn admin_invite_create_list_revoke_happy_path() {
     assert!(created["consent_url"]
         .as_str()
         .unwrap()
-        .contains("/authorize?invite="));
+        .contains("/join?invite="));
     let invite_id = created["id"].as_str().unwrap().to_string();
 
     // List: no secrets present.
@@ -230,7 +230,7 @@ async fn consent_url_uses_configured_public_url_over_host_header() {
     let created = json_body(resp.into_body()).await;
     let consent_url = created["consent_url"].as_str().unwrap();
     assert!(
-        consent_url.starts_with("https://db.example.com/authorize?invite="),
+        consent_url.starts_with("https://db.example.com/join?invite="),
         "expected the configured public_url as the base, got: {consent_url}"
     );
 }
@@ -254,7 +254,7 @@ async fn consent_url_falls_back_to_sanitized_host_header_without_public_url() {
     let created = json_body(resp.into_body()).await;
     let consent_url = created["consent_url"].as_str().unwrap();
     assert!(
-        consent_url.starts_with("http://192.168.1.50:8080/authorize?invite="),
+        consent_url.starts_with("http://192.168.1.50:8080/join?invite="),
         "expected the sanitized Host header as the base, got: {consent_url}"
     );
 }
@@ -691,6 +691,8 @@ async fn consent_page_closed_invite_shows_request_submitted_page() {
     assert!(html.contains("Waiting for an administrator"));
     assert!(html.contains("data-request-secret="));
     assert!(html.contains("form.submit()"));
+    assert!(html.contains(r#"data-on-approve="submit""#));
+    assert!(html.contains("data-poll-url="));
 
     // No user was created and no OAuth code issued.
     let user = state
@@ -699,6 +701,111 @@ async fn consent_page_closed_invite_shows_request_submitted_page() {
         .await
         .unwrap();
     assert!(user.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Standalone join page (`GET/POST /join`): a browser-only invitee path for
+// someone with no OAuth client and no CLI running.
+// ---------------------------------------------------------------------------
+
+/// `consent_url` resolves to a page that renders the join form, with the
+/// name field the join flow expects. The OAuth `/authorize` endpoint would
+/// reject a bare `?invite=` link with `unsupported_response_type`.
+#[tokio::test]
+async fn consent_url_path_renders_the_join_form() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin-join-repro", Role::Admin).await;
+    create_store_as(app.clone(), "docs", "shared", Some(&admin_secret)).await;
+    let created = create_invite(app.clone(), &admin_secret, "open", &["docs"], 1).await;
+    let consent_url = created["consent_url"].as_str().unwrap();
+    let parsed = url::Url::parse(consent_url).unwrap();
+    let path = format!("{}?{}", parsed.path(), parsed.query().unwrap_or_default());
+
+    let resp = get(app, &path).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp.into_body()).await;
+    assert!(html.contains(r#"name="requested_name""#));
+}
+
+#[tokio::test]
+async fn get_join_without_invite_is_400() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = get(app, "/join").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_join_open_mode_returns_a_working_api_key() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin-join-open", Role::Admin).await;
+    create_store_as(app.clone(), "docs", "shared", Some(&admin_secret)).await;
+    let created = create_invite(app.clone(), &admin_secret, "open", &["docs"], 1).await;
+    let token = created["token"].as_str().unwrap().to_string();
+
+    let resp = post_form(
+        app.clone(),
+        "/join",
+        &[
+            ("invite", token.as_str()),
+            ("requested_name", "join-newbie"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let html = body_string(resp.into_body()).await;
+    let api_key = html
+        .split("<code>")
+        .nth(1)
+        .and_then(|s| s.split("</code>").next())
+        .expect("the page must carry the API key in a <code> block")
+        .to_string();
+    assert!(api_key.starts_with("ldb_"));
+
+    let resp = request_with_bearer(app, Method::GET, "/v1/auth/me", None, Some(&api_key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_join_closed_mode_returns_a_waiting_page() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin-join-closed", Role::Admin).await;
+    let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
+    let token = created["token"].as_str().unwrap().to_string();
+
+    let resp = post_form(
+        app,
+        "/join",
+        &[
+            ("invite", token.as_str()),
+            ("requested_name", "join-closed"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp.into_body()).await;
+    assert!(html.contains(r#"data-on-approve="show""#));
+    assert!(html.contains("data-poll-url="));
+    assert!(html.contains(r#"id="api-key""#));
+}
+
+#[tokio::test]
+async fn post_join_bad_token_rerenders_form_with_error() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = post_form(
+        app,
+        "/join",
+        &[
+            ("invite", "ldb_totally-unknown"),
+            ("requested_name", "someone"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let html = body_string(resp.into_body()).await;
+    assert!(html.contains(r#"name="requested_name""#));
+    assert!(html.contains("class=\"error\""));
 }
 
 #[tokio::test]

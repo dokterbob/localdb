@@ -7,6 +7,7 @@
 //! one-time setup-code bootstrap seam (D3b, redeemed by `/authorize` in T4).
 
 pub mod base_url;
+pub mod join;
 pub mod middleware;
 pub mod oauth;
 pub mod register;

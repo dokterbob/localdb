@@ -218,9 +218,9 @@ fn print_created_invite(ctx: &CliContext, v: &serde_json::Value, via_daemon: boo
     println!("Store this now — it is shown only once and cannot be recovered.");
     match v.get("consent_url").and_then(|c| c.as_str()) {
         Some(url) => println!("Consent URL: {url}"),
-        None => println!(
-            "Consent URL: start a daemon and visit <daemon base url>/authorize?invite={token}"
-        ),
+        None => {
+            println!("Consent URL: start a daemon and visit <daemon base url>/join?invite={token}")
+        }
     }
 }
 

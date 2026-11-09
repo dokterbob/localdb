@@ -171,8 +171,10 @@ async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
 
 /// Escape a value for safe interpolation into the consent page HTML (XSS
 /// hardening for `client_id`/`redirect_uri`/`state`, which are fully
-/// attacker-controlled query/form params).
-fn escape_html(s: &str) -> String {
+/// attacker-controlled query/form params). Shared with the standalone join
+/// page (`super::join`), which renders its own HTML for the same invite
+/// -redemption data.
+pub(super) fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -259,17 +261,28 @@ button {{ margin-top: 20px; padding: 8px 20px; font-size: 1rem; }}
 }
 
 /// The browser uses the same collection endpoint as CLI login, then resumes
-/// the original authorization with the new credential (no second invite redemption).
+/// the original authorization with the new credential (no second invite
+/// redemption). `data-poll-url` is a relative path, built from this route's
+/// own prefix rather than parsed out of it client-side, so it keeps working
+/// behind any path prefix the daemon is mounted under. `data-on-approve`
+/// tells the shared script in `invite_wait.html` to resume this OAuth form
+/// on approval, rather than display the collected key the way the
+/// standalone join page's own waiting page does (`super::join`).
 fn render_request_submitted_page(
     params: &ValidParams,
     request_id: &str,
     request_secret: &str,
 ) -> Html<String> {
     let page = render_consent_page(params, "", None, None).0;
+    let poll_url = escape_html(&format!(
+        "v1/invites/requests/{request_id}?secret={request_secret}"
+    ));
     let body = format!(
-        "<body data-request-id=\"{}\" data-request-secret=\"{}\">",
+        "<body data-request-id=\"{}\" data-request-secret=\"{}\" data-poll-url=\"{}\" \
+         data-on-approve=\"submit\">",
         escape_html(request_id),
-        escape_html(request_secret)
+        escape_html(request_secret),
+        poll_url,
     );
     Html(
         page.replace("<body>", &body)

@@ -327,6 +327,10 @@ pub fn build_router(
             "/authorize",
             get(auth::oauth::get_authorize).post(auth::oauth::post_authorize),
         )
+        .route(
+            "/join",
+            get(auth::join::get_join).post(auth::join::post_join),
+        )
         .route("/token", post(auth::oauth::post_token))
         .route("/revoke", post(auth::oauth::post_revoke))
         .route("/register", post(auth::register::post_register))

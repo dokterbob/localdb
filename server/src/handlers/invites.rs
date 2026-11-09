@@ -140,8 +140,9 @@ fn default_max_uses() -> u32 {
 
 /// The show-once response to `POST /v1/invites`: `token` is the plaintext
 /// invite secret, never persisted or retrievable again after this response
-/// (D1) — and `consent_url` is a ready-made link to the OAuth2 consent page
-/// (T4 seam) pre-filled with it, for the `open`-mode browser flow.
+/// (D1) — and `consent_url` is a ready-made link to the standalone join page
+/// (`server::auth::join`) pre-filled with it, for a browser invitee with no
+/// CLI and no OAuth client.
 #[derive(Debug, Serialize)]
 pub struct CreateInviteResponse {
     pub id: String,
@@ -206,7 +207,7 @@ pub async fn create_invite(
         )
         .await?;
 
-    let consent_url = format!("{base}/authorize?invite={}", issued.secret);
+    let consent_url = format!("{base}/join?invite={}", issued.secret);
 
     Ok((
         StatusCode::CREATED,
