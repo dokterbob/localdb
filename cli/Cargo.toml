@@ -27,7 +27,7 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 indicatif = { workspace = true }
 percent-encoding = { workspace = true }
 # `bytes_stream()` on a `reqwest::Response` yields a `futures_util::Stream`

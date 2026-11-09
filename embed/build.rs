@@ -193,9 +193,21 @@ fn ensure_tarball(out_dir: &Path, asset: &Asset) -> PathBuf {
 fn download(url: &str) -> Vec<u8> {
     // ureq follows redirects by default (GitHub release assets 302 to a
     // separate asset host), honors HTTPS_PROXY/ALL_PROXY from the environment,
-    // and uses rustls for TLS (see Cargo.toml). `into_reader` rather than
-    // `read_to_vec`, which caps bodies at 10 MB.
-    let response = ureq::get(url)
+    // and uses rustls for TLS (see Cargo.toml). Certificates are checked
+    // against the OS trust store through rustls-platform-verifier, as reqwest
+    // does at runtime: ureq's default is its bundled webpki roots, which
+    // reject a TLS-intercepting proxy's CA that the host itself trusts.
+    // `into_reader` rather than `read_to_vec`, which caps bodies at 10 MB.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
+        .into();
+    let response = agent
+        .get(url)
         .call()
         .unwrap_or_else(|e| panic!("failed to download {url}: {e}"));
     let mut bytes = Vec::new();
