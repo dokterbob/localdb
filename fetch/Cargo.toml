@@ -16,7 +16,7 @@ name = "fetch"
 [dependencies]
 localdb-core = { path = "../core", version = "0.2.0" }
 async-trait = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # Real dependency, not just dev: `destination::GuardedResolver` resolves names
 # itself via `tokio::net::lookup_host` (`reqwest::dns::Resolve` has no
 # delegate-to-default hook).

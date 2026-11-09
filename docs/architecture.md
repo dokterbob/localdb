@@ -322,6 +322,40 @@ inherits the _build machine's_ glibc floor independent of this mechanism, the re
 workflows also pin Linux builds to `ubuntu-22.04` (not `ubuntu-latest`) and verify both the
 `localdb` binary and the embedded `.so` stay at or below `GLIBC_2.35`.
 
+**TLS certificate trust (all platforms).** localdb verifies HTTPS against the **operating system's
+trust store**, not a certificate list compiled into the binary. reqwest (in `fetch`, `embed` and
+`cli`) uses its default `rustls` feature, which verifies through `rustls-platform-verifier`, and
+`embed/build.rs` configures its ureq agent with `RootCerts::PlatformVerifier` to match. Where the
+roots come from:
+
+- **macOS / Windows:** the platform verifier (Security.framework / CryptoAPI), so keychain or
+  group-policy CAs, including a corporate proxy's, are trusted as the OS trusts them.
+- **Linux:** the system bundle, loaded via `rustls-native-certs`: `SSL_CERT_FILE` / `SSL_CERT_DIR`
+  if set, otherwise the distro's standard locations (`/etc/ssl/certs/ca-certificates.crt` and
+  friends). A CA added with `update-ca-certificates` / `update-ca-trust` is trusted after that
+  command runs.
+
+Why: bundled Mozilla roots (`webpki-roots`) reject any CA the host trusts but Mozilla doesn't. That
+breaks every model download and hosted-provider call behind a TLS-intercepting proxy (corporate
+networks, sandboxed CI and cloud dev environments), and `embed/build.rs`'s ONNX Runtime download
+along with them. A bundled list also only drops a distrusted root when a crate bump ships, not when
+the OS's own CA updates do.
+
+**Failure mode: a host with no CA certificates.** Minimal container images (`scratch`, distroless
+`static`, Alpine or Debian slim without the `ca-certificates` package) have no trust store, so every
+HTTPS request fails certificate verification. That covers model downloads, hosted embedding
+providers, URL and feed ingestion, and building from source (`build.rs`). Local-only use with an
+already-cached model keeps working. Fix it by installing `ca-certificates`, or by pointing
+`SSL_CERT_FILE` at a PEM bundle; offline builds can also skip the `build.rs` download with
+`LOCALDB_ORT_LIB` (above).
+
+**Exception:** models that `fastembed` downloads itself (e.g. `bge-small-en-v1.5`, through
+`hf-hub`'s ureq client) still verify against `webpki-roots`. `hf-hub` builds its own agent and
+exposes no TLS settings, and ureq's default roots are `webpki-roots` even with its
+`platform-verifier` feature enabled. Behind an intercepting proxy those downloads fail until
+`hf-hub` gains a TLS option; the default `pplx-embed-context-v1-0.6b` model downloads through
+localdb's own reqwest client and is not affected.
+
 ---
 
 <a id="known-gaps"></a>

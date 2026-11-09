@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router, ServerHandler,
 };
 
@@ -120,8 +120,8 @@ impl McpHandler {
 // wasted work for a routing table that never changes at runtime.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("localdb", env!("CARGO_PKG_VERSION")))
     }
 }

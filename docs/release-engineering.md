@@ -85,7 +85,7 @@ hand-maintained `workflow_call` workflows:
 
 | Platform            | Target triple               | Runner             | Notes                  |
 | ------------------- | --------------------------- | ------------------ | ---------------------- |
-| macOS Apple Silicon | `aarch64-apple-darwin`      | `macos-14`         | CoreML built in        |
+| macOS Apple Silicon | `aarch64-apple-darwin`      | `macos-15`         | CoreML built in        |
 | Linux x86_64        | `x86_64-unknown-linux-gnu`  | `ubuntu-22.04`     | glibc-2.35 floor       |
 | Linux arm64         | `aarch64-unknown-linux-gnu` | `ubuntu-22.04-arm` | native build, no cross |
 

@@ -345,7 +345,7 @@ impl LibsqlDb {
 ///
 /// # Even the explicit path isn't fully panic-proof
 ///
-/// Per vendored libsql 0.10.0-pre.4 (`local::Transaction::commit`/
+/// Per vendored libsql 0.10.0 (`local::Transaction::commit`/
 /// `rollback`): if the COMMIT/ROLLBACK statement itself errors, the method
 /// returns that `Err` while the transaction is still open (non-autocommit) —
 /// so `Transaction`'s own `Drop` then fires and retries a rollback. If that
