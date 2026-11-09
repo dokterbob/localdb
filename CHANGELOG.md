@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format follows [Common Changelog](https://common-changelog.org).
 
+## [0.2.1] - 2026-11-09
+
+### Changed
+
+- Security dependency bumps for 0.2.1; verify TLS against the OS trust store ([#363](https://github.com/dokterbob/localdb/pull/363)) ([`18dffed`](https://github.com/dokterbob/localdb/commit/18dffed70cc9904f26ebcce06ab3925bf4b5c3bf))
+
+
 ## [0.2.0] - 2026-09-06
 
 Indexing gets dramatically cheaper on unchanged content: conditional GETs, a feed entry recheck
