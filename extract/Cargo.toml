@@ -54,6 +54,6 @@ quick-xml = "=0.40.1"
 # (issue #251) to open docProps/core.xml at extraction time. Pinned to major
 # 8 to match rbook's transitive zip 8.6.0 — the 2.x pin previously used only
 # in tests would otherwise compile two zip majors into the binary.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 tracing = { workspace = true }
