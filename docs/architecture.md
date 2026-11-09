@@ -238,8 +238,13 @@ transitively — any other session created by authorizing an `/authorize` reques
 from that family, plus everything minted under that descendant session in turn. Every family swept
 this way is also recorded as compromised, so a token insert naming one as its ancestor is refused
 rather than slipping in after the fact. Logout revokes only the session's own access and refresh
-tokens, with no such marker. API keys (`localdb key create`) share the same token table, never
-expire by default, and track `last_used_at`.
+tokens, with no such marker. The sweep covers credentials only, not administrative actions taken
+with the session: users and invites it created, grants it changed and users it deleted are left as
+they are. A user's deletion removes that user's token rows, and with them the ancestry links they
+carried, so credentials derived through a deleted user's session are out of the sweep's reach. After
+a compromised _admin_ session, review users, keys and invites as well. API keys
+(`localdb key create`) share the same token table, never expire by default, and track
+`last_used_at`.
 
 **OAuth2 authorization-code + PKCE (S256)** is the flow behind `GET/POST /authorize` (an inline-HTML
 consent page) and `POST /token`. `POST /revoke` implements RFC 7009 (always `200`, even for an

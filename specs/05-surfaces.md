@@ -613,11 +613,17 @@ so a token insert naming one as its `minted_by_family` — racing the sweep, or 
 in-flight OAuth exchange — is refused rather than slipping in after the fact. Logout (`POST /revoke`
 on a refresh token) revokes only the session's own access and refresh tokens, never a key minted
 under it, and writes no compromise marker — a key minted from a tainted key after an ordinary logout
-still works. API keys share the same `auth_tokens` table (`kind = 'api_key'`), have no default
-expiry, and track `last_used_at`. OAuth2 authorization-code + PKCE (S256) is the flow behind
-`/authorize` and `/token`. Verifiers require 43–128 ASCII unreserved characters. Refresh-token
-revocation and replacement tokens commit atomically. CLI refresh and cache mutations use one
-cross-process lock per credentials file.
+still works. **Scope of the sweep:** it revokes credentials derived from the session, and only
+those. It does not undo administrative actions the session performed. Users it created, invites it
+issued (an open invite redeems to a fresh key with no session ancestry), grants it changed, and
+users it deleted are untouched. Deleting a user also deletes that user's token rows, and with them
+any ancestry links they carried, so credentials derived through a deleted user's session are no
+longer reachable from the sweep. Recovering from a compromised _admin_ session therefore also means
+reviewing users, keys and invites (`localdb user list`, `key list`, `invite list`). API keys share
+the same `auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`.
+OAuth2 authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`. Verifiers
+require 43–128 ASCII unreserved characters. Refresh-token revocation and replacement tokens commit
+atomically. CLI refresh and cache mutations use one cross-process lock per credentials file.
 
 **Dynamic Client Registration (T7, RFC 7591):** `POST /register` is public/unauthenticated, so it
 enforces per-request size caps on registration metadata — at most 5 `redirect_uris`, each at most
