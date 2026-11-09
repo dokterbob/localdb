@@ -94,9 +94,9 @@ tempfile = "3"
 # embed/src/ort_runtime.rs). ureq is rustls-based and follows redirects (GitHub release assets
 # redirect to objects.githubusercontent.com).
 [build-dependencies]
-# ureq's "tls" feature (despite the generic name) wires up its rustls-based TLS backend
-# (webpki + webpki-roots + rustls) with no native-tls/OpenSSL dependency.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# ureq's "rustls" feature wires up its rustls TLS backend (ring provider + webpki-roots)
+# with no native-tls/OpenSSL dependency.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 hex = "0.4"
 flate2 = "1"

@@ -191,13 +191,16 @@ fn ensure_tarball(out_dir: &Path, asset: &Asset) -> PathBuf {
 }
 
 fn download(url: &str) -> Vec<u8> {
-    // ureq follows redirects by default (GitHub release assets 302 to
-    // objects.githubusercontent.com) and uses rustls for TLS (see Cargo.toml).
+    // ureq follows redirects by default (GitHub release assets 302 to a
+    // separate asset host), honors HTTPS_PROXY/ALL_PROXY from the environment,
+    // and uses rustls for TLS (see Cargo.toml). `into_reader` rather than
+    // `read_to_vec`, which caps bodies at 10 MB.
     let response = ureq::get(url)
         .call()
         .unwrap_or_else(|e| panic!("failed to download {url}: {e}"));
     let mut bytes = Vec::new();
     response
+        .into_body()
         .into_reader()
         .read_to_end(&mut bytes)
         .unwrap_or_else(|e| panic!("failed to read response body from {url}: {e}"));

@@ -589,8 +589,20 @@ mod tests {
             .expect("listener must have a local addr");
 
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             if let Ok((mut socket, _)) = listener.accept().await {
+                // Read the request head before answering, as a real server
+                // does: hyper rejects a response that arrives before its
+                // request has been written (`UnexpectedMessage`), which would
+                // fail `send()` instead of the body read under test.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
                 // Promises 100 bytes of body, sends 5, then the connection
                 // closes (`socket` dropping at the end of this block) —
                 // reqwest only discovers the mismatch when the body is

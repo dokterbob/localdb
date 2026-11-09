@@ -65,8 +65,11 @@ tokio-util = "0.7"
 directories = "6"
 dirs = "6"
 
-# libSQL (Turso's SQLite fork) — async, DiskANN vectors, FTS5
-libsql = "=0.10.0-pre.4"
+# libSQL (Turso's SQLite fork) — async, DiskANN vectors, FTS5. Only local
+# database files are opened, so default features are off: `remote`,
+# `replication`, `sync` and `tls` add a Hrana/gRPC client with its own older
+# hyper 0.14 + rustls 0.22 stack that nothing here uses.
+libsql = { version = "=0.10.0", default-features = false, features = ["core"] }
 
 # URL parsing
 url = "2"

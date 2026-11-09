@@ -22,7 +22,7 @@ test-support = []
 
 [dependencies]
 localdb-core = { path = "../core", version = "0.2.0" }
-libsql = "0.10.0-pre.4"
+libsql = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
