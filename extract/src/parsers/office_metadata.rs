@@ -81,8 +81,8 @@ fn parse_core_properties(xml: &str) -> Option<OfficeCoreProperties> {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {
                 current = match e.name().local_name().as_ref() {
-                    b"title" => Some(Field::Title),
-                    b"created" => Some(Field::Created),
+                    "title" => Some(Field::Title),
+                    "created" => Some(Field::Created),
                     _ => None,
                 };
             }
@@ -91,8 +91,7 @@ fn parse_core_properties(xml: &str) -> Option<OfficeCoreProperties> {
             Ok(Event::Empty(_)) => {}
             Ok(Event::Text(t)) => {
                 if current.is_some() {
-                    let decoded = t.decode().ok()?;
-                    let text = quick_xml::escape::unescape(&decoded).ok()?.into_owned();
+                    let text = quick_xml::escape::unescape(&t).ok()?.into_owned();
                     assign_field(&current, &text, &mut props);
                 }
             }
@@ -101,8 +100,7 @@ fn parse_core_properties(xml: &str) -> Option<OfficeCoreProperties> {
             // corrupted (or error out as a malformed entity reference).
             Ok(Event::CData(t)) => {
                 if current.is_some() {
-                    let text = std::str::from_utf8(t.as_ref()).ok()?;
-                    assign_field(&current, text, &mut props);
+                    assign_field(&current, &t, &mut props);
                 }
             }
             Ok(Event::End(_)) => current = None,
@@ -116,7 +114,7 @@ fn parse_core_properties(xml: &str) -> Option<OfficeCoreProperties> {
 
 /// Assign already-decoded `text` to whichever field `current` names, if any,
 /// once trimmed non-empty. Shared tail for the `Text` and `CData` arms, which
-/// differ only in how they turn their raw event bytes into `text`.
+/// differ only in whether their event content is entity-unescaped first.
 fn assign_field(current: &Option<Field>, text: &str, props: &mut OfficeCoreProperties) {
     if let Some(field) = current {
         let trimmed = text.trim();

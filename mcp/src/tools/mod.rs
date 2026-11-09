@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use localdb_core::{
     citation::Citation,
@@ -40,7 +40,7 @@ fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
             "message": message.into(),
         }
     });
-    CallToolResult::error(vec![Content::text(
+    CallToolResult::error(vec![ContentBlock::text(
         serde_json::to_string_pretty(&v).unwrap_or_default(),
     )])
 }
@@ -48,7 +48,7 @@ fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
 /// Build a successful `CallToolResult` carrying pretty-printed JSON as its
 /// single text content item.
 fn success_json(value: &Value) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(
+    CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).unwrap_or_default(),
     )])
 }
@@ -260,7 +260,7 @@ fn search_to_tool_result(response: QueryResponse, content_length: usize) -> Call
     let json_str = serde_json::to_string_pretty(&v).unwrap_or_default();
     let full_text = format!("{json_str}\n\n---\n{text_rendering}");
 
-    CallToolResult::success(vec![Content::text(full_text)])
+    CallToolResult::success(vec![ContentBlock::text(full_text)])
 }
 
 pub async fn tool_search(

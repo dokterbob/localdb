@@ -19,7 +19,7 @@ mod common;
 
 use axum::http::{Method, StatusCode};
 use rmcp::{
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
     },
@@ -61,7 +61,7 @@ async fn mcp_route_lists_and_calls_tools_over_real_http() {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .expect("client should complete the MCP initialize handshake");
