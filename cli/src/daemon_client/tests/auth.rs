@@ -822,3 +822,44 @@ async fn valid_cached_credentials_do_not_require_a_writable_lock_file() {
         Some("read-only-key")
     );
 }
+
+/// A token that is still valid, but due for a proactive refresh (inside the
+/// refresh margin), must not be dropped just because the lock file can't be
+/// opened — the same unwritable-lock fixture as
+/// `valid_cached_credentials_do_not_require_a_writable_lock_file`, but with
+/// a soon-expiring token instead of a non-expiring one.
+#[tokio::test]
+async fn soon_expiring_credentials_fall_back_to_the_cached_bearer_when_the_lock_file_is_unwritable()
+{
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.yaml");
+    let path = crate::credentials::credentials_path(&config);
+    let base = "https://daemon.example";
+    crate::credentials::write_entry(
+        &path,
+        base,
+        crate::credentials::CredentialEntry {
+            access_token: Some("soon-expiring".into()),
+            access_expires_at: Some(localdb_core::auth::rfc3339_from_now(10)),
+            refresh_token: Some("refresh-me".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Deterministically prevent opening a lock file, even when tests run as root.
+    std::fs::create_dir(dir.path().join("credentials.lock")).unwrap();
+
+    let ctx = ctx_with_config(&config);
+    assert_eq!(
+        fresh_bearer_for_url(&ctx, base).await.as_deref(),
+        Some("soon-expiring"),
+        "a still-valid token must not be dropped just because a proactive \
+         refresh can't take the lock"
+    );
+
+    assert_eq!(
+        refresh_cached_bearer(&ctx, base, Some("soon-expiring")).await,
+        None,
+        "a bearer the daemon already rejected must never be reused, lock or no lock"
+    );
+}

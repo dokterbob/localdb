@@ -291,9 +291,17 @@ pub(crate) async fn refresh_cached_bearer(
     if !needs_refresh(&entry) {
         return entry.access_token.or(entry.secret);
     }
-    let lock = crate::credentials::CredentialLock::acquire(&path)
+    let current = entry.access_token.clone().or_else(|| entry.secret.clone());
+    let Some(lock) = crate::credentials::CredentialLock::acquire(&path)
         .await
-        .ok()?;
+        .ok()
+    else {
+        // A still-usable token must not be dropped just because a proactive
+        // refresh can't take the lock (read-only credentials dir, or
+        // something else occupying the lock path) — only a bearer the
+        // daemon already rejected must never be reused.
+        return if rejected.is_none() { current } else { None };
+    };
     let entry = lock.lookup(base_url)?;
     let current = entry.access_token.clone().or_else(|| entry.secret.clone());
     // A process that waited for the lock must recheck the replacement entry.
