@@ -34,7 +34,7 @@
 //! statement itself errors, `Transaction::rollback` returns that `Err` while
 //! the connection is still non-autocommit, so `Transaction`'s own `Drop`
 //! then retries a rollback — and if *that* also fails, libsql panics before
-//! our `tracing::error!` below ever runs (see vendored libsql 0.10.0-pre.4's
+//! our `tracing::error!` below ever runs (see vendored libsql 0.10.0's
 //! `local::Transaction::commit`/`rollback`). So explicit rollback reliably
 //! handles and logs the common, first-order failure; a *persistently*
 //! failing ROLLBACK (disk gone, etc.) still panics regardless, an upstream

@@ -151,7 +151,7 @@ async fn get_stream_retries_once_on_a_bare_401_and_succeeds() {
     let result = client
         .get_stream(
             Arc::from(uri.as_str()),
-            Arc::from("session-1"),
+            Some(Arc::from("session-1")),
             None,
             None,
             HashMap::new(),
@@ -183,7 +183,7 @@ async fn get_stream_gives_up_when_the_source_cannot_refresh() {
     let result = client
         .get_stream(
             Arc::from(uri.as_str()),
-            Arc::from("session-1"),
+            Some(Arc::from("session-1")),
             None,
             None,
             HashMap::new(),

@@ -27,7 +27,7 @@ use axum::http::{Method, StatusCode};
 use localdb_core::auth::AuthStore as _;
 use mcp::proxy::BearerSource;
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, ClientInfo},
+    model::{CallToolRequestParams, CallToolResult, ClientConfig},
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
     },
@@ -71,7 +71,7 @@ async fn mcp_route_lists_and_calls_tools_over_real_http() {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .expect("client should complete the MCP initialize handshake");
@@ -140,7 +140,7 @@ async fn mcp_route_sees_a_store_created_after_the_router_was_built() {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .expect("client should complete the MCP initialize handshake");
@@ -227,7 +227,7 @@ async fn mcp_route_reports_provider_errors_as_tool_errors_and_stays_up() {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .expect("client should complete the MCP initialize handshake");
@@ -298,7 +298,7 @@ async fn enforced_mcp_propagates_principal_from_middleware_into_tool_handler() {
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
             .auth_header(secret),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .expect("authenticated client should complete the MCP initialize handshake");
@@ -337,7 +337,7 @@ async fn enforced_mcp_rejects_unauthenticated_client_at_handshake() {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    let handshake = ClientInfo::default().serve(transport).await;
+    let handshake = ClientConfig::default().serve(transport).await;
     assert!(
         handshake.is_err(),
         "initialize without a bearer token must fail against an enforcing daemon"
@@ -385,7 +385,7 @@ async fn connect_mcp_client(
     app: axum::Router,
     bearer: Option<&str>,
 ) -> (
-    rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>,
+    rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
     tokio::task::JoinHandle<()>,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -401,7 +401,7 @@ async fn connect_mcp_client(
         config = config.auth_header(secret.to_string());
     }
     let transport = StreamableHttpClientTransport::from_config(config);
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .expect("client should complete the MCP initialize handshake");
@@ -794,7 +794,10 @@ async fn scoped_proxy_authenticates_to_enforced_daemon() {
             .await
             .unwrap();
     });
-    let client = ClientInfo::default().serve(client_transport).await.unwrap();
+    let client = ClientConfig::default()
+        .serve(client_transport)
+        .await
+        .unwrap();
     let result = client
         .call_tool(CallToolRequestParams::new("list_stores"))
         .await
@@ -887,7 +890,10 @@ async fn proxy_refreshes_a_revoked_bearer_mid_session_and_retries_once() {
             .await
             .unwrap();
     });
-    let client = ClientInfo::default().serve(client_transport).await.unwrap();
+    let client = ClientConfig::default()
+        .serve(client_transport)
+        .await
+        .unwrap();
 
     let first = client
         .call_tool(CallToolRequestParams::new("list_stores"))
@@ -964,7 +970,10 @@ async fn proxy_surfaces_the_auth_error_when_the_bearer_source_cannot_refresh() {
             .await
             .unwrap();
     });
-    let client = ClientInfo::default().serve(client_transport).await.unwrap();
+    let client = ClientConfig::default()
+        .serve(client_transport)
+        .await
+        .unwrap();
 
     state.auth_store().revoke_token(&key.row.id).await.unwrap();
 

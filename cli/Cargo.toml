@@ -28,7 +28,9 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# `form`: the OAuth `/token` exchanges in `cmds/login.rs` and `daemon_client.rs`
+# post `application/x-www-form-urlencoded` bodies.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form"] }
 indicatif = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }

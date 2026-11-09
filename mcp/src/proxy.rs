@@ -35,8 +35,8 @@ use std::sync::Arc;
 
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
     },
     service::{RequestContext, RoleClient, RoleServer, RunningService, ServiceError},
     transport::{
@@ -146,7 +146,7 @@ fn scope_rejection(requested: &str, allowed: &str) -> CallToolResult {
             ),
         }
     });
-    CallToolResult::error(vec![Content::text(
+    CallToolResult::error(vec![ContentBlock::text(
         serde_json::to_string_pretty(&v).unwrap_or_default(),
     )])
 }
@@ -190,7 +190,7 @@ impl std::error::Error for ProxyConnectError {}
 /// — and the upstream `initialize` handshake it already completed — alive
 /// for as long as this stdio process serves requests.
 pub struct ProxyHandler {
-    upstream: RunningService<RoleClient, rmcp::model::ClientInfo>,
+    upstream: RunningService<RoleClient, rmcp::model::ClientConfig>,
     /// `None` = unscoped (no `--store` given): every request relays verbatim.
     scope: Option<ProxyScope>,
 }
@@ -246,14 +246,14 @@ impl ProxyHandler {
                     RefreshingHttpClient::new(source),
                     config,
                 );
-                rmcp::model::ClientInfo::default()
+                rmcp::model::ClientConfig::default()
                     .serve(transport)
                     .await
                     .map_err(|e| ProxyConnectError::Unreachable(e.into()))?
             }
             None => {
                 let transport = StreamableHttpClientTransport::from_config(config);
-                rmcp::model::ClientInfo::default()
+                rmcp::model::ClientConfig::default()
                     .serve(transport)
                     .await
                     .map_err(|e| ProxyConnectError::Unreachable(e.into()))?
@@ -482,7 +482,7 @@ impl ProxyHandler {
                 .is_some_and(|id| scope.allows(id))
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&parsed).unwrap_or_default(),
         )]))
     }
@@ -490,7 +490,7 @@ impl ProxyHandler {
 
 /// Ask the upstream for its store set via its own `list_stores` tool.
 async fn fetch_upstream_stores(
-    upstream: &RunningService<RoleClient, rmcp::model::ClientInfo>,
+    upstream: &RunningService<RoleClient, rmcp::model::ClientConfig>,
 ) -> anyhow::Result<Vec<UpstreamStore>> {
     let result = upstream
         .call_tool(CallToolRequestParams::new("list_stores"))
@@ -549,8 +549,8 @@ fn upstream_error_to_mcp(err: ServiceError) -> McpError {
 }
 
 impl ServerHandler for ProxyHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("localdb", env!("CARGO_PKG_VERSION")))
     }
 
@@ -572,39 +572,47 @@ impl ServerHandler for ProxyHandler {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let Some(scope) = &self.scope else {
-            // Unscoped: byte-identical relay, including for unknown tool
-            // names — the upstream owns "tool not found".
-            return self.relay(request).await;
-        };
+    ) -> Result<CallToolResponse, McpError> {
+        // rmcp's handler returns `CallToolResponse`, which also models an
+        // input-required reply; every path here completes the call.
+        let result: Result<CallToolResult, McpError> = async {
+            let Some(scope) = &self.scope else {
+                // Unscoped: byte-identical relay, including for unknown tool
+                // names — the upstream owns "tool not found".
+                return self.relay(request).await;
+            };
 
-        match request.name.as_ref() {
-            "search" => self.call_search_scoped(request, scope).await,
-            "get_document" | "get_chunks" => self.call_single_store_scoped(request, scope).await,
-            "list_documents" => self.call_list_documents_scoped(request, scope).await,
-            "list_stores" => self.call_list_stores_scoped(request, scope).await,
-            // Deliberately a denylist-free allowlist: a scoped session
-            // relays only the five tools whose store semantics are known
-            // here. Falling through to a verbatim relay would mean the first
-            // mutating tool ever added (`--allow-write`, specs/05-surfaces.md
-            // §4) silently bypasses the scope on the day it lands. Making
-            // that a compile-time-visible gap is the point — the tripwire is
-            // `mcp_tool_set_identical_with_and_without_allow_write`.
-            other => Ok(CallToolResult::error(vec![Content::text(
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "error": {
-                        "code": "invalid_request",
-                        "message": format!(
-                            "tool '{other}' has no --store scoping rule, so it cannot be \
-                             served on a store-scoped MCP session; re-run `localdb mcp` \
-                             without --store to reach it"
-                        ),
-                    }
-                }))
-                .unwrap_or_default(),
-            )])),
+            match request.name.as_ref() {
+                "search" => self.call_search_scoped(request, scope).await,
+                "get_document" | "get_chunks" => {
+                    self.call_single_store_scoped(request, scope).await
+                }
+                "list_documents" => self.call_list_documents_scoped(request, scope).await,
+                "list_stores" => self.call_list_stores_scoped(request, scope).await,
+                // Deliberately a denylist-free allowlist: a scoped session
+                // relays only the five tools whose store semantics are known
+                // here. Falling through to a verbatim relay would mean the first
+                // mutating tool ever added (`--allow-write`, specs/05-surfaces.md
+                // §4) silently bypasses the scope on the day it lands. Making
+                // that a compile-time-visible gap is the point — the tripwire is
+                // `mcp_tool_set_identical_with_and_without_allow_write`.
+                other => Ok(CallToolResult::error(vec![ContentBlock::text(
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "error": {
+                            "code": "invalid_request",
+                            "message": format!(
+                                "tool '{other}' has no --store scoping rule, so it cannot be \
+                                 served on a store-scoped MCP session; re-run `localdb mcp` \
+                                 without --store to reach it"
+                            ),
+                        }
+                    }))
+                    .unwrap_or_default(),
+                )])),
+            }
         }
+        .await;
+        result.map(CallToolResponse::from)
     }
 }
 

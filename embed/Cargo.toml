@@ -30,7 +30,7 @@ tracing = { workspace = true }
 async-trait = "0.1"
 
 # HTTP client for hosted providers
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 
 # Shared outgoing-HTTP layer (issue #207): user agent, retry/backoff/jitter,
 # and Retry-After handling for hosted-provider requests. `fetch` depends only
@@ -92,11 +92,12 @@ tempfile = "3"
 
 # build.rs downloads and verifies the embedded ONNX Runtime shared library (see build.rs and
 # embed/src/ort_runtime.rs). ureq is rustls-based and follows redirects (GitHub release assets
-# redirect to objects.githubusercontent.com).
+# redirect to a separate asset host).
 [build-dependencies]
-# ureq's "tls" feature (despite the generic name) wires up its rustls-based TLS backend
-# (webpki + webpki-roots + rustls) with no native-tls/OpenSSL dependency.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# "rustls" is ureq's rustls TLS backend, with no native-tls/OpenSSL dependency;
+# "platform-verifier" lets build.rs verify against the OS trust store (the same verifier
+# reqwest uses at runtime) instead of ureq's default bundled webpki roots.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 sha2 = "0.10"
 hex = "0.4"
 flate2 = "1"

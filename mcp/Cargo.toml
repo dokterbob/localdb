@@ -36,9 +36,9 @@ http = "1"
 # `proxy::auth::RefreshingHttpClient` names `reqwest::Client` directly (it
 # delegates to rmcp's own `impl StreamableHttpClient for reqwest::Client`
 # through a fully-qualified call), so it needs `reqwest` as a direct
-# dependency rather than relying on rmcp's transitive one. rmcp 1.8.0 itself
-# depends on reqwest 0.13, not the 0.12 the rest of the workspace uses — this
-# pins the same major/minor so cargo resolves one shared copy instead of two;
+# dependency rather than relying on rmcp's transitive one. The version must
+# match the reqwest major/minor rmcp depends on, or `reqwest::Client` here is
+# a different type from the one rmcp implements the trait for;
 # `default-features = false` leaves feature selection (rustls, etc.) to
 # rmcp's own `reqwest` dependency, which the two then share.
 reqwest = { version = "0.13", default-features = false }
