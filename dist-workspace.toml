@@ -43,8 +43,8 @@ contents = "read"
 
 # Runner pinning. ubuntu-22.04 keeps the glibc-2.35 floor for x86_64;
 # ubuntu-22.04-arm builds aarch64 natively (avoids dist's default zigbuild
-# cross path). macos-14 is Apple Silicon.
+# cross path). macos-15 is Apple Silicon.
 [dist.github-custom-runners]
 x86_64-unknown-linux-gnu = "ubuntu-22.04"
 aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
-aarch64-apple-darwin = "macos-14"
+aarch64-apple-darwin = "macos-15"
