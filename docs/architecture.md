@@ -338,8 +338,8 @@ roots come from:
 Why: bundled Mozilla roots (`webpki-roots`) reject any CA the host trusts but Mozilla doesn't. That
 breaks every model download and hosted-provider call behind a TLS-intercepting proxy (corporate
 networks, sandboxed CI and cloud dev environments), and `embed/build.rs`'s ONNX Runtime download
-along with them. A bundled list also only drops a distrusted root when a crate bump ships, not
-when the OS's own CA updates do.
+along with them. A bundled list also only drops a distrusted root when a crate bump ships, not when
+the OS's own CA updates do.
 
 **Failure mode: a host with no CA certificates.** Minimal container images (`scratch`, distroless
 `static`, Alpine or Debian slim without the `ca-certificates` package) have no trust store, so every
