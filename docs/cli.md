@@ -1814,7 +1814,7 @@ Run the MCP server on stdio for use with AI agents.
 ```
 Run the MCP server on stdio for use with AI agents.
 
-Exposes every store when `--store` is omitted; pass `--store <NAME>` (repeatable) to limit the session to those stores. The limit is enforced whether the server runs embedded or proxies to a running daemon, and an unknown name exits 3. Note this is a guardrail, not a security boundary: the daemon's MCP endpoint is unauthenticated, so a client that bypasses `localdb mcp` can still reach every store.
+Exposes every store when `--store` is omitted; pass `--store <NAME>` (repeatable) to limit the session to those stores. The limit is enforced whether the server runs embedded or proxies to a running daemon, and an unknown name exits 3. Note this is a guardrail, not a security boundary: `--store` is enforced by this client, not the daemon, so a caller that reaches the daemon's `/mcp` route directly — with whatever credentials `server.auth` requires — can still reach every store those credentials are authorized to see.
 
 Usage: localdb mcp [OPTIONS]
 
@@ -1863,10 +1863,11 @@ A database with no stores at all is not an error here — the server starts and 
 because an MCP server that exits non-zero at startup reads to its client as broken rather than as
 empty.
 
-> **Scoping, not a security boundary.** The daemon's `/mcp` route is loopback and unauthenticated,
-> so anything that can open a socket can bypass `localdb mcp` and talk to it unscoped. `--store`
-> stops an agent from _accidentally_ reading another project's docs; it does not contain a hostile
-> one. See [docs/mcp.md](mcp.md#store-scoping).
+> **Scoping, not a security boundary.** `--store` is enforced by this client, not the daemon: a
+> caller that reaches the daemon's `/mcp` route directly — with whatever credentials `server.auth`
+> requires — can still reach every store those credentials are authorized to see. It stops an agent
+> from _accidentally_ reading another project's docs; it does not contain a hostile one. See
+> [docs/mcp.md](mcp.md#store-scoping).
 
 `--allow-write` is accepted on the command line for forward compatibility, but v1 registers no
 mutating tool at all — the tool set is identical with and without it, and passing it prints a

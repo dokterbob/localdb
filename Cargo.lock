@@ -3560,12 +3560,15 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.9",
+ "futures",
  "http 1.4.2",
  "localdb-core",
+ "reqwest 0.13.4",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "sse-stream",
  "tokio",
 ]
 

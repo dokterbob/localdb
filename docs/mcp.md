@@ -168,12 +168,14 @@ claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
 
 Any MCP client that lets you attach a static header to an HTTP transport works the same way.
 
-**Stdio is always unauthenticated.** `localdb mcp` over stdio (embedded, or proxied to a local
-daemon — see [Daemon-proxied stdio](#daemon-proxied-stdio) below) never requires a bearer token,
-regardless of the daemon's own `server.auth` setting: stdio access to the local process is already
-trusted as local-files-equivalent, the same trust boundary as every other daemonless CLI command.
-Auth only applies to the HTTP transport (`/mcp` on a running daemon), which is what makes remote
-access meaningfully different from running `localdb mcp` on the same machine as the caller.
+**The stdio side never asks for a token.** The MCP client that launches `localdb mcp` over stdio
+sends no credentials; stdio access to the local process is trusted as local-files-equivalent, the
+same trust boundary as every other daemonless CLI command. Embedded, that is the whole story.
+Proxied to a daemon (see [Daemon-proxied stdio](#daemon-proxied-stdio) below), the proxy itself
+authenticates upstream to `/mcp` with the credential `localdb login` saved (or `LOCALDB_API_KEY`)
+whenever the daemon enforces `server.auth`. It refreshes an expired or rejected access token
+mid-session, so a long-running proxy keeps working across token lifetimes and picks up a token
+another `localdb` process refreshed.
 
 ---
 
@@ -236,12 +238,13 @@ While the tool set is fixed at five read-only tools, a scoped session relays onl
 other tool name is rejected, so a future mutating tool cannot slip through unscoped on the day it
 lands.
 
-> **This is scoping, not a security boundary.** The daemon's `/mcp` route is loopback and
-> **unauthenticated**: anything that can open a socket can bypass `localdb mcp` entirely and talk to
-> the unscoped endpoint directly. `--store` stops an agent from _accidentally_ reading another
-> project's docs; it does not contain a hostile one. Real containment needs daemon-side
-> authentication, which does not exist in v1. In embedded mode there is no such endpoint, so the
-> scope is as strong as the process boundary.
+> **This is scoping, not a security boundary.** `--store` is enforced by `localdb mcp`, not the
+> daemon: a caller that reaches the daemon's `/mcp` route directly sees every store its own
+> credential is authorized for. On an open-mode daemon (the loopback default) that is every store,
+> to anything that can open a socket. `--store` stops an agent from _accidentally_ reading another
+> project's docs; it does not contain a hostile one. Real containment is the daemon's own
+> authorization (`server.auth` plus per-member store grants). In embedded mode there is no such
+> endpoint, so the scope is as strong as the process boundary.
 
 ---
 

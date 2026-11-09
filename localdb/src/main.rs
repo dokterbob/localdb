@@ -119,8 +119,10 @@ pub enum Command {
     /// (repeatable) to limit the session to those stores. The limit is
     /// enforced whether the server runs embedded or proxies to a running
     /// daemon, and an unknown name exits 3. Note this is a guardrail, not a
-    /// security boundary: the daemon's MCP endpoint is unauthenticated, so a
-    /// client that bypasses `localdb mcp` can still reach every store.
+    /// security boundary: `--store` is enforced by this client, not the
+    /// daemon, so a caller that reaches the daemon's `/mcp` route directly —
+    /// with whatever credentials `server.auth` requires — can still reach
+    /// every store those credentials are authorized to see.
     Mcp {
         /// Enable write tools (reserved for future use; no effect in v1).
         ///

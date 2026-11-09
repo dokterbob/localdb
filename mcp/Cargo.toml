@@ -33,6 +33,23 @@ rmcp = { workspace = true, features = [
 # injects into tool-call extensions (principal propagation — see
 # `handler::McpHandler::principal_for`). Same major version rmcp pins.
 http = "1"
+# `proxy::auth::RefreshingHttpClient` names `reqwest::Client` directly (it
+# delegates to rmcp's own `impl StreamableHttpClient for reqwest::Client`
+# through a fully-qualified call), so it needs `reqwest` as a direct
+# dependency rather than relying on rmcp's transitive one. rmcp 1.8.0 itself
+# depends on reqwest 0.13, not the 0.12 the rest of the workspace uses — this
+# pins the same major/minor so cargo resolves one shared copy instead of two;
+# `default-features = false` leaves feature selection (rustls, etc.) to
+# rmcp's own `reqwest` dependency, which the two then share.
+reqwest = { version = "0.13", default-features = false }
+# `RefreshingHttpClient::get_stream` names the success type of rmcp's
+# `StreamableHttpClient::get_stream` (`BoxStream<'static, Result<Sse,
+# SseError>>`) in its own signature. rmcp re-exports `SseError` but not
+# `Sse` or `BoxStream`, so both `sse-stream` and `futures` need to be direct
+# dependencies here too, pinned to the versions rmcp's own `client-side-sse`
+# feature already resolves.
+sse-stream = "0.2"
+futures = { workspace = true }
 
 [dev-dependencies]
 localdb-core = { path = "../core", features = ["test-support"] }

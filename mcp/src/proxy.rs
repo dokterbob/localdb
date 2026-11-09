@@ -31,6 +31,8 @@
 //! agent from *accidentally* reading another project's docs; it does not
 //! contain a hostile one. See specs/05-surfaces.md §4.2.1.
 
+use std::sync::Arc;
+
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
@@ -42,6 +44,10 @@ use rmcp::{
     },
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
+
+mod auth;
+use auth::RefreshingHttpClient;
+pub use auth::{BearerSource, StaticBearer};
 
 /// One store the upstream daemon exposes over MCP, as reported by its own
 /// `list_stores` tool.
@@ -225,18 +231,34 @@ impl ProxyHandler {
     pub async fn connect_with_auth(
         daemon_base_url: &str,
         scope_names: &[String],
-        bearer: Option<String>,
+        bearer: Option<Arc<dyn BearerSource>>,
     ) -> Result<Self, ProxyConnectError> {
-        let mut config =
+        let config =
             StreamableHttpClientTransportConfig::with_uri(format!("{daemon_base_url}/mcp"));
-        if let Some(secret) = bearer {
-            config = config.auth_header(secret);
-        }
-        let transport = StreamableHttpClientTransport::from_config(config);
-        let upstream = rmcp::model::ClientInfo::default()
-            .serve(transport)
-            .await
-            .map_err(|e| ProxyConnectError::Unreachable(e.into()))?;
+        let upstream = match bearer {
+            // No `auth_header` on the config: `RefreshingHttpClient` asks
+            // `source` for a token on every call instead, so a token
+            // refreshed mid-session (by this process or another one) is
+            // picked up on the very next request rather than only at the
+            // next `connect`.
+            Some(source) => {
+                let transport = StreamableHttpClientTransport::with_client(
+                    RefreshingHttpClient::new(source),
+                    config,
+                );
+                rmcp::model::ClientInfo::default()
+                    .serve(transport)
+                    .await
+                    .map_err(|e| ProxyConnectError::Unreachable(e.into()))?
+            }
+            None => {
+                let transport = StreamableHttpClientTransport::from_config(config);
+                rmcp::model::ClientInfo::default()
+                    .serve(transport)
+                    .await
+                    .map_err(|e| ProxyConnectError::Unreachable(e.into()))?
+            }
+        };
 
         if scope_names.is_empty() {
             return Ok(Self {

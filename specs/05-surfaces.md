@@ -966,10 +966,12 @@ server starts and exposes zero stores (§2.2's empty-scope exception).
   those five and rejects any other name with `invalid_request` — a future mutating tool must be
   given an explicit scoping rule before it can pass through.
 
-**This is scoping, not a security boundary.** The daemon's `/mcp` is loopback and unauthenticated,
-so anything that can open a socket can bypass `localdb mcp` and talk to the unscoped endpoint
-directly. It stops an agent from _accidentally_ reading another project's docs; it does not contain
-a hostile one. Real containment needs daemon-side auth, which is out of scope for v1.
+**This is scoping, not a security boundary.** `--store` is enforced by the proxy, not the daemon: a
+caller that reaches `/mcp` directly sees every store its own credential is authorized for. On an
+open-mode daemon that is every store, to anything that can open a socket. It stops an agent from
+_accidentally_ reading another project's docs; it does not contain a hostile one. Real containment
+is the daemon's authorization (§3.1, D7). When the daemon enforces auth, the proxy authenticates
+upstream with the CLI's saved credential and refreshes it mid-session (once per rejected call).
 
 ### 4.3 Error model
 

@@ -10,6 +10,50 @@ use crate::{
     normalize::{exit_err, print_json},
 };
 
+/// A `mcp::proxy::BearerSource` backed by the CLI's own credentials file and
+/// refresh-token flow, so the daemon-proxy MCP transport picks up a token
+/// refreshed by another `localdb` process mid-session instead of carrying
+/// the one bearer it connected with for the lifetime of the stdio process.
+///
+/// Each call re-reads `credentials.json` through the same `CredentialLock`
+/// serialization every other CLI credential access goes through
+/// (`daemon_client::ensure_fresh_bearer`/`refresh_cached_bearer`), so it
+/// never races a concurrent `localdb login`/refresh in another process.
+struct CliBearerSource {
+    ctx: CliContext,
+    base_url: String,
+}
+
+impl CliBearerSource {
+    /// The exact credentials-file key for `base_url`: the longest
+    /// path-segment prefix of it among the stored keys (the same
+    /// resolution `try_refresh_and_persist` applies to a request URL), not
+    /// `base_url` itself — a daemon served behind a path prefix may have
+    /// been logged into at a shorter URL than the one `localdb mcp` was
+    /// pointed at. A `base_url` with no matching entry (not logged in; an
+    /// open-mode daemon) falls back to `base_url` verbatim, which simply
+    /// finds no entry and resolves to `None`.
+    fn resolved_key(&self) -> String {
+        crate::daemon_client::resolved_config_file(&self.ctx)
+            .map(|config_file| crate::credentials::credentials_path(&config_file))
+            .and_then(|path| crate::credentials::lookup_entry_for_url(&path, &self.base_url))
+            .map(|(key, _)| key)
+            .unwrap_or_else(|| self.base_url.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl mcp::proxy::BearerSource for CliBearerSource {
+    async fn current(&self) -> Option<String> {
+        crate::daemon_client::ensure_fresh_bearer(&self.ctx, &self.resolved_key()).await
+    }
+
+    async fn refresh(&self, rejected: &str) -> Option<String> {
+        crate::daemon_client::refresh_cached_bearer(&self.ctx, &self.resolved_key(), Some(rejected))
+            .await
+    }
+}
+
 /// `localdb serve` — start the HTTP daemon (specs/05-surfaces.md §3).
 pub fn run_serve(ctx: &CliContext) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -152,28 +196,36 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
             }
         }
 
-        let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, &base_url).await;
-        let handler = match ProxyHandler::connect_with_auth(&base_url, &ctx.stores, bearer).await {
-            Ok(handler) => handler,
-            Err(ProxyConnectError::StoreNotFound(name)) => {
-                exit_err(&Error::StoreNotFound { id: name }, ctx.json);
-            }
-            Err(ProxyConnectError::Unreachable(e)) => {
-                // The underlying transport/handshake error (`e`) is otherwise
-                // discarded — `exit_err` below only ever prints the generic
-                // "daemon is unreachable" message, giving no clue *why* the
-                // proxy hop failed (issue #147: the daemon/MCP connection
-                // path gives no diagnostic signal on rejection). `warn!` so
-                // it surfaces under the default `warn,pdf_oxide=off` filter
-                // (`localdb/src/main.rs`) without needing `RUST_LOG=debug`.
-                tracing::warn!(
-                    daemon_url = %base_url,
-                    error = %e,
-                    "mcp proxy: failed to connect to daemon"
-                );
-                exit_err(&Error::DaemonUnreachable, ctx.json);
-            }
-        };
+        // `CliBearerSource` resolves and refreshes the credential itself on
+        // every call the upstream transport makes — no prefetch here — so a
+        // token refreshed by another `localdb` process mid-session, or one
+        // that expires partway through this one, is picked up without this
+        // stdio process ever reconnecting.
+        let source: std::sync::Arc<dyn mcp::proxy::BearerSource> =
+            std::sync::Arc::new(CliBearerSource {
+                ctx: ctx.clone(),
+                base_url: base_url.clone(),
+            });
+        let handler =
+            match ProxyHandler::connect_with_auth(&base_url, &ctx.stores, Some(source)).await {
+                Ok(handler) => handler,
+                Err(ProxyConnectError::StoreNotFound(name)) => {
+                    exit_err(&Error::StoreNotFound { id: name }, ctx.json);
+                }
+                Err(ProxyConnectError::Unreachable(e)) => {
+                    // The underlying transport/handshake error (`e`) is otherwise
+                    // discarded — `exit_err` below only ever prints the generic
+                    // "daemon is unreachable" message, giving no clue *why* the
+                    // proxy hop failed. `warn!` so it surfaces under the default `warn,pdf_oxide=off` filter
+                    // (`localdb/src/main.rs`) without needing `RUST_LOG=debug`.
+                    tracing::warn!(
+                        daemon_url = %base_url,
+                        error = %e,
+                        "mcp proxy: failed to connect to daemon"
+                    );
+                    exit_err(&Error::DaemonUnreachable, ctx.json);
+                }
+            };
         if let Err(e) = mcp::serve_proxied_stdio(handler).await {
             exit_err(
                 &Error::Internal {
@@ -234,3 +286,6 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

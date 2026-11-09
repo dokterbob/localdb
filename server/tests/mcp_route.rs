@@ -17,7 +17,15 @@
 
 mod common;
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use async_trait::async_trait;
 use axum::http::{Method, StatusCode};
+use localdb_core::auth::AuthStore as _;
+use mcp::proxy::BearerSource;
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientInfo},
     transport::{
@@ -26,6 +34,7 @@ use rmcp::{
     ServiceExt,
 };
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use common::{create_store, json_body, make_app, request};
 
@@ -768,10 +777,13 @@ async fn scoped_proxy_authenticates_to_enforced_daemon() {
     let server_task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let proxy =
-        mcp::proxy::ProxyHandler::connect_with_auth(&base, &["included".into()], Some(secret))
-            .await
-            .unwrap();
+    let proxy = mcp::proxy::ProxyHandler::connect_with_auth(
+        &base,
+        &["included".into()],
+        Some(std::sync::Arc::new(mcp::proxy::StaticBearer(secret))),
+    )
+    .await
+    .unwrap();
     let (server_transport, client_transport) = tokio::io::duplex(8192);
     let proxy_task = tokio::spawn(async move {
         proxy
@@ -788,6 +800,184 @@ async fn scoped_proxy_authenticates_to_enforced_daemon() {
         .await
         .unwrap();
     assert_eq!(list_stores_names(result), vec!["included"]);
+    let _ = client.cancel().await;
+    proxy_task.abort();
+    server_task.abort();
+}
+
+/// A `BearerSource` that serves a token from behind a lock (so it can be
+/// swapped out) and counts how many times `refresh` is actually called,
+/// replacing its served token with a fixed replacement every time.
+struct CountingBearerSource {
+    current: Mutex<String>,
+    replacement: String,
+    refreshes: AtomicUsize,
+}
+
+#[async_trait]
+impl BearerSource for CountingBearerSource {
+    async fn current(&self) -> Option<String> {
+        Some(self.current.lock().await.clone())
+    }
+
+    async fn refresh(&self, _rejected: &str) -> Option<String> {
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
+        let mut guard = self.current.lock().await;
+        *guard = self.replacement.clone();
+        Some(guard.clone())
+    }
+}
+
+/// A `BearerSource` that never has a replacement to offer.
+struct UnrefreshableBearerSource {
+    secret: String,
+    refresh_attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl BearerSource for UnrefreshableBearerSource {
+    async fn current(&self) -> Option<String> {
+        Some(self.secret.clone())
+    }
+
+    async fn refresh(&self, _rejected: &str) -> Option<String> {
+        self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+/// The token the proxy's upstream connection is sending can go stale mid
+/// session — revoked server-side, or simply expired — without the stdio
+/// process that holds the proxy open ever restarting. The upstream
+/// transport asks its `BearerSource` for a fresh token and retries once,
+/// so a call made after the active key is revoked still succeeds as long
+/// as the source can produce a replacement, with exactly one refresh.
+#[tokio::test]
+async fn proxy_refreshes_a_revoked_bearer_mid_session_and_retries_once() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin = state
+        .auth()
+        .create_user("mcp-refresh-admin", localdb_core::auth::Role::Admin)
+        .await
+        .expect("seed admin");
+    let key_a = state.auth().issue_api_key(&admin.id).await.unwrap();
+    let key_b = state.auth().issue_api_key(&admin.id).await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let source = Arc::new(CountingBearerSource {
+        current: Mutex::new(key_a.secret.clone()),
+        replacement: key_b.secret.clone(),
+        refreshes: AtomicUsize::new(0),
+    });
+    let proxy = mcp::proxy::ProxyHandler::connect_with_auth(&base, &[], Some(source.clone()))
+        .await
+        .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    let proxy_task = tokio::spawn(async move {
+        proxy
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let client = ClientInfo::default().serve(client_transport).await.unwrap();
+
+    let first = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert_ne!(
+        first.is_error,
+        Some(true),
+        "key A is still valid for the first call"
+    );
+    assert_eq!(source.refreshes.load(Ordering::SeqCst), 0);
+
+    state
+        .auth_store()
+        .revoke_token(&key_a.row.id)
+        .await
+        .unwrap();
+
+    let second = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert_ne!(
+        second.is_error,
+        Some(true),
+        "the call must succeed once retried with the refreshed key"
+    );
+    assert_eq!(
+        source.refreshes.load(Ordering::SeqCst),
+        1,
+        "exactly one refresh for the one rejected call"
+    );
+
+    let _ = client.cancel().await;
+    proxy_task.abort();
+    server_task.abort();
+}
+
+/// When the bearer source has no replacement to offer, the rejected call
+/// surfaces as an error instead of retrying forever.
+#[tokio::test]
+async fn proxy_surfaces_the_auth_error_when_the_bearer_source_cannot_refresh() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin = state
+        .auth()
+        .create_user("mcp-norefresh-admin", localdb_core::auth::Role::Admin)
+        .await
+        .expect("seed admin");
+    let key = state.auth().issue_api_key(&admin.id).await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let source = Arc::new(UnrefreshableBearerSource {
+        secret: key.secret.clone(),
+        refresh_attempts: AtomicUsize::new(0),
+    });
+    let proxy = mcp::proxy::ProxyHandler::connect_with_auth(&base, &[], Some(source.clone()))
+        .await
+        .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    let proxy_task = tokio::spawn(async move {
+        proxy
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let client = ClientInfo::default().serve(client_transport).await.unwrap();
+
+    state.auth_store().revoke_token(&key.row.id).await.unwrap();
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await;
+    assert!(
+        result.is_err(),
+        "an unrecoverable auth failure must surface as an error, not a silent empty success"
+    );
+    assert_eq!(
+        source.refresh_attempts.load(Ordering::SeqCst),
+        1,
+        "exactly one refresh attempt, never a retry loop"
+    );
+
     let _ = client.cancel().await;
     proxy_task.abort();
     server_task.abort();

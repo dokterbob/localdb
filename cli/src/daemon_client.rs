@@ -262,7 +262,12 @@ async fn try_refresh_and_persist(
 
 /// One serialized path for reactive HTTP refresh and proactive MCP refresh.
 /// `rejected` is the bearer sent by the failed request, not a new cache lookup.
-async fn refresh_cached_bearer(
+/// `base_url` is the exact credentials-file key, not a request URL — callers
+/// that only have a request URL resolve the key first (see
+/// `try_refresh_and_persist`'s `lookup_entry_for_url` call, and
+/// `cmds::surface::CliBearerSource`, which resolves it once at construction
+/// from the daemon base URL it was given).
+pub(crate) async fn refresh_cached_bearer(
     ctx: &CliContext,
     base_url: &str,
     rejected: Option<&str>,
