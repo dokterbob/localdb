@@ -17,39 +17,25 @@ use crate::{
 ///
 /// Each call re-reads `credentials.json` through the same `CredentialLock`
 /// serialization every other CLI credential access goes through
-/// (`daemon_client::ensure_fresh_bearer`/`refresh_cached_bearer`), so it
-/// never races a concurrent `localdb login`/refresh in another process.
+/// (`daemon_client::fresh_bearer_for_url`/`try_refresh_and_persist`), so it
+/// never races a concurrent `localdb login`/refresh in another process, and
+/// resolves the credentials-file key fresh each call via the same
+/// longest-path-segment-prefix match every other daemon-bound request
+/// applies to its URL — `base_url` itself need not be the exact string
+/// `localdb login` stored a credential under.
 struct CliBearerSource {
     ctx: CliContext,
     base_url: String,
 }
 
-impl CliBearerSource {
-    /// The exact credentials-file key for `base_url`: the longest
-    /// path-segment prefix of it among the stored keys (the same
-    /// resolution `try_refresh_and_persist` applies to a request URL), not
-    /// `base_url` itself — a daemon served behind a path prefix may have
-    /// been logged into at a shorter URL than the one `localdb mcp` was
-    /// pointed at. A `base_url` with no matching entry (not logged in; an
-    /// open-mode daemon) falls back to `base_url` verbatim, which simply
-    /// finds no entry and resolves to `None`.
-    fn resolved_key(&self) -> String {
-        crate::daemon_client::resolved_config_file(&self.ctx)
-            .map(|config_file| crate::credentials::credentials_path(&config_file))
-            .and_then(|path| crate::credentials::lookup_entry_for_url(&path, &self.base_url))
-            .map(|(key, _)| key)
-            .unwrap_or_else(|| self.base_url.clone())
-    }
-}
-
 #[async_trait::async_trait]
 impl mcp::proxy::BearerSource for CliBearerSource {
     async fn current(&self) -> Option<String> {
-        crate::daemon_client::ensure_fresh_bearer(&self.ctx, &self.resolved_key()).await
+        crate::daemon_client::fresh_bearer_for_url(&self.ctx, &self.base_url).await
     }
 
     async fn refresh(&self, rejected: &str) -> Option<String> {
-        crate::daemon_client::refresh_cached_bearer(&self.ctx, &self.resolved_key(), Some(rejected))
+        crate::daemon_client::try_refresh_and_persist(&self.ctx, &self.base_url, Some(rejected))
             .await
     }
 }
@@ -107,12 +93,25 @@ pub(crate) async fn run_serve_async(ctx: &CliContext) {
             // Announce the bound address before blocking on the server future
             // so callers (and tests) can discover an OS-assigned port.
             if ctx.json {
-                print_json(&json!({
+                let mut announced = json!({
                     "status": "listening",
                     "url": format!("http://{}", handle.addr),
-                }));
+                });
+                if let Some(code) = &handle.setup_code {
+                    announced["setup_code"] = json!(code);
+                }
+                print_json(&announced);
             } else {
                 println!("daemon listening on http://{}", handle.addr);
+                if let Some(code) = &handle.setup_code {
+                    println!();
+                    println!("One-time setup code: {code}");
+                    println!(
+                        "Run: localdb login --url http://{} --setup-code {code}",
+                        handle.addr
+                    );
+                    println!("This code works once and changes on restart.");
+                }
             }
             use std::io::Write as _;
             let _ = std::io::stdout().flush();

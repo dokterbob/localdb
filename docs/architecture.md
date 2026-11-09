@@ -221,13 +221,17 @@ on-disk files themselves. See
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3/§3.1
 for the full decision matrix.
 
-**Bootstrap.** The first `localdb serve` with auth enforced and no admin yet prints a one-time setup
-code to stderr. Paste it into the browser consent page `/authorize` opens (or pass it via
-`localdb login --setup-code <code>`) to create the first admin account. A singleton
-`pending_bootstrap` record keeps interrupted onboarding recoverable until an issued admin credential
-authenticates a protected request. Retrying reuses the same admin; restart rotates the in-memory
-setup code. Established accounts do not reopen setup. These operations live in the shared auth
-service, independent of terminal, browser, or future native UI presentation.
+**Bootstrap.** The first `localdb serve` with auth enforced and no admin yet mints a one-time setup
+code. Presentation is the CLI's job, not the daemon's: `localdb serve` prints it to stdout right
+after the `daemon listening on http://…` line, alongside the ready-to-run
+`localdb login --url http://<addr> --setup-code <code>`, and `serve --json` carries it as the
+`setup_code` field of the `listening` object. Paste the code into the browser consent page
+`/authorize` opens, or pass it via `localdb login --setup-code <code>`, to create the first admin
+account. A singleton `pending_bootstrap` record keeps interrupted onboarding recoverable until an
+issued admin credential authenticates a protected request. Retrying reuses the same admin; restart
+rotates the in-memory setup code. Established accounts do not reopen setup. Minting the code lives
+in the shared auth service, independent of terminal, browser, or future native UI presentation —
+only how it's shown is the CLI's choice.
 
 **Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a blake3
 hash. A login session mints an access token (1h) and a refresh token (30d) sharing one rotation
@@ -288,7 +292,10 @@ to `config.yaml`
 `localdb logout` revokes it and clears the cache only after successful revocation; failures retain
 the cache for retry. `localdb status` shows the caller's identity and cached token expiry once
 authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached credential for a
-single invocation. Exit code `6` (new) is reserved for `unauthorized`/`forbidden`.
+single invocation and is never refreshed. Every daemon-bound request refreshes an expired, or
+about-to-expire, cached access token before sending it (`cli::daemon_client::fresh_bearer_for_url`),
+rather than only after a `401`; a request still retries once more on an outright `401` as a
+backstop. Exit code `6` (new) is reserved for `unauthorized`/`forbidden`.
 
 **Behavior changes worth flagging to anyone tracking this branch:**
 

@@ -555,7 +555,7 @@ async fn try_attach_via_sse(
         base_url,
         encode_path_segment(job_id)
     );
-    let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, base_url).await;
+    let bearer = crate::daemon_client::fresh_bearer_for_url(ctx, base_url).await;
     let mut request = client.get(&url).header("Accept", "text/event-stream");
     if let Some(secret) = bearer {
         request = request.bearer_auth(secret);

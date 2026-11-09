@@ -81,10 +81,21 @@ admins) only see/search `shared`-visibility stores they hold an explicit grant f
 the D7 authorization model.
 
 **Setup and recovery.** When authentication is enforced and no admin exists, or first-admin setup is
-incomplete, `localdb serve` prints a setup code:
+incomplete, `localdb serve` prints a setup-code block to stdout right after the announce line:
 
 ```
+daemon listening on http://127.0.0.1:7700
+
 One-time setup code: ldb_...
+Run: localdb login --url http://127.0.0.1:7700 --setup-code ldb_...
+This code works once and changes on restart.
+```
+
+`serve --json`'s `listening` object carries the same code as a `setup_code` field, present only
+while setup is outstanding:
+
+```json
+{ "status": "listening", "url": "http://127.0.0.1:7700", "setup_code": "ldb_..." }
 ```
 
 Paste it into the browser consent page (or use `localdb login --setup-code <code>`). Interrupted

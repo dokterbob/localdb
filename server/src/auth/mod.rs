@@ -67,8 +67,11 @@ pub type ServerAuthService = localdb_core::auth::AuthService<store_libsql::Libsq
 
 /// Issue a setup code for first-admin creation or recovery of pending setup.
 /// Only its hash lives in AppState. Restart rotates the code while the persisted
-/// pending-admin marker keeps onboarding recoverable. The caller presents the
-/// plaintext once (currently stderr; native presentation can use the same result).
+/// pending-admin marker keeps onboarding recoverable. The plaintext is returned
+/// to the caller to present however its surface sees fit — `server::start_daemon`
+/// hands it back on `DaemonHandle::setup_code` rather than printing it itself, so
+/// the CLI's `serve` command decides whether and how to show it (stdout, in both
+/// human and `--json` output).
 pub async fn generate_setup_code_if_needed(state: &AppState) -> Result<Option<String>, Error> {
     if state.auth_mode() != AuthMode::Enforced {
         return Ok(None);

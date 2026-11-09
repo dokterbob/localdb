@@ -200,7 +200,12 @@ uses to authenticate to a given daemon. Keyed by the daemon's base URL, so a mac
 multiple daemons keeps a separate cached credential per one. Written by `localdb login` (planned,
 §3.1) and read by every daemon-attached command. Never written into or read from the YAML config —
 it is credential material, not declarative config. The `LOCALDB_API_KEY` environment variable, when
-set, overrides the cached credential for that invocation.
+set, overrides the cached credential for that invocation and is never refreshed.
+
+Every daemon-bound request refreshes an already-expired, or about-to-expire, cached access token
+before sending it, through one shared helper (`cli::daemon_client::fresh_bearer_for_url`) — not just
+after the fact. A request still retries once more on an outright `401` (a token revoked out of band,
+or one that expired mid-flight) as a backstop.
 
 ## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx`)
 

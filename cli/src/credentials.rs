@@ -176,32 +176,11 @@ pub(crate) fn lookup_entry_for_url(
 /// legacy `secret` (API key) field. Any failure (missing file, malformed
 /// JSON, absent key) is a silent `None`. A test helper for asserting what a
 /// known key round-trips to; production code resolves a request's bearer
-/// through [`resolve_bearer`]'s path-segment-prefix match instead.
+/// through `daemon_client::fresh_bearer_for_url`'s path-segment-prefix match
+/// instead.
 #[cfg(test)]
 pub(crate) fn lookup_secret(credentials_file: &Path, base_url: &str) -> Option<String> {
     let entry = lookup_entry(credentials_file, base_url)?;
-    entry.access_token.or(entry.secret)
-}
-
-/// Resolve the bearer secret for a daemon request:
-/// 1. `api_key` (from `LOCALDB_API_KEY`, read once at startup) if set;
-/// 2. else the `credentials.json` entry next to `config_file` whose key is
-///    the longest path-segment prefix of `request_url` — so a daemon served
-///    behind a path (e.g. `https://example.com/team`) matches a request to
-///    `https://example.com/team/v1/stores` rather than only its bare origin;
-/// 3. else `None` (send no Authorization header).
-pub(crate) fn resolve_bearer(
-    api_key: Option<&str>,
-    config_file: Option<&Path>,
-    request_url: &str,
-) -> Option<String> {
-    if let Some(key) = api_key {
-        if !key.is_empty() {
-            return Some(key.to_string());
-        }
-    }
-    let config_file = config_file?;
-    let (_, entry) = lookup_entry_for_url(&credentials_path(config_file), request_url)?;
     entry.access_token.or(entry.secret)
 }
 

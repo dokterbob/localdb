@@ -112,13 +112,13 @@ async fn refresh_forces_a_new_token_even_when_the_cached_one_has_not_expired() {
 }
 
 #[tokio::test]
-async fn resolved_key_matches_a_shorter_stored_prefix_of_the_daemon_base_url() {
+async fn current_matches_a_shorter_stored_prefix_of_the_daemon_base_url() {
     // The daemon base URL `CliBearerSource` is given need not be the exact
     // string `localdb login` stored a credential under — only a
-    // path-segment prefix of it (same rule `try_refresh_and_persist`
-    // applies to a request URL). `resolved_key` must apply that same
-    // longest-prefix match rather than requiring `base_url` to equal the
-    // stored key verbatim.
+    // path-segment prefix of it (same rule `fresh_bearer_for_url` applies
+    // to a request URL). `current` must apply that same longest-prefix
+    // match rather than requiring `base_url` to equal the stored key
+    // verbatim.
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -140,6 +140,5 @@ async fn resolved_key_matches_a_shorter_stored_prefix_of_the_daemon_base_url() {
         base_url: "https://example.com/team/mcp-route".to_string(),
     };
 
-    assert_eq!(source.resolved_key(), "https://example.com/team");
     assert_eq!(source.current().await.as_deref(), Some("ldb_team"));
 }

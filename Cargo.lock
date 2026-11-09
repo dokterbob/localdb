@@ -3400,6 +3400,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-subscriber",
+ "url",
  "vergen-gitcl",
 ]
 

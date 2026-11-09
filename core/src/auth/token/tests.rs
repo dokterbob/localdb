@@ -70,6 +70,33 @@ fn is_expired_false_for_future_timestamp() {
 }
 
 #[test]
+fn expires_within_true_for_an_already_expired_timestamp() {
+    assert!(expires_within(&rfc3339_from_now(-10), 30));
+}
+
+#[test]
+fn expires_within_true_for_a_timestamp_inside_the_margin() {
+    assert!(expires_within(&rfc3339_from_now(10), 30));
+}
+
+#[test]
+fn expires_within_false_for_a_timestamp_outside_the_margin() {
+    assert!(!expires_within(&rfc3339_from_now(3600), 30));
+}
+
+#[test]
+fn expires_within_zero_margin_matches_is_expired() {
+    assert_eq!(
+        expires_within(&rfc3339_from_now(-1), 0),
+        is_expired(&rfc3339_from_now(-1))
+    );
+    assert_eq!(
+        expires_within(&rfc3339_from_now(3600), 0),
+        is_expired(&rfc3339_from_now(3600))
+    );
+}
+
+#[test]
 fn generate_pkce_pair_round_trips_with_verify() {
     let (verifier, challenge) = generate_pkce_pair();
     assert!(verify_pkce_s256(&verifier, &challenge));

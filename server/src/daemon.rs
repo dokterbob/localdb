@@ -47,6 +47,11 @@ pub struct DaemonHandle {
     pub _url_file: UrlFileGuard,
     /// The bind address.
     pub addr: SocketAddr,
+    /// The one-time first-admin setup code, if auth is enforced and no admin
+    /// exists yet. Presentation is the caller's job (specs/05-surfaces.md
+    /// §2): the CLI's `serve` surface prints it to stdout, in both human and
+    /// `--json` output.
+    pub setup_code: Option<String>,
 }
 
 impl std::fmt::Debug for DaemonHandle {
@@ -74,9 +79,7 @@ pub async fn start_daemon(
     warn_if_unspecified(bound_addr);
     let auth_mode = resolve_auth_mode(bound_addr, options.config.server.auth)?;
     let (state, url_scheduler) = build_daemon_state(&options, auth_mode).await?;
-    if let Some(code) = auth::generate_setup_code_if_needed(&state).await? {
-        eprintln!("One-time setup code: {code}");
-    }
+    let setup_code = auth::generate_setup_code_if_needed(&state).await?;
     let mcp_embedder = mcp_bridge::build_mcp_embedder(&state);
     // Bind first so `mcp_allowed_hosts` sees the actually-bound address
     // (wildcard aliases like `"0"`/`"[::]"` only resolve to a concrete
@@ -101,6 +104,7 @@ pub async fn start_daemon(
         _socket: socket_guard,
         _url_file: url_file_guard,
         addr: bound_addr,
+        setup_code,
     };
 
     Ok((handle, server_future(listener, router)))

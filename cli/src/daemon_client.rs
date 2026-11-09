@@ -138,17 +138,12 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
 // writing directly to the embedded store. This thin client issues the
 // appropriate HTTP requests and maps responses to exit codes.
 
-/// Resolve the bearer secret for a daemon request per specs/03-config.md §6:
-/// `LOCALDB_API_KEY` (read once into `ctx.api_key`) wins; otherwise the
-/// `credentials.json` next to the resolved config file, whose key is the
-/// longest path-segment prefix of `url` — covering both a bare-origin
-/// daemon and one served behind a path (e.g. `https://example.com/team`).
-/// `None` sends the request without an Authorization header (fine against
-/// an open-mode daemon).
-fn bearer_for_request(ctx: &CliContext, url: &str) -> Option<String> {
-    let config_file = resolved_config_file(ctx);
-    crate::credentials::resolve_bearer(ctx.api_key.as_deref(), config_file.as_deref(), url)
-}
+/// Expiry margin for proactively refreshing a still-valid access token
+/// before it is actually used: a request that would otherwise land just
+/// past expiry (network latency, clock skew) gets a fresh token instead of
+/// a guaranteed 401. Applied by `refresh_cached_bearer`'s `needs_refresh`
+/// check, shared by every call site through `fresh_bearer_for_url`.
+const REFRESH_MARGIN_SECS: i64 = 30;
 
 pub(crate) fn resolved_config_file(ctx: &CliContext) -> Option<std::path::PathBuf> {
     let options = localdb_core::config::loader::LoadOptions {
@@ -197,7 +192,7 @@ async fn send_once(
 /// or revoked refresh token). Pure HTTP exchange — callers own the
 /// credentials-file lookup and write so this can be shared by both the
 /// retry-on-401 path (`try_refresh_and_persist`) and the proactive
-/// pre-connect path (`ensure_fresh_bearer`).
+/// pre-connect path (`fresh_bearer_for_url`).
 async fn redeem_refresh_token(
     base_url: &str,
     refresh_token: &str,
@@ -239,17 +234,19 @@ async fn redeem_refresh_token(
 /// Attempt a refresh-grant exchange for the stored refresh token (if any)
 /// against the matching credentials-file key's `/token` endpoint,
 /// persisting the rotated pair on success. The key is resolved from `url`
-/// by the same longest-path-segment-prefix match `bearer_for_request` uses,
-/// so a path-prefixed daemon refreshes under the key its credential was
-/// written under rather than a re-derived origin. Returns the new access
-/// token to retry with, or `None` if there was nothing to refresh, no
-/// stored key matched `url`, or the refresh itself failed — either way the
-/// caller falls through to surfacing the original 401.
+/// by the same longest-path-segment-prefix match `fresh_bearer_for_url`
+/// uses, so a path-prefixed daemon refreshes under the key its credential
+/// was written under rather than a re-derived origin. Returns the new
+/// access token to retry with, or `None` if there was nothing to refresh,
+/// no stored key matched `url`, or the refresh itself failed — either way
+/// the caller falls through to surfacing the original rejection (a 401 for
+/// `daemon_request_async`, the presented bearer for
+/// `cmds::surface::CliBearerSource::refresh`).
 ///
 /// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
 /// statically configured bearer isn't part of the login token-pair rotation
 /// model, so there is nothing to refresh.
-async fn try_refresh_and_persist(
+pub(crate) async fn try_refresh_and_persist(
     ctx: &CliContext,
     url: &str,
     rejected: Option<&str>,
@@ -260,13 +257,12 @@ async fn try_refresh_and_persist(
     refresh_cached_bearer(ctx, &key, rejected).await
 }
 
-/// One serialized path for reactive HTTP refresh and proactive MCP refresh.
-/// `rejected` is the bearer sent by the failed request, not a new cache lookup.
-/// `base_url` is the exact credentials-file key, not a request URL — callers
-/// that only have a request URL resolve the key first (see
-/// `try_refresh_and_persist`'s `lookup_entry_for_url` call, and
-/// `cmds::surface::CliBearerSource`, which resolves it once at construction
-/// from the daemon base URL it was given).
+/// One serialized path for reactive HTTP refresh and proactive refresh
+/// alike. `rejected` is the bearer sent by the failed request, not a new
+/// cache lookup. `base_url` is the exact credentials-file key, not a
+/// request URL — callers that only have a request URL resolve the key
+/// first (`try_refresh_and_persist`'s `lookup_entry_for_url` call, and
+/// `fresh_bearer_for_url`'s own).
 pub(crate) async fn refresh_cached_bearer(
     ctx: &CliContext,
     base_url: &str,
@@ -283,12 +279,12 @@ pub(crate) async fn refresh_cached_bearer(
     let path = crate::credentials::credentials_path(&config_file);
     let needs_refresh = |entry: &crate::credentials::CredentialEntry| {
         let current = entry.access_token.as_deref().or(entry.secret.as_deref());
-        let expired = entry.access_token.is_some()
+        let due = entry.access_token.is_some()
             && entry
                 .access_expires_at
                 .as_deref()
-                .is_some_and(localdb_core::auth::is_expired);
-        expired || rejected.is_some_and(|old| current == Some(old))
+                .is_some_and(|at| localdb_core::auth::expires_within(at, REFRESH_MARGIN_SECS));
+        due || rejected.is_some_and(|old| current == Some(old))
     };
     // Ordinary reads need no writable directory or lock: rename makes them atomic.
     let entry = crate::credentials::lookup_entry(&path, base_url)?;
@@ -313,8 +309,34 @@ pub(crate) async fn refresh_cached_bearer(
     current
 }
 
-pub(crate) async fn ensure_fresh_bearer(ctx: &CliContext, base_url: &str) -> Option<String> {
-    refresh_cached_bearer(ctx, base_url, None).await
+/// Resolve a fresh bearer for a request to `url`, refreshing an expired or
+/// soon-to-expire cached access token before handing it back instead of
+/// after a guaranteed 401:
+///
+/// 1. A non-empty `ctx.api_key` (`LOCALDB_API_KEY`/`--api-key`) wins
+///    unchanged, with no refresh — a statically configured bearer isn't
+///    part of the login token-pair rotation model.
+/// 2. Otherwise, the `credentials.json` entry whose key is the longest
+///    path-segment prefix of `url` is looked up — covering both a
+///    bare-origin daemon and one served behind a path (e.g.
+///    `https://example.com/team`). No matching entry means no bearer at
+///    all (fine against an open-mode daemon).
+/// 3. The matched entry is then run through `refresh_cached_bearer`'s
+///    proactive-refresh check, so a token that is expired or due to expire
+///    within `REFRESH_MARGIN_SECS` is redeemed before use.
+///
+/// Used by every daemon-bound CLI request: `daemon_request_async` (which
+/// keeps its own 401 retry as a backstop for a token that expires mid-flight
+/// or is revoked out of band), the job-attach SSE path, and the MCP
+/// daemon-proxy's `current()` bearer.
+pub(crate) async fn fresh_bearer_for_url(ctx: &CliContext, url: &str) -> Option<String> {
+    if let Some(key) = ctx.api_key.as_deref().filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+    let config_file = resolved_config_file(ctx)?;
+    let path = crate::credentials::credentials_path(&config_file);
+    let (key, _) = crate::credentials::lookup_entry_for_url(&path, url)?;
+    refresh_cached_bearer(ctx, &key, None).await
 }
 
 pub(crate) async fn daemon_request_async(
@@ -324,7 +346,7 @@ pub(crate) async fn daemon_request_async(
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, Error> {
     let client = build_http_client()?;
-    let bearer = bearer_for_request(ctx, url);
+    let bearer = fresh_bearer_for_url(ctx, url).await;
     let (status, json) = send_once(
         &client,
         method.clone(),

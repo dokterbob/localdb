@@ -252,6 +252,82 @@ async fn full_auth_code_pkce_flow_happy_path() {
     assert_eq!(me_body["name"], "alice");
 }
 
+// ---------------------------------------------------------------------
+// `urn:ietf:wg:oauth:2.0:oob` (`localdb login --no-browser`)
+// ---------------------------------------------------------------------
+
+/// The OOB success page must offer exactly one selectable `<code>` element —
+/// the issued authorization code — so a double-click-to-select habit never
+/// grabs the `localdb login --no-browser` command mention instead (U2).
+#[tokio::test]
+async fn oob_success_page_has_exactly_one_selectable_code() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let secret = seed_admin_with_key(&state, "oob-user").await;
+    let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
+
+    let resp = post_form(
+        app.clone(),
+        "/authorize",
+        &[
+            ("response_type", "code"),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", localdb_core::auth::OOB_REDIRECT_URI),
+            ("state", "s"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("credential", &secret),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp.into_body()).await;
+
+    assert_eq!(
+        body.matches("<code").count(),
+        1,
+        "exactly one <code element must exist: {body}"
+    );
+
+    let code_tag_start = body
+        .find("<code")
+        .expect("body must contain a <code element");
+    let code_tag_end = body[code_tag_start..]
+        .find('>')
+        .map(|i| code_tag_start + i)
+        .expect("<code tag must close");
+    assert_eq!(
+        &body[code_tag_start..=code_tag_end],
+        "<code id=\"authorization-code\">",
+        "the first (and only) <code must be the authorization code: {body}"
+    );
+
+    let code_text_start = code_tag_end + 1;
+    let code_text_end = body[code_text_start..]
+        .find("</code>")
+        .map(|i| code_text_start + i)
+        .expect("<code element must close");
+    let code = &body[code_text_start..code_text_end];
+
+    let token_resp = post_form(
+        app,
+        "/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", localdb_core::auth::OOB_REDIRECT_URI),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    assert_eq!(token_resp.status(), StatusCode::OK);
+    let token_body = json_body(token_resp.into_body()).await;
+    assert!(token_body["access_token"]
+        .as_str()
+        .unwrap()
+        .starts_with("ldb_"));
+}
+
 #[tokio::test]
 async fn token_exchange_wrong_verifier_is_invalid_grant() {
     let (_dir, state, app) = make_enforced_app().await;

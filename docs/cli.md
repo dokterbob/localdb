@@ -488,6 +488,11 @@ retried. Logout affects those credentials, not separate sessions on other client
 Credential mutations are serialized across CLI processes. Concurrent commands share one token
 refresh, and updates preserve credentials for other servers.
 
+**Refresh timing.** Every daemon-bound command refreshes an expired, or about-to-expire, cached
+access token before sending its request — not only after a `401`. A request still retries once more
+on an outright `401` as a backstop (a token revoked out of band, or one that expired mid-flight). A
+still-valid, not-soon-to-expire token needs no lock file and no writable `credentials.json`.
+
 ---
 
 ## `localdb user`
@@ -1761,6 +1766,18 @@ Prints an announce line on startup:
 $ localdb serve
 daemon listening on http://127.0.0.1:7700
 ```
+
+When authentication is enforced (`server.auth: required`, or `auto` on a non-loopback bind) and no
+admin exists yet, a setup-code block follows the announce line:
+
+```
+One-time setup code: ldb_...
+Run: localdb login --url http://127.0.0.1:7700 --setup-code ldb_...
+This code works once and changes on restart.
+```
+
+`--json` carries the same code as a `setup_code` field on the `listening` object, present only while
+setup is outstanding: `{"status":"listening","url":"http://127.0.0.1:7700","setup_code":"ldb_..."}`.
 
 Also creates a Unix socket at `<data_dir>/daemon.sock` that CLI commands use to detect the daemon.
 

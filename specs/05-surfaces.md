@@ -592,11 +592,16 @@ stable API). Deleting a user cascades to their tokens and store grants via `ON D
 the schema level ([02-domain-model.md](02-domain-model.md) §9).
 
 **Setup code:** with auth enforced, offer setup when no admin exists or a `pending_bootstrap` record
-identifies an unfinished first admin. The daemon prints a code whose hash stays in memory; restart
-rotates it. Valid setup retries atomically create or reuse that pending admin. The first successful
-bearer authentication on a protected route as that admin removes the pending marker. An established
-account never becomes eligible merely because its credentials are gone. Shared auth-service
-operations own this lifecycle; terminal/browser/native clients own presentation.
+identifies an unfinished first admin. The daemon mints a code whose hash stays in memory; restart
+rotates it. The shared auth service hands the plaintext back to its caller rather than printing it
+itself — `localdb serve` prints it to stdout right after the `daemon listening on http://…` line
+(and the ready-to-run `localdb login --url <addr> --setup-code <code>`), and `serve --json` carries
+it as the `setup_code` field of the `listening` object, present only while setup is outstanding:
+`{"status":"listening","url":"<addr>","setup_code":"ldb_..."}`. Valid setup retries atomically
+create or reuse that pending admin. The first successful bearer authentication on a protected route
+as that admin removes the pending marker. An established account never becomes eligible merely
+because its credentials are gone. Shared auth-service operations own this lifecycle; terminal/
+browser/native clients own presentation.
 
 **Token model:** opaque 32-byte secrets minted from `OsRng`, `ldb_`-prefixed, shown once at issuance
 and stored at rest only as a blake3 hash — never a password anywhere. A login session mints an

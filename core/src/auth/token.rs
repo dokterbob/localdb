@@ -167,5 +167,15 @@ pub fn is_expired(expires_at: &str) -> bool {
     expires_at < rfc3339_from_now(0).as_str()
 }
 
+/// Is the given RFC 3339 UTC timestamp already past, or due to pass within
+/// `secs` seconds? Lets a caller refresh a still-valid access token
+/// proactively — before a request that would otherwise land just past
+/// expiry (network latency, clock skew) gets a guaranteed 401 — rather than
+/// only reacting after the fact. `expires_within(t, 0)` is equivalent to
+/// `is_expired(t)`.
+pub fn expires_within(expires_at: &str, secs: i64) -> bool {
+    expires_at < rfc3339_from_now(secs).as_str()
+}
+
 #[cfg(test)]
 mod tests;

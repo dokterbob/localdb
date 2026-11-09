@@ -67,56 +67,11 @@ fn lookup_returns_none_for_malformed_json() {
     assert_eq!(lookup_secret(&path, "http://127.0.0.1:7700"), None);
 }
 
-#[test]
-fn resolve_bearer_prefers_env_api_key() {
-    let dir = TempDir::new().unwrap();
-    write_credentials(
-        &dir,
-        r#"{"version":1,"credentials":{"http://127.0.0.1:7700":{"secret":"ldb_cached"}}}"#,
-    );
-    let config_file = dir.path().join("config.yaml");
-    let resolved = resolve_bearer(
-        Some("ldb_from_env"),
-        Some(&config_file),
-        "http://127.0.0.1:7700",
-    );
-    assert_eq!(resolved.as_deref(), Some("ldb_from_env"));
-}
-
-#[test]
-fn resolve_bearer_falls_back_to_credentials_file() {
-    let dir = TempDir::new().unwrap();
-    write_credentials(
-        &dir,
-        r#"{"version":1,"credentials":{"http://127.0.0.1:7700":{"secret":"ldb_cached"}}}"#,
-    );
-    let config_file = dir.path().join("config.yaml");
-    let resolved = resolve_bearer(None, Some(&config_file), "http://127.0.0.1:7700");
-    assert_eq!(resolved.as_deref(), Some("ldb_cached"));
-}
-
-#[test]
-fn resolve_bearer_empty_env_key_is_ignored() {
-    let dir = TempDir::new().unwrap();
-    write_credentials(
-        &dir,
-        r#"{"version":1,"credentials":{"http://127.0.0.1:7700":{"secret":"ldb_cached"}}}"#,
-    );
-    let config_file = dir.path().join("config.yaml");
-    let resolved = resolve_bearer(Some(""), Some(&config_file), "http://127.0.0.1:7700");
-    assert_eq!(resolved.as_deref(), Some("ldb_cached"));
-}
-
-#[test]
-fn resolve_bearer_none_when_nothing_available() {
-    let dir = TempDir::new().unwrap();
-    let config_file = dir.path().join("config.yaml");
-    assert_eq!(
-        resolve_bearer(None, Some(&config_file), "http://127.0.0.1:7700"),
-        None
-    );
-    assert_eq!(resolve_bearer(None, None, "http://127.0.0.1:7700"), None);
-}
+// Env-key precedence, the credentials-file fallback, and the "nothing
+// available" case are pinned at the `daemon_client::fresh_bearer_for_url`
+// level (`daemon_client::tests::auth`), the one place that now resolves a
+// request's bearer — this module's tests stick to the lookup/write
+// primitives it builds on.
 
 // -----------------------------------------------------------------
 // T4: writer, login-token shape, atomicity, permissions
@@ -382,9 +337,9 @@ fn lookup_entry_for_url_matched_key_round_trips_through_lookup_entry() {
 }
 
 #[test]
-fn resolve_bearer_prefers_canonical_entry_when_both_spellings_stored() {
+fn lookup_entry_for_url_prefers_canonical_entry_when_both_spellings_stored() {
     let dir = TempDir::new().unwrap();
-    write_credentials(
+    let path = write_credentials(
         &dir,
         concat!(
             r#"{"version":1,"credentials":{"#,
@@ -393,14 +348,9 @@ fn resolve_bearer_prefers_canonical_entry_when_both_spellings_stored() {
             r#"}}"#
         ),
     );
-    let config_file = dir.path().join("config.yaml");
-    let resolved = resolve_bearer(
-        None,
-        Some(&config_file),
-        "https://example.com/team/v1/stores",
-    );
+    let (_, entry) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
     assert_eq!(
-        resolved.as_deref(),
+        entry.secret.as_deref(),
         Some("ldb_canonical"),
         "when both spellings of a key are stored, the already-canonical entry wins deterministically"
     );
@@ -443,19 +393,14 @@ fn lookup_entry_for_url_origin_only_entry_still_matches_origin_requests() {
 }
 
 #[test]
-fn resolve_bearer_matches_a_path_prefixed_daemon_request() {
+fn lookup_entry_for_url_matches_a_path_prefixed_daemon_request() {
     let dir = TempDir::new().unwrap();
-    write_credentials(
+    let path = write_credentials(
         &dir,
         r#"{"version":1,"credentials":{"https://example.com/team":{"secret":"ldb_team"}}}"#,
     );
-    let config_file = dir.path().join("config.yaml");
-    let resolved = resolve_bearer(
-        None,
-        Some(&config_file),
-        "https://example.com/team/v1/stores",
-    );
-    assert_eq!(resolved.as_deref(), Some("ldb_team"));
+    let (_, entry) = lookup_entry_for_url(&path, "https://example.com/team/v1/stores").unwrap();
+    assert_eq!(entry.secret.as_deref(), Some("ldb_team"));
 }
 
 #[tokio::test]

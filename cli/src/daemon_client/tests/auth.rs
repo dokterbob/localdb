@@ -1,14 +1,17 @@
 use super::super::*;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use tempfile::TempDir;
 
-/// `bearer_for_request` matches the stored key against the full request
+/// `fresh_bearer_for_url` matches the stored key against the full request
 /// URL by string prefix, with no URL reparsing on either side — a
 /// credential keyed by a bracketed IPv6 base URL (as `login` writes it,
 /// from `daemon.url`'s `SocketAddr` display) is found for a request built
 /// from that same base URL.
-#[test]
-fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
+#[tokio::test]
+async fn fresh_bearer_for_url_matches_credential_written_for_bracketed_ipv6_base_url() {
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -30,7 +33,7 @@ fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
     let ctx = ctx_with_config(&config_file);
     let request_url = format!("{base_url}/v1/status");
     assert_eq!(
-        bearer_for_request(&ctx, &request_url).as_deref(),
+        fresh_bearer_for_url(&ctx, &request_url).await.as_deref(),
         Some("ldb_ipv6_access"),
         "the credential written for the bracketed IPv6 base URL must be \
              found again when looked up via the same base URL derivation"
@@ -47,17 +50,28 @@ fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
 /// `Authorization: Bearer new_access` is presented. `token_prefix` is empty
 /// for a bare-origin daemon, or a path like `/team` for a path-prefixed one.
 fn start_refresh_mock_daemon() -> u16 {
-    start_refresh_mock_daemon_with_prefix("")
+    start_refresh_mock_daemon_with_prefix("").0
 }
 
 /// `POST {token_prefix}/token` with `grant_type=refresh_token&refresh_token=old_refresh`
 /// answers a fresh `new_access`/`new_refresh` pair, anything else `invalid_grant`.
-fn start_refresh_mock_daemon_with_prefix(token_prefix: &str) -> u16 {
+///
+/// Returns the bound port plus `(token_calls, unauthorized_calls)` counters
+/// so a proactive-refresh test can assert the stale/soon-to-expire token was
+/// redeemed before ever being sent to the protected route, rather than only
+/// after a 401.
+fn start_refresh_mock_daemon_with_prefix(
+    token_prefix: &str,
+) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     use std::io::{BufRead, BufReader, Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock daemon");
     let port = listener.local_addr().unwrap().port();
     let token_path = format!("{token_prefix}/token");
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let unauthorized_calls = Arc::new(AtomicUsize::new(0));
+    let token_calls_for_thread = token_calls.clone();
+    let unauthorized_calls_for_thread = unauthorized_calls.clone();
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -95,6 +109,7 @@ fn start_refresh_mock_daemon_with_prefix(token_prefix: &str) -> u16 {
             let body = String::from_utf8_lossy(&body).to_string();
 
             let response = if path.starts_with(&token_path) {
+                token_calls_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if body.contains("grant_type=refresh_token")
                     && body.contains("refresh_token=old_refresh")
                 {
@@ -120,6 +135,7 @@ fn start_refresh_mock_daemon_with_prefix(token_prefix: &str) -> u16 {
                         json
                     )
             } else {
+                unauthorized_calls_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let json = r#"{"code":"unauthorized","message":"missing or expired bearer token"}"#;
                 format!(
                         "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: Bearer\r\nContent-Length: {}\r\n\r\n{}",
@@ -131,7 +147,7 @@ fn start_refresh_mock_daemon_with_prefix(token_prefix: &str) -> u16 {
         }
     });
 
-    port
+    (port, token_calls, unauthorized_calls)
 }
 
 fn ctx_with_config(config_file: &std::path::Path) -> CliContext {
@@ -146,8 +162,13 @@ fn ctx_with_config(config_file: &std::path::Path) -> CliContext {
     }
 }
 
+/// The fixture here is a token with no `access_expires_at` recorded at all,
+/// so the proactive expiry check never fires — the retry happens only
+/// because the mock daemon rejects `old_access` with a 401, exercising the
+/// reactive backstop in `daemon_request_async`, not the proactive refresh
+/// `fresh_bearer_for_url` performs up front.
 #[tokio::test]
-async fn expired_access_token_is_retried_once_with_refreshed_token() {
+async fn rejected_access_token_is_retried_once_with_refreshed_token() {
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -178,7 +199,7 @@ async fn expired_access_token_is_retried_once_with_refreshed_token() {
 
     assert!(
         result.is_ok(),
-        "expired-token retry should succeed: {:?}",
+        "rejected-token retry should succeed: {:?}",
         result.err()
     );
 
@@ -197,7 +218,7 @@ async fn path_prefixed_daemon_credential_is_found_and_refreshed_under_the_same_k
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
-    let port = start_refresh_mock_daemon_with_prefix("/team");
+    let (port, _token_calls, _unauthorized_calls) = start_refresh_mock_daemon_with_prefix("/team");
     let base_url = format!("http://127.0.0.1:{port}/team");
 
     let credentials_file = crate::credentials::credentials_path(&config_file);
@@ -231,6 +252,156 @@ async fn path_prefixed_daemon_credential_is_found_and_refreshed_under_the_same_k
     let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
     assert_eq!(entry.access_token.as_deref(), Some("new_access"));
     assert_eq!(entry.refresh_token.as_deref(), Some("new_refresh"));
+}
+
+// -----------------------------------------------------------------
+// Proactive refresh through `daemon_request_async`: an expired, or
+// soon-to-expire, cached access token must never be sent to the protected
+// route at all — it is refreshed up front, so the mock's 401 counter stays
+// at zero and the only `/token` call is the proactive one.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn daemon_request_proactively_refreshes_an_already_expired_cached_token() {
+    let dir = TempDir::new().unwrap();
+    let config_file = dir.path().join("config.yaml");
+    std::fs::write(&config_file, "version: 1\n").unwrap();
+    let (port, token_calls, unauthorized_calls) = start_refresh_mock_daemon_with_prefix("");
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    crate::credentials::write_entry(
+        &credentials_file,
+        &base_url,
+        crate::credentials::CredentialEntry {
+            secret: None,
+            access_token: Some("old_access".to_string()),
+            refresh_token: Some("old_refresh".to_string()),
+            access_expires_at: Some(localdb_core::auth::rfc3339_from_now(-10)),
+        },
+    )
+    .unwrap();
+
+    let ctx = ctx_with_config(&config_file);
+    let result = daemon_request_async(
+        &ctx,
+        reqwest::Method::GET,
+        &format!("{base_url}/v1/status"),
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "the request after a proactive refresh should succeed: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        token_calls.load(Ordering::SeqCst),
+        1,
+        "the mock must see exactly one POST /token, issued before the API call"
+    );
+    assert_eq!(
+        unauthorized_calls.load(Ordering::SeqCst),
+        0,
+        "an already-expired token must never reach the protected route in the first place"
+    );
+    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+    assert_eq!(entry.access_token.as_deref(), Some("new_access"));
+}
+
+#[tokio::test]
+async fn daemon_request_proactively_refreshes_a_token_expiring_within_the_margin() {
+    let dir = TempDir::new().unwrap();
+    let config_file = dir.path().join("config.yaml");
+    std::fs::write(&config_file, "version: 1\n").unwrap();
+    let (port, token_calls, unauthorized_calls) = start_refresh_mock_daemon_with_prefix("");
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    crate::credentials::write_entry(
+        &credentials_file,
+        &base_url,
+        crate::credentials::CredentialEntry {
+            secret: None,
+            access_token: Some("old_access".to_string()),
+            refresh_token: Some("old_refresh".to_string()),
+            // Not yet expired, but inside the 30s refresh margin.
+            access_expires_at: Some(localdb_core::auth::rfc3339_from_now(10)),
+        },
+    )
+    .unwrap();
+
+    let ctx = ctx_with_config(&config_file);
+    let result = daemon_request_async(
+        &ctx,
+        reqwest::Method::GET,
+        &format!("{base_url}/v1/status"),
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "the request after a proactive refresh should succeed: {:?}",
+        result.err()
+    );
+    assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        unauthorized_calls.load(Ordering::SeqCst),
+        0,
+        "a token expiring within the refresh margin must be refreshed before use, not after a 401"
+    );
+    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+    assert_eq!(entry.access_token.as_deref(), Some("new_access"));
+}
+
+/// Same proactive-refresh guarantee as the bare-origin cases above, but for
+/// a credential keyed by a path-prefixed daemon base URL — the same bug
+/// `path_prefixed_daemon_credential_is_found_and_refreshed_under_the_same_key`
+/// guards for the reactive-401 path.
+#[tokio::test]
+async fn path_prefixed_daemon_credential_gets_the_same_proactive_refresh() {
+    let dir = TempDir::new().unwrap();
+    let config_file = dir.path().join("config.yaml");
+    std::fs::write(&config_file, "version: 1\n").unwrap();
+    let (port, _token_calls, unauthorized_calls) = start_refresh_mock_daemon_with_prefix("/team");
+    let base_url = format!("http://127.0.0.1:{port}/team");
+
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    crate::credentials::write_entry(
+        &credentials_file,
+        &base_url,
+        crate::credentials::CredentialEntry {
+            secret: None,
+            access_token: Some("old_access".to_string()),
+            refresh_token: Some("old_refresh".to_string()),
+            access_expires_at: Some(localdb_core::auth::rfc3339_from_now(-10)),
+        },
+    )
+    .unwrap();
+
+    let ctx = ctx_with_config(&config_file);
+    let result = daemon_request_async(
+        &ctx,
+        reqwest::Method::GET,
+        &format!("{base_url}/v1/status"),
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "the path-prefixed credential's proactive refresh should succeed: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        unauthorized_calls.load(Ordering::SeqCst),
+        0,
+        "the path-prefixed credential's expired token must be refreshed before use, not after a 401"
+    );
+    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+    assert_eq!(entry.access_token.as_deref(), Some("new_access"));
 }
 
 #[tokio::test]
@@ -336,14 +507,14 @@ async fn env_api_key_skips_refresh_attempt_entirely() {
 }
 
 // -----------------------------------------------------------------
-// ensure_fresh_bearer: proactive pre-connect refresh for the MCP
-// daemon-proxy handshake (`cmds::surface::run_mcp_async`), which has no
-// cheap way to retry mid-stream on a 401 the way `daemon_request_async`
-// does.
+// fresh_bearer_for_url: the shared proactive-refresh helper every
+// daemon-bound CLI request goes through, called directly here with an
+// already-resolved base URL (`daemon_request_async`'s own tests above
+// exercise it indirectly, through a full request).
 // -----------------------------------------------------------------
 
 #[tokio::test]
-async fn ensure_fresh_bearer_refreshes_an_expired_access_token() {
+async fn fresh_bearer_for_url_refreshes_an_expired_access_token() {
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -364,7 +535,7 @@ async fn ensure_fresh_bearer_refreshes_an_expired_access_token() {
     .unwrap();
 
     let ctx = ctx_with_config(&config_file);
-    let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+    let bearer = fresh_bearer_for_url(&ctx, &base_url).await;
 
     assert_eq!(
         bearer.as_deref(),
@@ -381,7 +552,7 @@ async fn ensure_fresh_bearer_refreshes_an_expired_access_token() {
 }
 
 #[tokio::test]
-async fn ensure_fresh_bearer_returns_unexpired_token_without_refreshing() {
+async fn fresh_bearer_for_url_returns_unexpired_token_without_refreshing() {
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -406,7 +577,7 @@ async fn ensure_fresh_bearer_returns_unexpired_token_without_refreshing() {
     .unwrap();
 
     let ctx = ctx_with_config(&config_file);
-    let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+    let bearer = fresh_bearer_for_url(&ctx, &base_url).await;
 
     assert_eq!(bearer.as_deref(), Some("still_good"));
     let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
@@ -418,7 +589,7 @@ async fn ensure_fresh_bearer_returns_unexpired_token_without_refreshing() {
 }
 
 #[tokio::test]
-async fn ensure_fresh_bearer_env_override_wins_without_touching_credentials() {
+async fn fresh_bearer_for_url_env_override_wins_without_touching_credentials() {
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -433,7 +604,7 @@ async fn ensure_fresh_bearer_env_override_wins_without_touching_credentials() {
         ctx
     };
 
-    let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+    let bearer = fresh_bearer_for_url(&ctx, &base_url).await;
     assert_eq!(bearer.as_deref(), Some("ldb_env_key"));
 
     let credentials_file = crate::credentials::credentials_path(&config_file);
@@ -444,7 +615,37 @@ async fn ensure_fresh_bearer_env_override_wins_without_touching_credentials() {
 }
 
 #[tokio::test]
-async fn ensure_fresh_bearer_falls_back_to_stale_token_when_refresh_fails() {
+async fn fresh_bearer_for_url_empty_env_key_falls_back_to_credentials_file() {
+    let dir = TempDir::new().unwrap();
+    let config_file = dir.path().join("config.yaml");
+    std::fs::write(&config_file, "version: 1\n").unwrap();
+    let base_url = "http://127.0.0.1:1".to_string();
+
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    crate::credentials::write_entry(
+        &credentials_file,
+        &base_url,
+        crate::credentials::CredentialEntry {
+            secret: Some("ldb_cached".to_string()),
+            access_token: None,
+            refresh_token: None,
+            access_expires_at: None,
+        },
+    )
+    .unwrap();
+
+    let mut ctx = ctx_with_config(&config_file);
+    ctx.api_key = Some(String::new());
+
+    assert_eq!(
+        fresh_bearer_for_url(&ctx, &base_url).await.as_deref(),
+        Some("ldb_cached"),
+        "an empty LOCALDB_API_KEY must be treated as unset, not as a literal empty bearer"
+    );
+}
+
+#[tokio::test]
+async fn fresh_bearer_for_url_falls_back_to_stale_token_when_refresh_fails() {
     let dir = TempDir::new().unwrap();
     let config_file = dir.path().join("config.yaml");
     std::fs::write(&config_file, "version: 1\n").unwrap();
@@ -467,7 +668,7 @@ async fn ensure_fresh_bearer_falls_back_to_stale_token_when_refresh_fails() {
     .unwrap();
 
     let ctx = ctx_with_config(&config_file);
-    let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+    let bearer = fresh_bearer_for_url(&ctx, &base_url).await;
 
     assert_eq!(
         bearer.as_deref(),
@@ -488,7 +689,7 @@ fn refresh_process_worker() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         if std::env::var("LOCALDB_TEST_REFRESH_PROACTIVE").is_ok() {
             assert_eq!(
-                ensure_fresh_bearer(&ctx, &base).await.as_deref(),
+                fresh_bearer_for_url(&ctx, &base).await.as_deref(),
                 Some("new_access")
             );
         } else {
@@ -589,7 +790,7 @@ async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
         Some("keep")
     );
     assert_eq!(
-        ensure_fresh_bearer(&ctx_with_config(&config), &base)
+        fresh_bearer_for_url(&ctx_with_config(&config), &base)
             .await
             .as_deref(),
         Some("new_access")
@@ -615,7 +816,7 @@ async fn valid_cached_credentials_do_not_require_a_writable_lock_file() {
     // Deterministically prevent opening a lock file, even when tests run as root.
     std::fs::create_dir(dir.path().join("credentials.lock")).unwrap();
     assert_eq!(
-        ensure_fresh_bearer(&ctx_with_config(&config), base)
+        fresh_bearer_for_url(&ctx_with_config(&config), base)
             .await
             .as_deref(),
         Some("read-only-key")

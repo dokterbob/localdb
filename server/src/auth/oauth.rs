@@ -472,11 +472,11 @@ fn render_oob_success_page(code: &str) -> Html<String> {
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>localdb login code</title>
 <style>body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; }}
-code {{ font-size: 1.1rem; user-select: all; background: #f0f0f0; padding: 4px 8px; display: inline-block; margin-top: 8px; }}</style>
+#authorization-code {{ font-size: 1.1rem; user-select: all; background: #f0f0f0; padding: 4px 8px; display: inline-block; margin-top: 8px; }}</style>
 </head><body>
 <h1>Authorization complete</h1>
-<p>Copy this code and paste it back into the terminal running <code>localdb login --no-browser</code>:</p>
-<p><code>{}</code></p>
+<p>Copy this code and paste it back into the terminal running <kbd>localdb login --no-browser</kbd>:</p>
+<p><code id="authorization-code">{}</code></p>
 </body></html>"#,
         escape_html(code)
     ))
