@@ -21,7 +21,9 @@ use serde_json::json;
 
 use crate::{
     credentials::CredentialEntry,
-    daemon_client::{probe_daemon, resolved_config_file, CliContext, DaemonState},
+    daemon_client::{
+        encode_path_segment, probe_daemon, resolved_config_file, CliContext, DaemonState,
+    },
     normalize::{exit_err, print_json},
 };
 
@@ -138,9 +140,10 @@ fn resolve_requested_name(name: Option<&str>) -> Result<String, Error> {
 /// `server::auth::oauth::handle_invite_authorize`, exists too, but only for
 /// the browser flow; it can't drive a poll loop the way this can). `open`
 /// mode: one request, done. `closed` mode: polls
-/// `GET /v1/invites/requests/{id}` every `poll_interval` until an admin
-/// decides. `poll_interval` is injected (production: 1s) so tests can drive
-/// the loop with a much shorter interval instead of a multi-second sleep.
+/// `POST /v1/invites/requests/{id}/poll` every `poll_interval` until an
+/// admin decides. `poll_interval` is injected (production: 1s) so tests can
+/// drive the loop with a much shorter interval instead of a multi-second
+/// sleep.
 async fn perform_invite_login(
     ctx: &CliContext,
     base_url: &str,
@@ -221,10 +224,11 @@ async fn perform_invite_login(
     Err(crate::daemon_client::daemon_response_error(status, &body))
 }
 
-/// Poll `GET /v1/invites/requests/{id}?secret=...` every `poll_interval`
-/// until the request is decided. Returns the credential on approval;
-/// `denied` is a terminal `Unauthorized` with a clear message, per
-/// specs/05-surfaces.md §2.
+/// Poll `POST /v1/invites/requests/{id}/poll` every `poll_interval` until
+/// the request is decided. Returns the credential on approval; `denied` is
+/// a terminal `Unauthorized` with a clear message, per specs/05-surfaces.md
+/// §2. The secret is sent in the JSON body, never the URL — see
+/// `server::handlers::invites::poll_request`'s doc comment for why.
 async fn poll_until_decided(
     client: &reqwest::Client,
     base_url: &str,
@@ -232,11 +236,11 @@ async fn poll_until_decided(
     request_secret: &str,
     poll_interval: std::time::Duration,
 ) -> Result<String, Error> {
+    let encoded_id = encode_path_segment(request_id);
     loop {
         let resp = client
-            .get(format!(
-                "{base_url}/v1/invites/requests/{request_id}?secret={request_secret}"
-            ))
+            .post(format!("{base_url}/v1/invites/requests/{encoded_id}/poll"))
+            .json(&json!({ "secret": request_secret }))
             .send()
             .await
             .map_err(|_| Error::DaemonUnreachable)?;

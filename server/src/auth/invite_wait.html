@@ -13,11 +13,17 @@
   const form = document.querySelector('form');
   const approvedKey = document.getElementById('approved-key');
   const apiKeyEl = document.getElementById('api-key');
-  const { pollUrl, onApprove } = document.body.dataset;
+  const { pollUrl, onApprove, requestSecret } = document.body.dataset;
   async function poll() {
     retry.hidden = true;
     try {
-      const response = await fetch(pollUrl, { cache: 'no-store', referrerPolicy: 'no-referrer' });
+      const response = await fetch(pollUrl, {
+        method: 'POST',
+        cache: 'no-store',
+        referrerPolicy: 'no-referrer',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: requestSecret }),
+      });
       if (!response.ok) throw new Error('Could not check approval. Please retry.');
       const result = await response.json();
       if (result.state === 'pending') {

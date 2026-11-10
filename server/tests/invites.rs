@@ -128,11 +128,31 @@ async fn redeem_invite(app: Router, token: &str, name: &str) -> (StatusCode, Val
 }
 
 async fn poll_request(app: Router, request_id: &str, secret: &str) -> (StatusCode, Value) {
-    let resp = get(
-        app,
-        &format!("/v1/invites/requests/{request_id}?secret={secret}"),
-    )
-    .await;
+    poll_request_raw(app, request_id, Some(json!({ "secret": secret }))).await
+}
+
+/// Like [`poll_request`], but takes an arbitrary (possibly absent) JSON
+/// body, so tests can drive the missing-secret and malformed-body cases
+/// `poll_request`'s fixed shape can't express.
+async fn poll_request_raw(
+    app: Router,
+    request_id: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/invites/requests/{request_id}/poll"));
+    let request_body = match body {
+        Some(value) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = app
+        .oneshot(builder.body(request_body).unwrap())
+        .await
+        .unwrap();
     let status = resp.status();
     (status, json_body(resp.into_body()).await)
 }
@@ -430,6 +450,30 @@ async fn redeem_unknown_token_is_4xx() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn redeem_closed_invite_poll_hint_carries_no_secret() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin1", Role::Admin).await;
+    let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
+    let token = created["token"].as_str().unwrap().to_string();
+
+    let (status, body) = redeem_invite(app.clone(), &token, "requester").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let request_id = body["request_id"].as_str().unwrap().to_string();
+    let request_secret = body["request_secret"].as_str().unwrap().to_string();
+    let poll = body["poll"].as_str().unwrap();
+
+    assert_eq!(poll, format!("/v1/invites/requests/{request_id}/poll"));
+    assert!(
+        !poll.contains(&request_secret),
+        "the poll hint must carry no secret: {poll}"
+    );
+    assert!(
+        !poll.contains('?'),
+        "the poll hint must carry no query string: {poll}"
+    );
+}
+
+#[tokio::test]
 async fn closed_invite_full_round_trip_pending_approve_poll_once_collected() {
     let (_dir, state, app) = make_enforced_app().await;
     let admin_secret = seed_user_with_key(&state, "admin1", Role::Admin).await;
@@ -539,7 +583,7 @@ async fn closed_invite_deny_then_poll_denied() {
 }
 
 #[tokio::test]
-async fn poll_unknown_id_and_wrong_secret_are_indistinguishable_over_http() {
+async fn poll_unknown_id_wrong_secret_and_missing_secret_are_indistinguishable_over_http() {
     let (_dir, state, app) = make_enforced_app().await;
     let admin_secret = seed_user_with_key(&state, "admin1", Role::Admin).await;
     let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
@@ -551,11 +595,83 @@ async fn poll_unknown_id_and_wrong_secret_are_indistinguishable_over_http() {
         poll_request(app.clone(), "totally-unknown-id", "ldb_whatever").await;
     let (wrong_secret_status, wrong_secret_body) =
         poll_request(app.clone(), &request_id, "ldb_wrong-secret").await;
+    // A body with `secret` entirely absent, and one with `secret: ""`, must
+    // both collapse to the same unauthorized shape as an unknown id or a
+    // wrong secret — none of the four is distinguishable from the others.
+    let (missing_field_status, missing_field_body) =
+        poll_request_raw(app.clone(), &request_id, Some(json!({}))).await;
+    let (empty_secret_status, empty_secret_body) = poll_request(app.clone(), &request_id, "").await;
 
-    assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(wrong_secret_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(unknown_body["message"], wrong_secret_body["message"]);
-    assert_eq!(unknown_body["code"], wrong_secret_body["code"]);
+    for (status, body) in [
+        (unknown_status, &unknown_body),
+        (wrong_secret_status, &wrong_secret_body),
+        (missing_field_status, &missing_field_body),
+        (empty_secret_status, &empty_secret_body),
+    ] {
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["message"], unknown_body["message"]);
+        assert_eq!(body["code"], unknown_body["code"]);
+    }
+}
+
+#[tokio::test]
+async fn old_get_poll_route_is_gone_and_never_mints_a_key() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin1", Role::Admin).await;
+    let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
+    let token = created["token"].as_str().unwrap().to_string();
+    let (_status, body) = redeem_invite(app.clone(), &token, "requester").await;
+    let request_id = body["request_id"].as_str().unwrap().to_string();
+    let request_secret = body["request_secret"].as_str().unwrap().to_string();
+
+    state.auth().approve_request(&request_id).await.unwrap();
+
+    // The old GET route with the secret in the query string must no longer
+    // resolve to the poll handler at all. Checked with a *valid* admin
+    // bearer attached, so the result is unambiguous: this router's
+    // merged fallback answers any entirely unmatched path with "missing
+    // bearer token" when no bearer is presented (a pre-existing property
+    // of how `public`/`protected` are merged in `daemon::build_router`,
+    // unrelated to this route specifically) — attaching a bearer rules
+    // that out and leaves only axum's genuine "no route matched" 404.
+    let resp = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/invites/requests/{request_id}?secret={request_secret}"),
+        None,
+        Some(&admin_secret),
+    )
+    .await;
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
+        "the old GET poll route must be gone, got {}",
+        resp.status()
+    );
+
+    // The approved request is still collectible via the real route — the
+    // GET attempt above must not have minted (and thus burned) the key.
+    let (status, body) = poll_request(app.clone(), &request_id, &request_secret).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "approved");
+    assert!(body["api_key"].as_str().unwrap().starts_with("ldb_"));
+}
+
+#[tokio::test]
+async fn poll_route_works_without_a_bearer_when_auth_is_enforced() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin1", Role::Admin).await;
+    let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
+    let token = created["token"].as_str().unwrap().to_string();
+    let (_status, body) = redeem_invite(app.clone(), &token, "requester").await;
+    let request_id = body["request_id"].as_str().unwrap().to_string();
+    let request_secret = body["request_secret"].as_str().unwrap().to_string();
+
+    // No `Authorization` header anywhere in `poll_request` — this would
+    // 401 with "missing bearer token" if the route were on the protected
+    // router instead of the public one.
+    let (status, resp_body) = poll_request(app.clone(), &request_id, &request_secret).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp_body["state"], "pending");
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +809,15 @@ async fn consent_page_closed_invite_shows_request_submitted_page() {
     assert!(html.contains("form.submit()"));
     assert!(html.contains(r#"data-on-approve="submit""#));
     assert!(html.contains("data-poll-url="));
+    let poll_url = html
+        .split("data-poll-url=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("data-poll-url attribute must be present");
+    assert!(
+        poll_url.ends_with("/poll") && !poll_url.contains('?'),
+        "data-poll-url must carry no secret: {poll_url}"
+    );
 
     // No user was created and no OAuth code issued.
     let user = state
@@ -787,6 +912,15 @@ async fn post_join_closed_mode_returns_a_waiting_page() {
     assert!(html.contains(r#"data-on-approve="show""#));
     assert!(html.contains("data-poll-url="));
     assert!(html.contains(r#"id="api-key""#));
+    let poll_url = html
+        .split("data-poll-url=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("data-poll-url attribute must be present");
+    assert!(
+        poll_url.ends_with("/poll") && !poll_url.contains('?'),
+        "data-poll-url must carry no secret: {poll_url}"
+    );
 }
 
 #[tokio::test]
@@ -877,8 +1011,10 @@ async fn browser_closed_invite_retains_secret_and_resumes_original_oauth_flow() 
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/v1/invites/requests/{request_id}?secret={secret}"))
-                .body(Body::empty())
+                .method(Method::POST)
+                .uri(format!("/v1/invites/requests/{request_id}/poll"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "secret": secret }).to_string()))
                 .unwrap(),
         )
         .await

@@ -136,9 +136,7 @@ fn render_joined_page(name: &str, api_key: &str, grants: &[String]) -> Html<Stri
 /// working behind any path prefix the daemon is mounted under.
 fn render_join_wait_page(request_id: &str, request_secret: &str) -> Html<String> {
     let page = page_shell("Join localdb", "<h1>Join localdb</h1>").0;
-    let poll_url = escape_html(&format!(
-        "v1/invites/requests/{request_id}?secret={request_secret}"
-    ));
+    let poll_url = escape_html(&format!("v1/invites/requests/{request_id}/poll"));
     let body_tag = format!(
         "<body data-request-id=\"{}\" data-request-secret=\"{}\" data-poll-url=\"{}\" \
          data-on-approve=\"show\">",

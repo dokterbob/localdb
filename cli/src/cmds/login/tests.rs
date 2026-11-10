@@ -467,6 +467,65 @@ async fn polling_stops_on_http_errors_and_malformed_success() {
 }
 
 #[tokio::test]
+async fn poll_until_decided_sends_the_secret_in_the_json_body_not_the_url() {
+    let recorded: Arc<std::sync::Mutex<Option<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let recorded_clone = recorded.clone();
+
+    let app = axum::Router::new().route(
+        "/v1/invites/requests/{id}/poll",
+        axum::routing::post(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let recorded = recorded_clone.clone();
+            async move {
+                *recorded.lock().unwrap() =
+                    Some((uri.to_string(), String::from_utf8_lossy(&body).into_owned()));
+                axum::Json(serde_json::json!({ "state": "approved", "api_key": "ldb_minted" }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A request id with a space, to prove it's percent-encoded as a path
+    // segment rather than dropped into the URL raw.
+    let result = poll_until_decided(
+        &reqwest::Client::new(),
+        &base,
+        "req id",
+        "ldb_topsecret",
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(result.unwrap(), "ldb_minted");
+
+    let (uri, body) = recorded
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the mock daemon must have recorded exactly one poll request");
+    assert!(
+        !uri.contains('?'),
+        "the poll request's URI must carry no query string: {uri}"
+    );
+    assert!(
+        !uri.contains("ldb_topsecret"),
+        "the secret must never appear in the URI: {uri}"
+    );
+    assert!(
+        uri.contains("req%20id"),
+        "the request id must be percent-encoded as a path segment: {uri}"
+    );
+
+    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json_body["secret"], "ldb_topsecret");
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn failed_logout_keeps_cache_for_retry() {
     let dir = TempDir::new().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

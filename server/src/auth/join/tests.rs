@@ -60,8 +60,23 @@ fn joined_page_escapes_a_hostile_store_name() {
 fn join_wait_page_carries_a_relative_poll_url_and_show_mode() {
     let html = render_join_wait_page("req1", "sekret").0;
     assert!(html.contains(r#"data-on-approve="show""#));
-    assert!(html.contains(r#"data-poll-url="v1/invites/requests/req1?secret=sekret""#));
+    assert!(html.contains(r#"data-poll-url="v1/invites/requests/req1/poll""#));
     assert!(html.contains(r#"id="api-key""#));
+}
+
+#[test]
+fn join_wait_page_poll_url_carries_no_secret() {
+    let html = render_join_wait_page("req1", "sekret").0;
+    let poll_url = html
+        .split("data-poll-url=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("data-poll-url attribute must be present");
+    assert!(!poll_url.contains("sekret"));
+    assert!(!poll_url.contains('?'));
+    // The secret still rides along separately, for the shared script to
+    // build the POST body from.
+    assert!(html.contains(r#"data-request-secret="sekret""#));
 }
 
 #[test]

@@ -340,8 +340,8 @@ pub fn build_router(
         .route("/register", post(auth::register::post_register))
         .route("/v1/invites/redeem", post(handlers::redeem_invite_public))
         .route(
-            "/v1/invites/requests/{id}",
-            get(handlers::poll_access_request),
+            "/v1/invites/requests/{id}/poll",
+            post(handlers::poll_access_request),
         )
         .layer(middleware::from_fn(auth::middleware::protect_auth_response))
         .with_state(state);

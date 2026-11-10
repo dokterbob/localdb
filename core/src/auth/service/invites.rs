@@ -356,11 +356,14 @@ impl<S: AuthStore> AuthService<S> {
     /// request IDs (no existence oracle; specs/05-surfaces.md §3.1).
     ///
     /// The request secret is poll-only — it is never promoted to a
-    /// credential (it travels as a URL query parameter on every poll, which
-    /// would otherwise leak into access logs/proxies/shell history as a
-    /// long-lived, live-from-approval-time API key). Instead, on the
-    /// transition into `Approved`, a *fresh* API key is minted for the
-    /// request's resulting user and handed back exactly once:
+    /// credential. It travels in the poll request's JSON body, not the URL
+    /// (a URL is routinely recorded by reverse-proxy and access logs, and a
+    /// secret that leaked through one would let a log reader collect the
+    /// minted key ahead of the real requester), but the body is sent on
+    /// every poll either way, so it still isn't fit to serve as a
+    /// long-lived credential. Instead, on the transition into `Approved`, a
+    /// *fresh* API key is minted for the request's resulting user and
+    /// handed back exactly once:
     /// `AuthStore::mark_access_request_collected` is an atomic consume-once
     /// gate (mirroring `consume_auth_code`), so a second successful poll (or
     /// two concurrent ones racing the first) observes

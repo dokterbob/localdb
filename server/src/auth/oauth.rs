@@ -274,9 +274,7 @@ fn render_request_submitted_page(
     request_secret: &str,
 ) -> Html<String> {
     let page = render_consent_page(params, "", None, None).0;
-    let poll_url = escape_html(&format!(
-        "v1/invites/requests/{request_id}?secret={request_secret}"
-    ));
+    let poll_url = escape_html(&format!("v1/invites/requests/{request_id}/poll"));
     let body = format!(
         "<body data-request-id=\"{}\" data-request-secret=\"{}\" data-poll-url=\"{}\" \
          data-on-approve=\"submit\">",

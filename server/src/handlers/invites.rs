@@ -6,9 +6,9 @@
 //! /v1/invites/requests/{id}/approve|deny`) live in the first half of this
 //! file, mounted on the `protected` router in `daemon::build_router`. The
 //! public redeem/poll routes (`redeem_invite`, `poll_request` — `POST
-//! /v1/invites/redeem`, `GET /v1/invites/requests/{id}`) are in the second
-//! half, deliberately public — they *are* the join flow, mirroring how
-//! `/authorize`/`/token` are public for the OAuth2 flow (T4) — and are
+//! /v1/invites/redeem`, `POST /v1/invites/requests/{id}/poll`) are in the
+//! second half, deliberately public — they *are* the join flow, mirroring
+//! how `/authorize`/`/token` are public for the OAuth2 flow (T4) — and are
 //! mounted on the unlayered `public` router instead.
 //!
 //! HTTP shape only (specs/01-architecture.md §1): the invite/access-request
@@ -370,7 +370,7 @@ pub async fn redeem_invite(
             Json(serde_json::json!({
                 "request_id": request_id,
                 "request_secret": request_secret,
-                "poll": format!("/v1/invites/requests/{request_id}?secret={request_secret}"),
+                "poll": format!("/v1/invites/requests/{request_id}/poll"),
             })),
         )
             .into_response()),
@@ -378,23 +378,27 @@ pub async fn redeem_invite(
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PollRequestQuery {
+pub struct PollRequestBody {
     pub secret: Option<String>,
 }
 
-/// `GET /v1/invites/requests/{id}?secret=<request_secret>` (public): polls a
-/// closed-mode access request's status. The secret is a query parameter
-/// (documented choice, specs/05-surfaces.md §3.1) rather than a header — it
-/// keeps the endpoint trivially `curl`-able and matches the `poll` hint
-/// `POST /v1/invites/redeem` returns. An unknown `id` and a wrong `secret`
-/// against a real one are deliberately indistinguishable (`Unauthorized`,
-/// same message) — no existence oracle.
+/// `POST /v1/invites/requests/{id}/poll` (public): polls a closed-mode
+/// access request's status. The secret travels in the JSON body
+/// (specs/05-surfaces.md §3.1) rather than a URL query parameter: a URL is
+/// routinely recorded by reverse-proxy and access logs, and whoever can
+/// read those logs could poll first and collect the one-time minted API
+/// key ahead of the real requester. RFC 8628's device-authorization grant
+/// sends its device code the same way, in a POST body, for the same
+/// reason. It still matches the `poll` hint `POST /v1/invites/redeem`
+/// returns, and remains trivially `curl`-able with `-d`. An unknown `id`
+/// and a wrong `secret` against a real one are deliberately
+/// indistinguishable (`Unauthorized`, same message) — no existence oracle.
 pub async fn poll_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<PollRequestQuery>,
+    Json(body): Json<PollRequestBody>,
 ) -> Result<Response, ApiError> {
-    let secret = query.secret.unwrap_or_default();
+    let secret = body.secret.unwrap_or_default();
     if secret.is_empty() {
         return Err(ApiError(CoreError::Unauthorized {
             message: "invalid access request id or secret".to_string(),
