@@ -128,6 +128,40 @@ where
     }
 }
 
+/// A JSON body extractor for a public, unauthenticated route whose request
+/// body carries a secret (an invite token, a poll secret): every
+/// deserialization failure — malformed JSON, a type mismatch, a missing or
+/// wrong `Content-Type`, anything [`JsonRejection`] covers — collapses to the
+/// same fixed `invalid_request`/`400`, with neither the rejection's
+/// `Display` output read nor its own `IntoResponse` called.
+///
+/// [`ApiJson`] isn't safe to reuse here: its `JsonDataError`/`JsonSyntaxError`
+/// branch interpolates the rejection into the response message, and serde's
+/// own "invalid type" message embeds the offending value verbatim — for a
+/// bare-string body that value *is* the secret, so the echo would land
+/// straight in the JSON response body (not just a log line) exactly where
+/// this type exists to prevent it. Collapsing every rejection variant,
+/// `Content-Type` ones included, also keeps the response identical across
+/// malformed-body shapes, so a client probing for one can't tell them apart.
+pub struct SecretJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for SecretJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(_rejection) => Err(ApiError(CoreError::InvalidRequest {
+                message: "request body must be a JSON object".to_string(),
+            })),
+        }
+    }
+}
+
 /// Map a `CoreError` to an HTTP status code per specs/05-surfaces.md §5.
 pub fn http_status_for(err: &CoreError) -> StatusCode {
     match err {

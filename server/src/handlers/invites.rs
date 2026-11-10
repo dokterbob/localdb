@@ -33,7 +33,7 @@ use localdb_core::Error as CoreError;
 
 use super::require_principal;
 use crate::auth::base_url::resolve_base_url;
-use crate::error::ApiError;
+use crate::error::{ApiError, SecretJson};
 use crate::state::AppState;
 
 /// A minimal user view for invite-flow responses — deliberately not
@@ -339,9 +339,15 @@ pub struct RedeemInviteRequest {
 /// `POST /v1/invites/redeem` (public): `open` mode -> `201` with the new
 /// user, its granted stores, and a show-once API key; `closed` mode -> `202`
 /// with the pending request's id and secret to poll with.
+///
+/// The body carries the invite token, so it is extracted with
+/// [`SecretJson`] rather than plain `Json`: a malformed body (not JSON at
+/// all, or a bare JSON string rather than the expected object) must not
+/// echo the token back in the error response or in axum's own rejection
+/// trace log.
 pub async fn redeem_invite(
     State(state): State<AppState>,
-    Json(req): Json<RedeemInviteRequest>,
+    SecretJson(req): SecretJson<RedeemInviteRequest>,
 ) -> Result<Response, ApiError> {
     if req.token.trim().is_empty() || req.name.trim().is_empty() {
         return Err(ApiError(CoreError::InvalidRequest {
@@ -390,13 +396,16 @@ pub struct PollRequestBody {
 /// key ahead of the real requester. RFC 8628's device-authorization grant
 /// sends its device code the same way, in a POST body, for the same
 /// reason. It still matches the `poll` hint `POST /v1/invites/redeem`
-/// returns, and remains trivially `curl`-able with `-d`. An unknown `id`
-/// and a wrong `secret` against a real one are deliberately
-/// indistinguishable (`Unauthorized`, same message) — no existence oracle.
+/// returns, and remains trivially `curl`-able with `-H 'Content-Type:
+/// application/json'`. An unknown `id` and a wrong `secret` against a real
+/// one are deliberately indistinguishable (`Unauthorized`, same message) —
+/// no existence oracle. The body is extracted with [`SecretJson`] rather
+/// than plain `Json` for the same reason `redeem_invite` is: a malformed
+/// body must not echo the secret back.
 pub async fn poll_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<PollRequestBody>,
+    SecretJson(body): SecretJson<PollRequestBody>,
 ) -> Result<Response, ApiError> {
     let secret = body.secret.unwrap_or_default();
     if secret.is_empty() {

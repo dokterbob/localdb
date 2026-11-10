@@ -692,10 +692,11 @@ and access logs; a leaked request secret would let whoever reads those logs poll
 the one-time minted API key ahead of the real requester. This follows the OAuth 2.0 device
 authorization grant (RFC 8628), whose device code is likewise sent in a POST body rather than a URL,
 for the same reason. It is still trivially `curl`-able:
-`curl -X POST <base>/v1/invites/requests/<id>/poll -d '{"secret":"<request_secret>"}'`. An unknown
-`id` and a wrong `secret` against a real one are **deliberately indistinguishable**
-(`401 unauthorized`, identical body) — no existence oracle. A **freshly minted** API key is handed
-back **exactly once**, on the poll that first observes the `approved` transition
+`curl -X POST <base>/v1/invites/requests/<id>/poll -H 'Content-Type: application/json' -d '{"secret":"<request_secret>"}'`
+— the explicit header matters: `curl -d` alone sends `application/x-www-form-urlencoded`, which this
+JSON-only route rejects. An unknown `id` and a wrong `secret` against a real one are **deliberately
+indistinguishable** (`401 unauthorized`, identical body) — no existence oracle. A **freshly minted**
+API key is handed back **exactly once**, on the poll that first observes the `approved` transition
 (`AccessRequest.collected_at`, an atomic single-use guard mirroring `consume_auth_code`) — every
 later poll answers `collected` instead of re-issuing a credential. `request_secret` itself never
 becomes a credential: it is poll-only, scoped to proving knowledge of this one request, and is

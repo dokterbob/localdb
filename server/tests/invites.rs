@@ -157,6 +157,34 @@ async fn poll_request_raw(
     (status, json_body(resp.into_body()).await)
 }
 
+/// Sends a raw, pre-serialized (and possibly not even valid JSON) body to
+/// `uri`, with an explicit `Content-Type` header or none at all when
+/// `content_type` is `None` — the shape the malformed-body tests below need
+/// and the `Option<Value>`-based helpers above, which always serialize a
+/// well-formed JSON value, can't express.
+async fn post_raw_body(
+    app: Router,
+    uri: &str,
+    content_type: Option<&str>,
+    body: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(Method::POST).uri(uri);
+    if let Some(ct) = content_type {
+        builder = builder.header("content-type", ct);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, json_body(resp.into_body()).await)
+}
+
+/// Stands in for a real secret (an invite token or a poll `request_secret`)
+/// in the malformed-body tests below — any response that contains this
+/// string indicates a leak.
+const SENTINEL_SECRET: &str = "ldb_SENTINEL_DO_NOT_LEAK_6f2a9c";
+
 // ---------------------------------------------------------------------------
 // Admin CRUD + 403-for-member
 // ---------------------------------------------------------------------------
@@ -1051,4 +1079,85 @@ async fn browser_closed_invite_retains_secret_and_resumes_original_oauth_flow() 
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(state.auth_store().list_users().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn redeem_malformed_body_never_echoes_the_token_and_is_identical_across_shapes() {
+    let (_dir, _state, app) = make_enforced_app().await;
+
+    let (bare_string_status, bare_string_body) = post_raw_body(
+        app.clone(),
+        "/v1/invites/redeem",
+        Some("application/json"),
+        &format!("\"{SENTINEL_SECRET}\""),
+    )
+    .await;
+    let (not_json_status, not_json_body) = post_raw_body(
+        app.clone(),
+        "/v1/invites/redeem",
+        Some("application/json"),
+        &format!("this is not json at all {SENTINEL_SECRET}"),
+    )
+    .await;
+    let (no_content_type_status, no_content_type_body) = post_raw_body(
+        app.clone(),
+        "/v1/invites/redeem",
+        None,
+        &format!("\"{SENTINEL_SECRET}\""),
+    )
+    .await;
+
+    for body in [&bare_string_body, &not_json_body, &no_content_type_body] {
+        assert!(
+            !body.to_string().contains(SENTINEL_SECRET),
+            "response body must never echo the request body: {body}"
+        );
+    }
+    assert_eq!(bare_string_status, StatusCode::BAD_REQUEST);
+    assert_eq!(not_json_status, StatusCode::BAD_REQUEST);
+    assert_eq!(no_content_type_status, StatusCode::BAD_REQUEST);
+    assert_eq!(bare_string_body, not_json_body);
+    assert_eq!(bare_string_body, no_content_type_body);
+    assert_eq!(bare_string_body["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn poll_malformed_body_never_echoes_the_secret_and_is_identical_across_shapes() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "admin1", Role::Admin).await;
+    let created = create_invite(app.clone(), &admin_secret, "closed", &[], 1).await;
+    let token = created["token"].as_str().unwrap().to_string();
+    let (_status, body) = redeem_invite(app.clone(), &token, "requester").await;
+    let request_id = body["request_id"].as_str().unwrap().to_string();
+    let uri = format!("/v1/invites/requests/{request_id}/poll");
+
+    let (bare_string_status, bare_string_body) = post_raw_body(
+        app.clone(),
+        &uri,
+        Some("application/json"),
+        &format!("\"{SENTINEL_SECRET}\""),
+    )
+    .await;
+    let (not_json_status, not_json_body) = post_raw_body(
+        app.clone(),
+        &uri,
+        Some("application/json"),
+        &format!("this is not json at all {SENTINEL_SECRET}"),
+    )
+    .await;
+    let (no_content_type_status, no_content_type_body) =
+        post_raw_body(app.clone(), &uri, None, &format!("\"{SENTINEL_SECRET}\"")).await;
+
+    for body in [&bare_string_body, &not_json_body, &no_content_type_body] {
+        assert!(
+            !body.to_string().contains(SENTINEL_SECRET),
+            "response body must never echo the request body: {body}"
+        );
+    }
+    assert_eq!(bare_string_status, StatusCode::BAD_REQUEST);
+    assert_eq!(not_json_status, StatusCode::BAD_REQUEST);
+    assert_eq!(no_content_type_status, StatusCode::BAD_REQUEST);
+    assert_eq!(bare_string_body, not_json_body);
+    assert_eq!(bare_string_body, no_content_type_body);
+    assert_eq!(bare_string_body["code"], "invalid_request");
 }
