@@ -84,6 +84,7 @@ struct ValidParams {
 
 #[derive(Debug)]
 struct OAuthError {
+    status: StatusCode,
     code: &'static str,
     description: String,
 }
@@ -91,8 +92,22 @@ struct OAuthError {
 impl OAuthError {
     fn new(code: &'static str, description: impl Into<String>) -> Self {
         Self {
+            status: StatusCode::BAD_REQUEST,
             code,
             description: description.into(),
+        }
+    }
+
+    /// A store-layer (internal-class) failure behind a client/redirect-uri
+    /// lookup, not genuine client input (see `super::is_internal_class_error`):
+    /// a fixed, detail-free description, so no storage error ever reaches
+    /// this public route — mirrors `oauth.rs`'s own `internal_token_error`
+    /// and `register.rs`'s `internal_register_error`.
+    fn server_error() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "server_error",
+            description: "internal error".to_string(),
         }
     }
 }
@@ -106,11 +121,13 @@ impl OAuthError {
 /// T7: `client_id` recognition and `redirect_uri` validation now go through
 /// `AuthService::is_known_client`/`validate_client_redirect_uri`, which
 /// extend the built-in `localdb-cli` pure check with a store-backed lookup
-/// for `POST /register`-created clients (specs/05-surfaces.md §3.1). A store
-/// read failure is treated the same as "not found" here — surfaced as the
-/// same `unauthorized_client`/`invalid_request` the caller would see for an
-/// actually-unknown client, never as a distinct error shape that could leak
-/// which case occurred.
+/// for `POST /register`-created clients (specs/05-surfaces.md §3.1). An
+/// internal-class store failure (see `super::is_internal_class_error`) is a
+/// server fault, not client input, so it short-circuits to
+/// `OAuthError::server_error()` (500) rather than being folded into
+/// `unauthorized_client`/`invalid_request` (400) — the two must not be
+/// conflated, or a transient store error gets reported and retried as if the
+/// client itself were bad.
 async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
     auth: &localdb_core::auth::AuthService<S>,
     response_type: Option<&str>,
@@ -129,17 +146,17 @@ async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
     let client_id = client_id
         .filter(|s| !s.is_empty())
         .ok_or_else(|| OAuthError::new("invalid_request", "client_id is required"))?;
-    let known = auth.is_known_client(client_id).await.unwrap_or(false);
+    let known = known_or_server_error(auth.is_known_client(client_id).await)?;
     if !known {
         return Err(OAuthError::new("unauthorized_client", "unknown client_id"));
     }
     let redirect_uri = redirect_uri
         .filter(|s| !s.is_empty())
         .ok_or_else(|| OAuthError::new("invalid_request", "redirect_uri is required"))?;
-    let redirect_ok = auth
-        .validate_client_redirect_uri(client_id, redirect_uri)
-        .await
-        .unwrap_or(false);
+    let redirect_ok = known_or_server_error(
+        auth.validate_client_redirect_uri(client_id, redirect_uri)
+            .await,
+    )?;
     if !redirect_ok {
         return Err(OAuthError::new(
             "invalid_request",
@@ -167,6 +184,22 @@ async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
         state: state.unwrap_or_default().to_string(),
         code_challenge: code_challenge.to_string(),
     })
+}
+
+/// Shared by `validate_authorize_params`'s `is_known_client`/
+/// `validate_client_redirect_uri` checks: an internal-class store failure
+/// (see `super::is_internal_class_error`) is a server fault, so it becomes
+/// `OAuthError::server_error()` rather than being folded into "unknown
+/// client"/"bad redirect_uri" — a transient store error must never be
+/// reported (and retried) as if the client itself were bad. Any other `Err`
+/// (there is no other case today, but none is assumed unreachable) is
+/// treated as "not found", matching the check's own `Ok(false)` outcome.
+fn known_or_server_error(result: Result<bool, CoreError>) -> Result<bool, OAuthError> {
+    match result {
+        Ok(known) => Ok(known),
+        Err(e) if super::is_internal_class_error(&e) => Err(OAuthError::server_error()),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Escape a value for safe interpolation into the consent page HTML (XSS
@@ -225,24 +258,10 @@ fn render_consent_page(
         }
     };
 
-    Html(format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Authorize localdb</title>
-<style>
-body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; color: #1a1a1a; }}
-h1 {{ font-size: 1.25rem; }}
-label {{ display: block; margin-top: 16px; font-size: 0.9rem; }}
-input[type="text"], input[type="password"] {{ width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; font-size: 1rem; }}
-button {{ margin-top: 20px; padding: 8px 20px; font-size: 1rem; }}
-.error {{ color: #b00020; }}
-.hint {{ color: #666; font-size: 0.85rem; }}
-</style>
-</head>
-<body>
-<h1>Authorize &ldquo;{client_id}&rdquo;</h1>
+    super::page_shell(
+        "Authorize localdb",
+        &format!(
+            r#"<h1>Authorize &ldquo;{client_id}&rdquo;</h1>
 <p>This application is requesting access to your localdb data.</p>
 {error_html}
 <form method="post" action="">
@@ -254,10 +273,9 @@ button {{ margin-top: 20px; padding: 8px 20px; font-size: 1rem; }}
 <input type="hidden" name="code_challenge_method" value="S256">
 {credential_field}
 <button type="submit">Authorize</button>
-</form>
-</body>
-</html>"#
-    ))
+</form>"#
+        ),
+    )
 }
 
 /// The browser uses the same collection endpoint as CLI login, then resumes
@@ -291,7 +309,7 @@ fn render_request_submitted_page(
 
 fn oauth_error_page(err: OAuthError) -> Response {
     (
-        StatusCode::BAD_REQUEST,
+        err.status,
         Html(format!(
             "<!doctype html><html><body><h1>Authorization error</h1><p><code>{}</code>: {}</p></body></html>",
             escape_html(err.code),
@@ -466,18 +484,15 @@ async fn issue_code_and_continue(
 /// (escaped) for the operator to copy and paste back into the CLI's stdin
 /// prompt, since there is no listener to redirect to.
 fn render_oob_success_page(code: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>localdb login code</title>
-<style>body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; }}
-#authorization-code {{ font-size: 1.1rem; user-select: all; background: #f0f0f0; padding: 4px 8px; display: inline-block; margin-top: 8px; }}</style>
-</head><body>
-<h1>Authorization complete</h1>
+    super::page_shell(
+        "localdb login code",
+        &format!(
+            r#"<h1>Authorization complete</h1>
 <p>Copy this code and paste it back into the terminal running <kbd>localdb login --no-browser</kbd>:</p>
-<p><code id="authorization-code">{}</code></p>
-</body></html>"#,
-        escape_html(code)
-    ))
+<p><code id="authorization-code">{}</code></p>"#,
+            escape_html(code)
+        ),
+    )
 }
 
 /// Resolve a presented consent-form credential to a user id and its session
@@ -635,11 +650,11 @@ async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
             "code, redirect_uri, client_id, and code_verifier are all required",
         );
     };
-    let known = state
-        .auth()
-        .is_known_client(&client_id)
-        .await
-        .unwrap_or(false);
+    let known = match state.auth().is_known_client(&client_id).await {
+        Ok(known) => known,
+        Err(e) if super::is_internal_class_error(&e) => return internal_token_error(),
+        Err(_) => false,
+    };
     if !known {
         return token_error(
             StatusCode::UNAUTHORIZED,

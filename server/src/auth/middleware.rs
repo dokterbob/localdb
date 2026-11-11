@@ -49,16 +49,27 @@ use crate::{error::ApiError, state::AppState};
 
 use super::{base_url::resolve_base_url, AuthMode};
 
-/// OAuth and invite responses can contain credentials, codes, or poll secrets.
+/// OAuth and invite responses can contain credentials, codes, or poll
+/// secrets, and render attacker-controlled values (the consent page's
+/// `client_id`/`state`, the join form's invite token) into HTML — framing one
+/// of these pages in a hidden iframe would let a malicious page trick a
+/// signed-in user into submitting it (clickjacking), so every response also
+/// gets `Content-Security-Policy: frame-ancestors 'none'` and, for browsers
+/// that don't honor CSP's `frame-ancestors`, the equivalent legacy
+/// `X-Frame-Options: DENY`.
 pub async fn protect_auth_response(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
 }
 

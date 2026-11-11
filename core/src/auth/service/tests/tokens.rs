@@ -570,7 +570,10 @@ async fn is_known_client_recognizes_builtin_and_registered() {
 async fn register_client_rejects_empty_redirect_uris() {
     let svc = service();
     let err = svc.register_client(vec![], None).await.unwrap_err();
-    assert!(matches!(err, Error::InvalidRequest { .. }));
+    assert!(matches!(
+        err,
+        RegisterClientError::Validation(RegistrationError::EmptyRedirectUris)
+    ));
 }
 
 #[tokio::test]
@@ -580,7 +583,10 @@ async fn register_client_rejects_invalid_redirect_uri() {
         .register_client(vec!["http://evil.com/cb".to_string()], None)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::InvalidRequest { .. }));
+    assert!(matches!(
+        err,
+        RegisterClientError::Validation(RegistrationError::InvalidRedirectUri(_))
+    ));
 }
 
 #[tokio::test]

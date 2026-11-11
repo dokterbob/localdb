@@ -148,3 +148,88 @@ fn registration_rejects_oob_sentinel() {
     // registration redirect for a general public client.
     assert!(!validate_registration_redirect_uri(OOB_REDIRECT_URI));
 }
+
+// -----------------------------------------------------------------
+// `validate_registration_request`: the one DCR validator
+// `AuthService::register_client` enforces.
+// -----------------------------------------------------------------
+
+#[test]
+fn validate_registration_request_accepts_a_normal_request() {
+    assert_eq!(
+        validate_registration_request(
+            &["https://app.example.com/cb".to_string()],
+            Some("A Normal Client"),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_empty_redirect_uris() {
+    assert_eq!(
+        validate_registration_request(&[], None),
+        Err(RegistrationError::EmptyRedirectUris)
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_too_many_redirect_uris() {
+    let redirect_uris: Vec<String> = (0..MAX_REGISTRATION_REDIRECT_URIS + 1)
+        .map(|i| format!("https://app.example.com/cb{i}"))
+        .collect();
+    assert_eq!(
+        validate_registration_request(&redirect_uris, None),
+        Err(RegistrationError::TooManyOrOverlongRedirectUris)
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_an_overlong_redirect_uri() {
+    let long_uri = format!(
+        "https://app.example.com/{}",
+        "a".repeat(MAX_REGISTRATION_REDIRECT_URI_LEN)
+    );
+    assert_eq!(
+        validate_registration_request(&[long_uri], None),
+        Err(RegistrationError::TooManyOrOverlongRedirectUris)
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_an_overlong_client_name() {
+    let long_name = "a".repeat(MAX_REGISTRATION_CLIENT_NAME_LEN + 1);
+    assert_eq!(
+        validate_registration_request(
+            &["https://app.example.com/cb".to_string()],
+            Some(&long_name),
+        ),
+        Err(RegistrationError::ClientNameTooLong)
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_an_invalid_redirect_uri_shape() {
+    assert_eq!(
+        validate_registration_request(&["http://evil.example.com/cb".to_string()], None),
+        Err(RegistrationError::InvalidRedirectUri(
+            "http://evil.example.com/cb".to_string()
+        ))
+    );
+}
+
+#[test]
+fn validate_registration_request_checks_bounds_before_per_uri_validity() {
+    // A request that violates both the count cap and per-URI shape still
+    // reports the bounds violation — `register_client`'s own validator
+    // checks bounds before looping over shapes (mirrors the order the old
+    // handler-side checks used).
+    let mut redirect_uris: Vec<String> = (0..MAX_REGISTRATION_REDIRECT_URIS + 1)
+        .map(|i| format!("https://app.example.com/cb{i}"))
+        .collect();
+    redirect_uris.push("http://evil.example.com/cb".to_string());
+    assert_eq!(
+        validate_registration_request(&redirect_uris, None),
+        Err(RegistrationError::TooManyOrOverlongRedirectUris)
+    );
+}

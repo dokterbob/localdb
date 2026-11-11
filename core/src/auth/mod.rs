@@ -19,13 +19,15 @@ mod token;
 pub use client::{
     is_known_client, registration_client_name_within_bounds,
     registration_redirect_uris_within_bounds, validate_redirect_uri,
-    validate_registration_redirect_uri, LOCALDB_CLI_CLIENT_ID, MAX_REGISTRATION_CLIENT_NAME_LEN,
-    MAX_REGISTRATION_REDIRECT_URIS, MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI,
-    SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
+    validate_registration_redirect_uri, validate_registration_request, RegistrationError,
+    LOCALDB_CLI_CLIENT_ID, MAX_REGISTRATION_CLIENT_NAME_LEN, MAX_REGISTRATION_REDIRECT_URIS,
+    MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI, SUPPORTED_GRANT_TYPES,
+    SUPPORTED_RESPONSE_TYPES,
 };
 pub use principal::{Principal, Role, SessionOrigin, StoreAccess};
 pub use service::{
     AuthService, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome, RedeemOutcome,
+    RegisterClientError,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeAuthStore;

@@ -12,7 +12,7 @@ use localdb_core::{
     DocumentInfo, Error, RetrievalStore, SourceRow, StoreBackend, StoreRow, TableSize,
 };
 
-use super::common::{build_router, json_body, make_app};
+use super::common::{build_router, json_body, make_app, make_state_with_auth_mode};
 use crate::state::AppState;
 
 #[tokio::test]
@@ -403,6 +403,74 @@ async fn get_status_scoped_by_healthy_ignores_malformed_policy_on_other_store() 
         "only the scoped store must be reported: {body}"
     );
     assert_eq!(stores[0]["name"], "healthy");
+}
+
+// ---------------------------------------------------------------------------
+// `IndexJob.store_id` actually holds the store *name* (`JobQueue::submit` is
+// always called with `&store_row.name`), so a member's job count must
+// compare against the scoped store's `name`, not its `id`, or it is always
+// zero regardless of how many jobs are running on a store the member can
+// read.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn get_status_member_job_count_counts_jobs_on_granted_stores() {
+    use localdb_core::auth::Role;
+    use localdb_core::types::StoreVisibility;
+
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+    state.add_store("granted", "shared").await.unwrap();
+
+    let admin = state
+        .auth()
+        .create_user("admin1", Role::Admin)
+        .await
+        .unwrap();
+    let admin_key = state.auth().issue_api_key(&admin.id).await.unwrap().secret;
+    let member = state
+        .auth()
+        .create_user("member1", Role::Member)
+        .await
+        .unwrap();
+    let member_key = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+    state
+        .auth()
+        .grant_store("granted", StoreVisibility::Shared, &member.id, &admin.id)
+        .await
+        .unwrap();
+
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jobs")
+                .header("authorization", format!("Bearer {admin_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"store_name": "granted"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .header("authorization", format!("Bearer {member_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(
+        body["job_count"], 1,
+        "member must see the job submitted on their granted store: {body}"
+    );
 }
 
 #[tokio::test]

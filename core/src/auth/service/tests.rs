@@ -1,5 +1,5 @@
 use super::*;
-use crate::auth::client::LOCALDB_CLI_CLIENT_ID;
+use crate::auth::client::{RegistrationError, LOCALDB_CLI_CLIENT_ID};
 use crate::auth::store::FakeAuthStore;
 use crate::auth::token::TOKEN_PREFIX;
 

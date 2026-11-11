@@ -10,6 +10,15 @@ fn fake_auth() -> AuthService<FakeAuthStore> {
     AuthService::new(Arc::new(FakeAuthStore::new()))
 }
 
+/// Like [`fake_auth`], but also hands back the underlying `FakeAuthStore` so
+/// a test can poison it (e.g. `poison_next_find_oauth_client`) — `AuthService`
+/// itself keeps no accessor to its store, so the test must retain its own
+/// `Arc` clone from before the service is built.
+fn fake_auth_with_store() -> (AuthService<FakeAuthStore>, Arc<FakeAuthStore>) {
+    let store = Arc::new(FakeAuthStore::new());
+    (AuthService::new(store.clone()), store)
+}
+
 // -----------------------------------------------------------------
 // Finding #5: internal-class token-issuance/rotation failures must map
 // to 500, not 400 `server_error`/`invalid_grant`. `AuthService`'s
@@ -162,6 +171,81 @@ async fn auth_code_grant_failure_keeps_genuine_bad_code_at_400_invalid_grant() {
     );
 }
 
+// -----------------------------------------------------------------
+// Infrastructure errors reported as bad clients: an internal-class store
+// failure behind `is_known_client`/`validate_client_redirect_uri` must
+// become a generic `server_error`, never `unauthorized_client`/
+// `invalid_request` (which would tell a client to stop retrying a merely
+// transient fault, or an attacker that their guessed client_id is "merely
+// unknown" rather than that the server tripped over itself).
+// -----------------------------------------------------------------
+
+#[test]
+fn known_or_server_error_passes_through_ok_values() {
+    assert!(known_or_server_error(Ok(true)).unwrap());
+    assert!(!known_or_server_error(Ok(false)).unwrap());
+}
+
+#[test]
+fn known_or_server_error_treats_internal_class_errors_as_server_error() {
+    let err = known_or_server_error(Err(CoreError::Internal {
+        message: "raw sql error: database is locked".into(),
+        correlation_id: "corr-2".into(),
+    }))
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.code, "server_error");
+    assert_eq!(err.description, "internal error");
+}
+
+#[test]
+fn known_or_server_error_treats_client_errors_as_unknown() {
+    assert!(!known_or_server_error(Err(CoreError::StoreNotFound { id: "x".into() })).unwrap());
+}
+
+/// End-to-end through `validate_authorize_params`: a real store failure
+/// behind `is_known_client` (simulated via `FakeAuthStore::
+/// poison_next_find_oauth_client`) must surface as `server_error`/500, not
+/// `unauthorized_client`/400.
+#[tokio::test]
+async fn validate_authorize_params_maps_is_known_client_store_error_to_server_error() {
+    let (auth, store) = fake_auth_with_store();
+    store.poison_next_find_oauth_client().await;
+    let err = validate_authorize_params(
+        &auth,
+        Some("code"),
+        Some("some-registered-client-id"),
+        Some("http://127.0.0.1:1/callback"),
+        None,
+        Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+        Some("S256"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.code, "server_error");
+}
+
+/// `oauth_error_page` must actually render the error's own status, not a
+/// hardcoded 400 — regression guard for `server_error`'s 500.
+#[test]
+fn oauth_error_page_uses_the_error_s_own_status() {
+    let resp = oauth_error_page(OAuthError::server_error());
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Mirrors `register.rs`'s `internal_register_error_is_a_generic_500_with_no_leaked_detail`:
+/// `/token`'s own generic-error body for an internal-class `is_known_client`
+/// failure (`handle_auth_code_grant`) carries no storage detail.
+#[tokio::test]
+async fn internal_token_error_is_a_generic_500_with_no_leaked_detail() {
+    let resp = internal_token_error();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response_body_json(resp).await;
+    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error_description"], "internal error");
+}
+
 #[test]
 fn escape_html_neutralizes_script_tags() {
     let escaped = escape_html("<script>alert(1)</script>");
@@ -298,6 +382,31 @@ async fn validate_authorize_params_rejects_registered_client_mismatched_redirect
     .await
     .unwrap_err();
     assert_eq!(err.code, "invalid_request");
+}
+
+/// The shared page shell (see `server::auth::page_shell`) must carry a
+/// viewport meta tag so the consent page (and the OOB success page, which
+/// shares it) render usably on a phone screen.
+#[test]
+fn consent_page_has_a_viewport_meta_tag() {
+    let params = ValidParams {
+        client_id: "localdb-cli".to_string(),
+        redirect_uri: "http://127.0.0.1:1/cb".to_string(),
+        state: "xyz".to_string(),
+        code_challenge: "c".to_string(),
+    };
+    let html = render_consent_page(&params, "", None, None).0;
+    assert!(
+        html.contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#)
+    );
+}
+
+#[test]
+fn oob_success_page_has_a_viewport_meta_tag() {
+    let html = render_oob_success_page("abc123").0;
+    assert!(
+        html.contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#)
+    );
 }
 
 #[test]

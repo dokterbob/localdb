@@ -12,9 +12,53 @@ pub mod middleware;
 pub mod oauth;
 pub mod register;
 
+use axum::response::Html;
+
 use localdb_core::{auth::mint_secret, Error};
 
 use crate::state::AppState;
+
+/// Shared inline CSS for every rendered auth-flow HTML page: the OAuth
+/// consent page, its OOB (`--no-browser`) success page, and the standalone
+/// `/join` page (plus their waiting/joined variants) — one page style so the
+/// small set of elements they use (forms, buttons, inline `<code>` secrets,
+/// store lists) looks consistent regardless of which page renders them.
+const PAGE_STYLE: &str = r#"
+body { font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; color: #1a1a1a; }
+h1 { font-size: 1.25rem; }
+label { display: block; margin-top: 16px; font-size: 0.9rem; }
+input[type="text"], input[type="password"] { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; font-size: 1rem; }
+button { margin-top: 20px; padding: 8px 20px; font-size: 1rem; }
+.error { color: #b00020; }
+.hint { color: #666; font-size: 0.85rem; }
+ul { padding-left: 20px; }
+code, #authorization-code { font-size: 1.05rem; user-select: all; background: #f0f0f0; padding: 4px 8px; display: inline-block; margin-top: 8px; word-break: break-all; }
+"#;
+
+/// Wrap `body` in the shared minimal (dependency-free, inline-CSS) HTML
+/// document every auth-flow page uses — see [`PAGE_STYLE`]. The emitted
+/// `<body>` tag carries no attributes, so a caller that needs its own (the
+/// waiting pages' `data-*` attributes) can add them with a string replace,
+/// the technique `oauth::render_request_submitted_page` and
+/// `join::render_join_wait_page` both use.
+pub(crate) fn page_shell(title: &str, body: &str) -> Html<String> {
+    Html(format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+{PAGE_STYLE}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"#
+    ))
+}
 
 /// Whether `err` is an internal/server-side fault — a bug, a write-lock or
 /// store failure, an unreachable or misconfigured dependency — rather than

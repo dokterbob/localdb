@@ -26,6 +26,11 @@ struct FakeAuthStoreInner {
     /// simulates a transient store failure partway through a multi-step
     /// mint (T6 finding #6/#7 regression tests).
     poison_next_insert_token: bool,
+    /// Test-only hook (see `FakeAuthStore::poison_next_find_oauth_client`):
+    /// when `true`, the *next* `find_oauth_client` call fails instead of
+    /// looking up the row — simulates a transient store failure behind
+    /// `AuthService::is_known_client`/`validate_client_redirect_uri`.
+    poison_next_find_oauth_client: bool,
     /// Every family ever recorded as compromised by `revoke_compromised_family`
     /// (mirrors the real store's `auth_compromised_families` table): a token
     /// insert naming one of these as `minted_by_family` is refused, even
@@ -87,6 +92,16 @@ impl FakeAuthStore {
     /// error without having minted anything.
     pub async fn poison_next_insert_token(&self) {
         self.inner.write().await.poison_next_insert_token = true;
+    }
+
+    /// Deterministically simulate a transient store failure behind a
+    /// client-id/redirect-uri lookup: the *next* `find_oauth_client` call
+    /// returns `Error::Internal` instead of a row, so
+    /// `AuthService::is_known_client`/`validate_client_redirect_uri` (and the
+    /// `/authorize`/`/token` handlers built on them) see a genuine store
+    /// error rather than "not found".
+    pub async fn poison_next_find_oauth_client(&self) {
+        self.inner.write().await.poison_next_find_oauth_client = true;
     }
 
     pub fn new() -> Self {
@@ -534,14 +549,15 @@ impl AuthStore for FakeAuthStore {
     }
 
     async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error> {
-        Ok(self
-            .inner
-            .read()
-            .await
-            .oauth_clients
-            .iter()
-            .find(|c| c.id == id)
-            .cloned())
+        let mut inner = self.inner.write().await;
+        if inner.poison_next_find_oauth_client {
+            inner.poison_next_find_oauth_client = false;
+            return Err(Error::Internal {
+                message: "poisoned find_oauth_client: simulated store failure".to_string(),
+                correlation_id: "fake_auth_store_poison_find_oauth_client".to_string(),
+            });
+        }
+        Ok(inner.oauth_clients.iter().find(|c| c.id == id).cloned())
     }
 
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {

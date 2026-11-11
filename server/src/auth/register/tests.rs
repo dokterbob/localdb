@@ -47,6 +47,30 @@ fn unsupported_entry_flags_a_disallowed_response_type() {
 }
 
 // -----------------------------------------------------------------
+// `registration_error_code`: the one place this handler maps a
+// `RegistrationError` onto its RFC 7591 §3.2.2 code.
+// -----------------------------------------------------------------
+
+#[test]
+fn registration_error_code_maps_invalid_redirect_uri() {
+    assert_eq!(
+        registration_error_code(&RegistrationError::InvalidRedirectUri("x".to_string())),
+        "invalid_redirect_uri"
+    );
+}
+
+#[test]
+fn registration_error_code_maps_every_other_violation_to_invalid_client_metadata() {
+    for err in [
+        RegistrationError::EmptyRedirectUris,
+        RegistrationError::TooManyOrOverlongRedirectUris,
+        RegistrationError::ClientNameTooLong,
+    ] {
+        assert_eq!(registration_error_code(&err), "invalid_client_metadata");
+    }
+}
+
+// -----------------------------------------------------------------
 // Finding #4: a store-layer (internal-class) `register_client` failure
 // must become a generic, detail-free 500 (`internal_register_error`),
 // never a `400 invalid_client_metadata` echoing `e.to_string()`.

@@ -51,26 +51,9 @@ pub async fn get_document(
     let principal = require_principal(principal)?;
     let names = readable_store_names(&state, &principal, &query.store).await?;
     let detail = if names.is_empty() {
-        Err(localdb_core::Error::ResourceNotFound { id: doc_id.clone() })
+        return Err(localdb_core::Error::ResourceNotFound { id: doc_id }.into());
     } else {
-        state.get_document(&doc_id, &names).await
-    };
-    let detail = match detail {
-        Err(localdb_core::Error::ResourceNotFound { .. }) if query.store.is_empty() => {
-            for store in state.backend().list_stores().await? {
-                if !principal.can_read_store(&store.name, store.visibility.clone())
-                    && state
-                        .backend()
-                        .find_document(&doc_id, Some(&store.id))
-                        .await?
-                        .is_some()
-                {
-                    principal.require_read_store(&store.name, store.visibility)?;
-                }
-            }
-            return Err(localdb_core::Error::ResourceNotFound { id: doc_id }.into());
-        }
-        result => result?,
+        state.get_document(&doc_id, &names).await?
     };
     let info = detail.info;
     Ok(Json(DocumentRecord {

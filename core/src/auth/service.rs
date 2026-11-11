@@ -67,6 +67,37 @@ pub struct IssuedAuthCode {
 }
 redact_secret_in_debug!(IssuedAuthCode);
 
+/// `AuthService::register_client`'s error type: either the request itself
+/// fails this server's DCR policy ([`client::RegistrationError`], pure, no
+/// I/O involved), or persisting a validated request hits a store-layer
+/// failure. Kept distinct from the shared [`Error`] taxonomy so a caller
+/// (`server::auth::register::post_register`) can match on
+/// [`Self::Validation`]'s own variant to choose between RFC 7591 §3.2.2's
+/// `invalid_redirect_uri`/`invalid_client_metadata` codes, rather than
+/// string-matching an `Error::InvalidRequest` message.
+#[derive(Debug)]
+pub enum RegisterClientError {
+    /// The request failed [`client::validate_registration_request`].
+    Validation(client::RegistrationError),
+    /// A store-layer failure persisting the validated client.
+    Store(Error),
+}
+
+impl From<Error> for RegisterClientError {
+    fn from(err: Error) -> Self {
+        RegisterClientError::Store(err)
+    }
+}
+
+impl std::fmt::Display for RegisterClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(e) => write!(f, "{e}"),
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// The auth policy layer. Generic over `AuthStore` so callers (server, cli)
 /// can plug in the libsql-backed implementation; core tests use
 /// `FakeAuthStore`.
@@ -562,26 +593,19 @@ impl<S: AuthStore> AuthService<S> {
     /// custom-scheme rejection rationale) and an optional display
     /// `client_name`. Mints a ULID `client_id`; there is no client secret
     /// (public clients only, mirroring `localdb-cli`'s own policy).
+    ///
+    /// Enforces [`client::validate_registration_request`] — the one DCR
+    /// validator — before persisting anything; `server::auth::register::
+    /// post_register` performs no validation of its own, only mapping each
+    /// [`client::RegistrationError`] variant onto its RFC 7591 §3.2.2 error
+    /// code.
     pub async fn register_client(
         &self,
         redirect_uris: Vec<String>,
         client_name: Option<String>,
-    ) -> Result<OAuthClientRow, Error> {
-        if redirect_uris.is_empty() {
-            return Err(Error::InvalidRequest {
-                message: "redirect_uris is required and must not be empty".to_string(),
-            });
-        }
-        for uri in &redirect_uris {
-            if !client::validate_registration_redirect_uri(uri) {
-                return Err(Error::InvalidRequest {
-                    message: format!(
-                        "redirect_uri '{uri}' is not allowed: must be an https:// URL or a \
-                         loopback http://127.0.0.1[:port]/... or http://localhost[:port]/... URL"
-                    ),
-                });
-            }
-        }
+    ) -> Result<OAuthClientRow, RegisterClientError> {
+        client::validate_registration_request(&redirect_uris, client_name.as_deref())
+            .map_err(RegisterClientError::Validation)?;
         let row = OAuthClientRow {
             id: new_ulid(),
             client_name,

@@ -654,8 +654,12 @@ async fn get_document_unknown_store_name_in_query_returns_404() {
     assert_eq!(body["code"], "store_not_found");
 }
 
+/// A miss on an unscoped lookup (no `?store=`) must be a plain 404 even when
+/// the document exists in a store the caller cannot read — scanning every
+/// store to decide between 404 and 403 would turn the miss into an oracle
+/// that confirms the document (and the private store's name) exist.
 #[tokio::test]
-async fn get_document_without_store_grant_returns_403() {
+async fn get_document_without_store_grant_and_no_store_param_returns_404_not_403() {
     let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
 
     seed_chunk_in_store(
@@ -689,6 +693,64 @@ async fn get_document_without_store_grant_returns_403() {
         .oneshot(
             Request::builder()
                 .uri("/v1/documents/doc-secret-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "resource_not_found");
+    let body_text = body.to_string();
+    assert!(
+        !body_text.contains("store-shared"),
+        "a 404 on an unscoped miss must not name the private store: {body_text}"
+    );
+}
+
+/// The explicit-store counterpart: naming an unreadable store with `?store=`
+/// still gets 403 — only the scan on an *unscoped* miss was the leak.
+#[tokio::test]
+async fn get_document_explicit_unreadable_store_still_returns_403() {
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        SeedChunkInput {
+            chunk_id: "chunk-secret-2",
+            doc_id: "doc-secret-2",
+            text: "confidential contents the ungranted member must never see",
+            uri: "file:///secret2.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let bearer = seed_user_with_key(
+        &state,
+        "member-no-grant-2",
+        localdb_core::auth::Role::Member,
+    )
+    .await;
+
+    state
+        .update_store("store-shared", Some("shared"))
+        .await
+        .unwrap();
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-secret-2?store=store-shared")
                 .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),

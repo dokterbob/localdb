@@ -84,3 +84,14 @@ fn join_wait_page_escapes_hostile_request_id() {
     let html = render_join_wait_page("\"><script>alert(1)</script>", "sekret").0;
     assert!(!html.contains("<script>alert(1)</script>"));
 }
+
+/// The shared page shell (see `server::auth::page_shell`) must carry a
+/// viewport meta tag so these pages render usably on a phone screen —
+/// `/join` is frequently opened from an invite link on a mobile device.
+#[test]
+fn join_form_has_a_viewport_meta_tag() {
+    let html = render_join_form("tok", None).0;
+    assert!(
+        html.contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#)
+    );
+}

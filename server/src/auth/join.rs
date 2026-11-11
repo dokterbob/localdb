@@ -18,6 +18,7 @@ use serde::Deserialize;
 use localdb_core::auth::RedeemOutcome;
 
 use super::oauth::escape_html;
+use super::page_shell;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -29,41 +30,6 @@ pub struct JoinQuery {
 pub struct JoinForm {
     pub invite: Option<String>,
     pub requested_name: Option<String>,
-}
-
-const PAGE_STYLE: &str = r#"
-body { font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; color: #1a1a1a; }
-h1 { font-size: 1.25rem; }
-label { display: block; margin-top: 16px; font-size: 0.9rem; }
-input[type="text"] { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; font-size: 1rem; }
-button { margin-top: 20px; padding: 8px 20px; font-size: 1rem; }
-.error { color: #b00020; }
-.hint { color: #666; font-size: 0.85rem; }
-ul { padding-left: 20px; }
-code { font-size: 1.05rem; user-select: all; background: #f0f0f0; padding: 4px 8px; display: inline-block; margin-top: 8px; word-break: break-all; }
-"#;
-
-/// Wraps `body` in a minimal, dependency-free (inline CSS only) HTML
-/// document. The emitted `<body>` tag carries no attributes, so a caller that
-/// needs to add its own (the waiting page's `data-*` attributes) can do so
-/// with a string replace, the same technique
-/// `oauth::render_request_submitted_page` uses on the consent page.
-fn page_shell(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>
-{PAGE_STYLE}
-</style>
-</head>
-<body>
-{body}
-</body>
-</html>"#
-    ))
 }
 
 fn missing_invite_error() -> Response {

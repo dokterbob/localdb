@@ -136,6 +136,85 @@ pub fn registration_client_name_within_bounds(client_name: Option<&str>) -> bool
         .unwrap_or(true)
 }
 
+/// A `POST /register` request that fails this server's DCR validation policy
+/// — the single typed outcome [`validate_registration_request`] returns,
+/// enforced by `AuthService::register_client`. `server::auth::register::
+/// post_register` performs no validation of its own: it only maps each
+/// variant onto its RFC 7591 §3.2.2 error code (`invalid_redirect_uri` for
+/// [`Self::InvalidRedirectUri`], `invalid_client_metadata` for everything
+/// else).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationError {
+    /// `redirect_uris` was empty.
+    EmptyRedirectUris,
+    /// `redirect_uris` has more than [`MAX_REGISTRATION_REDIRECT_URIS`]
+    /// entries, or one entry exceeds [`MAX_REGISTRATION_REDIRECT_URI_LEN`]
+    /// characters.
+    TooManyOrOverlongRedirectUris,
+    /// `client_name` exceeds [`MAX_REGISTRATION_CLIENT_NAME_LEN`] characters.
+    ClientNameTooLong,
+    /// A `redirect_uris` entry is not an allowed shape — see
+    /// [`validate_registration_redirect_uri`]'s doc comment for which shapes
+    /// are allowed and why.
+    InvalidRedirectUri(String),
+}
+
+impl std::fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyRedirectUris => {
+                write!(f, "redirect_uris is required and must not be empty")
+            }
+            Self::TooManyOrOverlongRedirectUris => write!(
+                f,
+                "redirect_uris must contain at most {MAX_REGISTRATION_REDIRECT_URIS} entries, \
+                 each at most {MAX_REGISTRATION_REDIRECT_URI_LEN} characters"
+            ),
+            Self::ClientNameTooLong => write!(
+                f,
+                "client_name must be at most {MAX_REGISTRATION_CLIENT_NAME_LEN} characters"
+            ),
+            Self::InvalidRedirectUri(uri) => write!(
+                f,
+                "redirect_uri '{uri}' is not allowed: must be an https:// URL or a loopback \
+                 http://127.0.0.1[:port]/... or http://localhost[:port]/... URL"
+            ),
+        }
+    }
+}
+
+/// Validate a `POST /register` request against this server's DCR policy
+/// (RFC 7591): non-empty `redirect_uris`, within the count/length caps
+/// ([`registration_redirect_uris_within_bounds`]), each entry an allowed
+/// shape ([`validate_registration_redirect_uri`]), and `client_name` (if
+/// present) within its length cap
+/// ([`registration_client_name_within_bounds`]). The single validator
+/// `AuthService::register_client` enforces, replacing the two partial,
+/// independently-drifting copies that used to live in `register_client`
+/// (emptiness and per-URI validity only) and `server::auth::register::
+/// post_register` (the same two plus the bounds `register_client` never
+/// checked).
+pub fn validate_registration_request(
+    redirect_uris: &[String],
+    client_name: Option<&str>,
+) -> Result<(), RegistrationError> {
+    if redirect_uris.is_empty() {
+        return Err(RegistrationError::EmptyRedirectUris);
+    }
+    if !registration_redirect_uris_within_bounds(redirect_uris) {
+        return Err(RegistrationError::TooManyOrOverlongRedirectUris);
+    }
+    if !registration_client_name_within_bounds(client_name) {
+        return Err(RegistrationError::ClientNameTooLong);
+    }
+    for uri in redirect_uris {
+        if !validate_registration_redirect_uri(uri) {
+            return Err(RegistrationError::InvalidRedirectUri(uri.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// `http://127.0.0.1:<port>/<anything>` or `http://localhost:<port>/<anything>`,
 /// port required and numeric, path optional.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {

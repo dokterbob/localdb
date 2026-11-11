@@ -180,8 +180,13 @@ pub async fn get_status(
         job_count: if principal.role == Role::Admin {
             jobs.len()
         } else {
+            // `IndexJob.store_id` actually holds the store *name* —
+            // `JobQueue::submit` is always called with `&store_row.name`
+            // (`handlers::jobs::create_job`, `scheduler::UrlRefreshScheduler::tick`)
+            // — so a member's job count must compare against `s.name`, not
+            // `s.id`, or it is always zero.
             jobs.iter()
-                .filter(|j| scoped_stores.iter().any(|s| s.id == j.store_id))
+                .filter(|j| scoped_stores.iter().any(|s| s.name == j.store_id))
                 .count()
         },
         stores,

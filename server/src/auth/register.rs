@@ -1,12 +1,15 @@
 //! `POST /register` — OAuth2 Dynamic Client Registration (RFC 7591, T7,
 //! specs/05-surfaces.md §3.1).
 //!
-//! HTTP shape only (specs/01-architecture.md §1): validation and persistence
-//! policy live in `localdb_core::auth::AuthService::register_client`
-//! (redirect_uri policy: `core::auth::validate_registration_redirect_uri`).
-//! This module parses/renders JSON and maps `core::Error` onto the shared
-//! error taxonomy. Public client registration only — no `client_secret` is
-//! ever minted (mirrors the built-in `localdb-cli` client's own policy);
+//! HTTP shape only (specs/01-architecture.md §1): the one DCR validator
+//! (`redirect_uris`/`client_name` bounds and shape) lives in
+//! `core::auth::validate_registration_request`, enforced by
+//! `AuthService::register_client`. This module only parses/renders JSON,
+//! checks the two fields `register_client` doesn't validate
+//! (`token_endpoint_auth_method`, `grant_types`/`response_types`), and maps
+//! `RegisterClientError` onto the matching RFC 7591 §3.2.2 error code.
+//! Public client registration only — no `client_secret` is ever minted
+//! (mirrors the built-in `localdb-cli` client's own policy);
 //! `token_endpoint_auth_method` is always `"none"` in the response and, if
 //! the caller sends a different value, the request is rejected.
 //!
@@ -23,10 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use localdb_core::auth::{
-    registration_client_name_within_bounds, registration_redirect_uris_within_bounds,
-    validate_registration_redirect_uri, MAX_REGISTRATION_CLIENT_NAME_LEN,
-    MAX_REGISTRATION_REDIRECT_URIS, MAX_REGISTRATION_REDIRECT_URI_LEN, SUPPORTED_GRANT_TYPES,
-    SUPPORTED_RESPONSE_TYPES,
+    RegisterClientError, RegistrationError, SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
 };
 
 use crate::state::AppState;
@@ -128,26 +128,34 @@ fn unsupported_entry<'a>(requested: &'a [String], supported: &[&str]) -> Option<
         .map(|s| s.as_str())
 }
 
+/// RFC 7591 §3.2.2 error code for a [`RegistrationError`] — `invalid_redirect_uri`
+/// for a bad `redirect_uris` entry, `invalid_client_metadata` for every other
+/// violation (emptiness, bounds, client_name length).
+fn registration_error_code(err: &RegistrationError) -> &'static str {
+    match err {
+        RegistrationError::InvalidRedirectUri(_) => "invalid_redirect_uri",
+        RegistrationError::EmptyRedirectUris
+        | RegistrationError::TooManyOrOverlongRedirectUris
+        | RegistrationError::ClientNameTooLong => "invalid_client_metadata",
+    }
+}
+
 /// `POST /register` (public, RFC 7591): register a new public OAuth2 client.
 ///
-/// Validates every `redirect_uris` entry (exact `https://` or loopback
-/// `http://127.0.0.1[:port]/...` / `http://localhost[:port]/...` — see
-/// `core::auth::validate_registration_redirect_uri`'s doc comment for why
-/// custom URI schemes are rejected), rejects an explicit
-/// `token_endpoint_auth_method` other than `"none"` (this server only ever
-/// registers public clients — there is nowhere to store or verify a
-/// `client_secret`), enforces the DCR size bounds below (finding #8), and
-/// persists the result via `AuthService::register_client`. Every rejection
-/// is RFC 7591 §3.2.2-shaped (finding #10, `register_error`) rather than the
-/// shared `{"code":...,"message":...}` `ApiError` envelope used elsewhere.
-///
-/// **DCR bounds (finding #8):** this route is public and unauthenticated, so
-/// a single request must not be able to grow `oauth_clients` metadata
-/// without limit. At most [`MAX_REGISTRATION_REDIRECT_URIS`] `redirect_uris`
-/// entries, each at most [`MAX_REGISTRATION_REDIRECT_URI_LEN`] characters;
-/// `client_name`, if present, at most [`MAX_REGISTRATION_CLIENT_NAME_LEN`]
-/// characters. These are per-request size caps, not a rate limiter — see the
-/// `TODO` below.
+/// Rejects an explicit `token_endpoint_auth_method` other than `"none"`
+/// (this server only ever registers public clients — there is nowhere to
+/// store or verify a `client_secret`) and an unsupported `grant_types`/
+/// `response_types` entry (checked here, against
+/// `SUPPORTED_GRANT_TYPES`/`SUPPORTED_RESPONSE_TYPES`, since neither is
+/// persisted or known to `AuthService::register_client`). Every other
+/// check — `redirect_uris` non-empty and within the DCR size bounds, each
+/// entry an allowed shape, `client_name` within its length bound — is
+/// `AuthService::register_client`'s own `validate_registration_request`;
+/// this handler only maps its [`RegistrationError`] onto the matching RFC
+/// 7591 §3.2.2 code (`registration_error_code`) rather than re-validating.
+/// Every rejection is RFC 7591 §3.2.2-shaped (`register_error`) rather than
+/// the shared `{"code":...,"message":...}` `ApiError` envelope used
+/// elsewhere.
 pub async fn post_register(
     State(state): State<AppState>,
     Json(req): Json<RegisterClientRequest>,
@@ -163,52 +171,14 @@ pub async fn post_register(
             );
         }
     }
-    if req.redirect_uris.is_empty() {
-        return register_error(
-            "invalid_client_metadata",
-            "redirect_uris is required and must not be empty",
-        );
-    }
 
-    // TODO(#8 follow-up): these are per-request payload-size caps, not a
-    // rate limiter — a global registration-count cap / throttle on POST
-    // /register (this route is public/unauthenticated) is a separate,
-    // out-of-scope concern. Track it if T7's DCR endpoint sees abuse.
-    if !registration_redirect_uris_within_bounds(&req.redirect_uris) {
-        return register_error(
-            "invalid_client_metadata",
-            format!(
-                "redirect_uris must contain at most {MAX_REGISTRATION_REDIRECT_URIS} entries, \
-                 each at most {MAX_REGISTRATION_REDIRECT_URI_LEN} characters"
-            ),
-        );
-    }
-    if !registration_client_name_within_bounds(req.client_name.as_deref()) {
-        return register_error(
-            "invalid_client_metadata",
-            format!("client_name must be at most {MAX_REGISTRATION_CLIENT_NAME_LEN} characters"),
-        );
-    }
-
-    for uri in &req.redirect_uris {
-        if !validate_registration_redirect_uri(uri) {
-            return register_error(
-                "invalid_redirect_uri",
-                format!(
-                    "redirect_uri '{uri}' is not allowed: must be an https:// URL or a loopback \
-                     http://127.0.0.1[:port]/... or http://localhost[:port]/... URL"
-                ),
-            );
-        }
-    }
-
-    // Finding #3: a registrant asking for a `grant_types`/`response_types`
-    // entry this AS doesn't actually support (e.g. `client_credentials`,
-    // `token`) must be rejected rather than echoed back in the `201` — that
-    // response is otherwise the only place a client learns which flows are
-    // supported, and an unsupported entry there is a lie `/token`/`/authorize`
-    // can't back up. `SUPPORTED_GRANT_TYPES`/`SUPPORTED_RESPONSE_TYPES` are
-    // the same lists `discovery::oauth_authorization_server` advertises as
+    // A registrant asking for a `grant_types`/`response_types` entry this AS
+    // doesn't actually support (e.g. `client_credentials`, `token`) must be
+    // rejected rather than echoed back in the `201` — that response is
+    // otherwise the only place a client learns which flows are supported,
+    // and an unsupported entry there is a lie `/token`/`/authorize` can't
+    // back up. `SUPPORTED_GRANT_TYPES`/`SUPPORTED_RESPONSE_TYPES` are the
+    // same lists `discovery::oauth_authorization_server` advertises as
     // `grant_types_supported`/`response_types_supported` (single source of
     // truth in `core::auth::client`). Absent fields keep the current
     // defaults, applied below.
@@ -235,25 +205,32 @@ pub async fn post_register(
         }
     }
 
+    // TODO(#8 follow-up): `AuthService::register_client`'s bounds are
+    // per-request payload-size caps, not a rate limiter — a global
+    // registration-count cap / throttle on POST /register (this route is
+    // public/unauthenticated) is a separate, out-of-scope concern. Track it
+    // if T7's DCR endpoint sees abuse.
     let row = match state
         .auth()
         .register_client(req.redirect_uris, req.client_name)
         .await
     {
         Ok(row) => row,
-        // Finding #4: every check above mirrors `AuthService::register_client`'s
-        // own pure, stateless validation, so reaching here with a client-input
-        // -shaped error is vanishingly unlikely (at most a race). What's
-        // actually likely is a store-layer failure (write-lock contention, a
-        // dead connection) — an internal-class fault (`is_internal_class_error`,
-        // shared with `oauth.rs`'s token endpoint) must not be misreported as
-        // `400 invalid_client_metadata` with the raw storage error echoed back
+        Err(RegisterClientError::Validation(e)) => {
+            return register_error(registration_error_code(&e), e.to_string())
+        }
+        // A store-layer failure (write-lock contention, a dead connection) —
+        // an internal-class fault (`is_internal_class_error`, shared with
+        // `oauth.rs`'s token endpoint) must not be misreported as `400
+        // invalid_client_metadata` with the raw storage error echoed back
         // via `e.to_string()`; it becomes a generic, detail-free `500`
-        // instead. A genuine (non-internal) failure keeps the prior behavior:
-        // 400 invalid_client_metadata with its message, which carries no
-        // sensitive detail since it can only come from the validators above.
-        Err(e) if crate::auth::is_internal_class_error(&e) => return internal_register_error(),
-        Err(e) => return register_error("invalid_client_metadata", e.to_string()),
+        // instead.
+        Err(RegisterClientError::Store(e)) if crate::auth::is_internal_class_error(&e) => {
+            return internal_register_error()
+        }
+        Err(RegisterClientError::Store(e)) => {
+            return register_error("invalid_client_metadata", e.to_string())
+        }
     };
 
     let grant_types = req.grant_types.unwrap_or_else(default_grant_types);
