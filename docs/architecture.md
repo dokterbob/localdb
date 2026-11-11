@@ -99,10 +99,11 @@ to the HTTP API (thin-client mode) or opens the store in-process (embedded mode)
 ### `server`
 
 The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon unix socket for
-discovery, runs the file-watcher (`notify`), the URL refresh scheduler, and the background job
-queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is
-visible. Multi-process is the first-class concurrency model — the daemon is one writer among peers
-(CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
+discovery, runs the URL refresh scheduler and the background job queue. Watching source directories
+for changes is not implemented — sources refresh via `localdb index` or the URL scheduler. Opens the
+same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is visible.
+Multi-process is the first-class concurrency model — the daemon is one writer among peers (CLI
+sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
 `busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
 (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
 (`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a stub;

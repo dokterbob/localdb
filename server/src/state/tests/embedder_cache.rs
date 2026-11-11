@@ -123,11 +123,11 @@ async fn get_or_build_embedder_rebuilds_on_provider_settings_change() {
 /// An unchanged `EmbeddingPolicy` and `providers` but a changed `http:`
 /// block (e.g. editing `max_retries` or `user_agent`) must still miss
 /// the cache and rebuild — the cache key is policy, providers, *and*
-/// `http`, not policy+providers alone (issue #207 adversarial review,
-/// finding 1). Without this, two calls sharing the same policy/providers
-/// but a changed `http.max_retries` would still hit the cache and return
-/// an embedder built from the *old* `http:` snapshot, since the
-/// policy/providers equality check alone would report a cache hit.
+/// `http`, not policy+providers alone. Without this, two calls sharing
+/// the same policy/providers but a changed `http.max_retries` would
+/// still hit the cache and return an embedder built from the *old*
+/// `http:` snapshot, since the policy/providers equality check alone
+/// would report a cache hit.
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_on_http_config_change() {
     let (_dir, state) = make_state().await;

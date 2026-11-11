@@ -214,6 +214,29 @@ async fn fetch_identity(base_url: &str, bearer: &str) -> Result<(String, String)
     Ok((name, role))
 }
 
+/// Resolve `credentials.json`'s path for `ctx` and confirm it can be
+/// loaded for a write: a missing file is fine (the first write creates
+/// it), but an unreadable or malformed one fails here, before either login
+/// flow (browser/OOB or `--invite`) starts. Both flows have an irreversible
+/// side effect ahead of their final write — the browser/OOB flow consumes a
+/// single-use authorization code (and, for the first admin, a one-time
+/// bootstrap setup code), the invite flow consumes an invite's one-time
+/// use — so finding out the file is unusable only at that final write burns
+/// a credential that can never be un-consumed. The returned error never
+/// quotes the file's contents (see `credentials::describe_parse_error`).
+fn credentials_file_ready(ctx: &CliContext) -> Result<std::path::PathBuf, Error> {
+    let config_file = resolved_config_file(ctx).ok_or_else(|| Error::InvalidConfig {
+        message: "cannot resolve the config file path to write credentials.json".to_string(),
+    })?;
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    crate::credentials::ensure_loadable_for_write(&credentials_file).map_err(|e| {
+        Error::InvalidConfig {
+            message: format!("{e}; fix or remove the file before logging in"),
+        }
+    })?;
+    Ok(credentials_file)
+}
+
 /// The requested user name for an invite redemption: `--name` if given,
 /// else the OS login name (`$USER`/`%USERNAME%`) as a friendly default so
 /// the common case doesn't require typing a name twice (once to log into
@@ -260,6 +283,7 @@ async fn perform_invite_login(
     poll_interval: std::time::Duration,
 ) -> Result<(String, String), Error> {
     let requested_name = resolve_requested_name(name)?;
+    credentials_file_ready(ctx)?;
 
     let client = build_http_client(std::time::Duration::from_secs(30))?;
 
@@ -526,6 +550,8 @@ async fn perform_login(
     open_browser: impl Fn(&str) -> bool,
     callback_timeout: std::time::Duration,
 ) -> Result<String, Error> {
+    let credentials_file = credentials_file_ready(ctx)?;
+
     let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
     let (csrf_state, _) = localdb_core::auth::generate_pkce_pair();
 
@@ -592,10 +618,6 @@ async fn perform_login(
     let (access_token, refresh_token, expires_in) =
         exchange_code_for_tokens(base_url, &code, &redirect_uri, &verifier).await?;
 
-    let config_file = resolved_config_file(ctx).ok_or_else(|| Error::InvalidConfig {
-        message: "cannot resolve the config file path to write credentials.json".to_string(),
-    })?;
-    let credentials_file = crate::credentials::credentials_path(&config_file);
     let entry = CredentialEntry {
         secret: None,
         access_token: Some(access_token.clone()),

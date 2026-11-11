@@ -40,7 +40,7 @@
   end
 
   # Opt-in daemon: `brew services start localdb` runs the HTTP API server
-  # with file watching and scheduled refresh. Off by default.
+  # with scheduled refresh. Off by default.
   service do
     run [opt_bin/"localdb", "serve"]
     keep_alive true

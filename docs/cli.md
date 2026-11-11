@@ -33,14 +33,15 @@ Exit codes are stable API. See
 [specs/05-surfaces.md §5](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#5-shared-error-taxonomy)
 for the full error taxonomy that drives them.
 
-| Code | Meaning                 | Example trigger                                               |
-| ---- | ----------------------- | ------------------------------------------------------------- |
-| `0`  | OK                      | Successful command                                            |
-| `1`  | Internal error          | Bug or unrecoverable runtime failure                          |
-| `2`  | Invalid usage or config | Unknown subcommand, duplicate store, bad config file          |
-| `3`  | Not found               | `store remove <name>` — store does not exist                  |
-| `4`  | Conflict / locked       | `serve` when a daemon is already running on the same data dir |
-| `5`  | Unavailable             | Daemon unreachable (stale socket)                             |
+| Code | Meaning                  | Example trigger                                                               |
+| ---- | ------------------------ | ----------------------------------------------------------------------------- |
+| `0`  | OK                       | Successful command                                                            |
+| `1`  | Internal error           | Bug or unrecoverable runtime failure                                          |
+| `2`  | Invalid usage or config  | Unknown subcommand, duplicate store, bad config file                          |
+| `3`  | Not found                | `store remove <name>` — store does not exist                                  |
+| `4`  | Conflict / locked        | `serve` when a daemon is already running on the same data dir                 |
+| `5`  | Unavailable              | Daemon unreachable (stale socket)                                             |
+| `6`  | Unauthorized / forbidden | Missing or invalid bearer token; token lacks the required role or store grant |
 
 ---
 
@@ -458,6 +459,13 @@ exchanges it for an access + refresh token pair at `/token`, caching both in `cr
 guarantees stdout carries nothing but the final JSON result, even in this interactive mode.
 `--invite` conflicts with both `--setup-code` and `--no-browser` (exit 2): it takes a wholly
 separate, browser-free path, so neither flag has anything to apply to.
+
+Before either path starts, `login` checks that `credentials.json` can be loaded for a write: a
+missing file is fine (the first login creates it), but an unreadable or malformed one fails
+immediately with a message naming the file (exit 2), before the browser/OOB flow or the invite
+redemption begins. Without this check, a malformed file would only surface at the very end, after
+the flow had already consumed a one-time authorization code, a bootstrap setup code, or an invite's
+single use.
 
 With `--invite <token>` (T6): redeems the invite directly against `POST /v1/invites/redeem` — no
 browser round trip. `open`-mode invites persist the redeemed API key immediately; `closed`-mode

@@ -50,7 +50,7 @@ mod version {
 ///
 /// Indexes your files and URLs into a local store. Search with
 /// natural language. Expose as an MCP server for AI agents.
-/// Optionally run as a daemon with a REST API and file watching.
+/// Optionally run as a daemon with a REST API and scheduled refresh.
 #[derive(Debug, Parser)]
 #[command(
     name = "localdb",

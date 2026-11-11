@@ -42,11 +42,11 @@ async fn get_or_build_fetchers_builds_once_across_repeated_calls() {
     );
 }
 
-/// A changed `http:` block (e.g. an operator editing
-/// `http.rate_limit.requests_per_second` and the daemon's config-file
-/// watcher reloading it) must miss the cache and rebuild a fresh pair —
-/// otherwise every job would keep pacing through a `HostLimiter` built
-/// from stale rate-limit settings indefinitely.
+/// A second call made with a changed `http:` block (a different
+/// `RawConfig`, e.g. a different `http.rate_limit.requests_per_second`)
+/// must miss the cache and rebuild a fresh pair — otherwise a caller
+/// passing different http settings on two calls would keep pacing through
+/// a `HostLimiter` built from the first call's settings.
 #[tokio::test]
 async fn get_or_build_fetchers_rebuilds_on_http_config_change() {
     let (_dir, state) = make_state().await;

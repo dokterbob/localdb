@@ -506,9 +506,10 @@ fn render_oob_success_page(code: &str) -> Html<String> {
 /// original: revoking the original also revokes that new session and
 /// anything minted under it.
 ///
-/// An invite-token redemption branch runs here, tried alongside
-/// (not necessarily before/after) the API-key fallback — invites identify a
-/// *new* user the way the setup code identifies the *first* one.
+/// Invite-token redemption is a separate path: `post_authorize` checks for
+/// an invite token before calling this function at all and returns early via
+/// `handle_invite_authorize`, since invites identify a *new* user the way
+/// the setup code identifies the *first* one.
 async fn resolve_credential(
     state: &AppState,
     credential: &str,
@@ -594,8 +595,8 @@ fn internal_token_error() -> Response {
     )
 }
 
-/// Classify a token-issuance/rotation/auth-code-redemption failure (finding
-/// #5, #1): an internal-class error (see
+/// Classify a token-issuance/rotation/auth-code-redemption failure: an
+/// internal-class error (see
 /// [`super::is_internal_class_error`]) becomes a generic `500`; anything else
 /// is genuine client input and stays a `400 invalid_grant` with `description`
 /// (the token-endpoint code for a bad, expired, or already-consumed grant,

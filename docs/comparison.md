@@ -234,12 +234,12 @@ In the interest of the same honesty as [Known gaps](architecture.md#known-gaps):
   [#347](https://github.com/dokterbob/localdb/issues/347) — metadata-only entities first, graph
   extraction only after baseline retrieval quality is proven) but is not designed or built. Basic
   Memory already has one.
-- **File-watch-triggered re-indexing isn't live yet.** `POST /v1/jobs` itself runs real ingestion
-  through the daemon's async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)),
-  and `localdb index` (embedded or daemon-attached) drives it with live progress — but there is no
-  file watcher at all, so nothing triggers a job automatically when a source file changes. Today,
-  keeping an index current still means running `localdb index` again — incremental, but not
-  automatic.
+- **File-watch-triggered re-indexing is not implemented.** `POST /v1/jobs` itself runs real
+  ingestion through the daemon's async job queue
+  ([#187](https://github.com/dokterbob/localdb/issues/187)), and `localdb index` (embedded or
+  daemon-attached) drives it with live progress — but nothing watches source files for changes, so
+  nothing triggers a job automatically when a source file changes. Keeping an index current means
+  running `localdb index` again — incremental, but not automatic.
 
 ## Where localdb is headed that nobody else is
 

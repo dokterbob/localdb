@@ -172,10 +172,8 @@ impl SqliteBackend {
     /// connection. Not part of the `StoreBackend` trait — auth tables are a
     /// libsql implementation detail alongside stores/sources/etc., not a
     /// `core` retrieval concept, so this is an inherent method rather than a
-    /// trait requirement. No daemon/CLI wiring calls this yet (that's a
-    /// later ticket); it exists so `LibsqlAuthStore` has a real, public
-    /// construction path instead of only being reachable from this crate's
-    /// own tests.
+    /// trait requirement. `AppState::new`/`from_backend` call this to build
+    /// the daemon's `AuthContext`.
     pub fn auth_store(&self) -> LibsqlAuthStore {
         LibsqlAuthStore::new(self.conn.clone())
     }

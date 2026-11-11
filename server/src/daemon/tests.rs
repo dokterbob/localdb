@@ -8,5 +8,6 @@ mod rejected_logging;
 mod router;
 mod scheduler_registration;
 mod startup;
+mod watcher_integration;
 
 mod auth;

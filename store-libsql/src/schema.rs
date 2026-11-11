@@ -328,9 +328,9 @@ async fn create_credentials(conn: &Connection) -> Result<(), libsql::Error> {
 /// framework's `v6` entry (`create_auth_tables`,
 /// `store-libsql/src/migrations/chain.rs`) so both paths converge on an
 /// identical schema (the write-twice rule — see `docs/migrations.md`).
-/// `oauth_clients`/`auth_codes` have no corresponding `core::auth` Rust types
-/// yet — their DDL ships now (so this is the only migration this feature
-/// ever needs) but the OAuth2 code+PKCE flow lands in a later ticket.
+/// All seven tables' DDL ships in this one migration, so the auth feature
+/// needs only one chain entry regardless of how many of its Rust-side
+/// pieces land afterward.
 async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (
@@ -388,9 +388,9 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
-    // OAuth2 dynamic client registration (RFC 7591) — client rows are not
-    // written until a later ticket implements the `/register` route, but the
-    // table ships now per D13 (one migration for the whole auth feature).
+    // OAuth2 dynamic client registration (RFC 7591) has no write path: no
+    // `/register` route inserts an `oauth_clients` row. The table ships now
+    // so the auth feature needs only one migration (D13).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS oauth_clients (
             id            TEXT PRIMARY KEY NOT NULL,
@@ -416,8 +416,8 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
-    // OAuth2 authorization codes (code+PKCE flow, later ticket). The
-    // trailing `, minted_by_family TEXT)` follows the same splice
+    // OAuth2 authorization codes (code+PKCE flow, `server/src/auth/oauth.rs`).
+    // The trailing `, minted_by_family TEXT)` follows the same splice
     // convention as `auth_tokens.minted_by_family` above: a
     // `PRAGMA user_version`-migrated store gets this column via chain.rs's
     // `ALTER TABLE auth_codes ADD COLUMN minted_by_family TEXT`.

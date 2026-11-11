@@ -177,6 +177,16 @@ fn read_path_warning(error: &std::io::Error) -> String {
     format!("warning: {error}")
 }
 
+/// Check that `credentials_file` can be loaded for a write, without
+/// actually writing anything: a missing file is fine (the first write
+/// creates it), but an unreadable or malformed one is the same error
+/// [`write_entry`] would hit. A caller with work to do before that write —
+/// work with a side effect that can't be undone if the write later fails —
+/// can call this first and fail before doing any of it.
+pub(crate) fn ensure_loadable_for_write(credentials_file: &Path) -> std::io::Result<()> {
+    load_file_for_write(credentials_file).map(|_| ())
+}
+
 /// Look up the cached entry for `base_url`, if the file exists, parses, and
 /// has one.
 pub(crate) fn lookup_entry(credentials_file: &Path, base_url: &str) -> Option<CredentialEntry> {

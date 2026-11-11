@@ -196,10 +196,9 @@ pub(crate) fn log_scaffold_result(result: &ScaffoldResult) {
     );
 }
 
-/// Write `content` to `config_path` such that any concurrent reader (in
-/// particular the daemon's config file watcher,
-/// `server/src/daemon.rs::run_config_watcher`) never observes partial
-/// content.
+/// Write `content` to `config_path` such that any concurrent reader (another
+/// CLI process scaffolding the same config, or a daemon reading it at its own
+/// startup) never observes partial content.
 ///
 /// Writes the full content to a uniquely-named temp file
 /// (`config.yaml.tmp-<pid>-<ulid>`) in the *same* directory as `config_path`

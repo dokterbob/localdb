@@ -20,6 +20,7 @@ pub mod scheduler;
 pub mod search_service;
 pub mod socket;
 pub mod state;
+pub mod watcher;
 
 pub use auth::AuthMode;
 pub use daemon::{build_router, resolve_auth_mode, start_daemon, DaemonHandle, DaemonOptions};

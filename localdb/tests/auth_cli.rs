@@ -365,7 +365,7 @@ fn credentials_json_is_used_when_env_key_absent() {
 
     // credentials.json lives next to config.yaml, keyed by daemon base URL
     // (specs/03-config.md §6). `localdb login` writes it; hand-rolled here
-    // since this binary only reads it.
+    // since the command this test exercises (`store add`) only reads it.
     std::fs::write(
         dir.path().join("credentials.json"),
         format!(r#"{{"version":1,"credentials":{{"{base_url}":{{"secret":"ldb_cached_key"}}}}}}"#),

@@ -46,6 +46,10 @@ issue carrying the research and open design questions.
 - **Minimal read-only web UI** (#273) — basic search and browse on the existing HTTP API; the first
   slice of the Phase 3 web surface (§1), pulled forward because private local access (including via
   local AI models) is the primary use case and deserves a zero-terminal entry point.
+- **Source watching** (#372) — `file` sources are re-indexed only by an explicit `localdb index`.
+  Open design question: have the daemon watch source roots (`server::watcher` provides debounced
+  path watching and has no caller), poll them from the refresh scheduler, or keep indexing manual
+  and remove the module. URL/feed sources refresh on a schedule independently of this item.
 
 **Mid-term**
 

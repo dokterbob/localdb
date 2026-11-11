@@ -679,12 +679,44 @@ async fn fresh_bearer_for_url_falls_back_to_stale_token_when_refresh_fails() {
 }
 
 // Invoked in separate OS processes by the test below; ordinary test runs do nothing.
+//
+// Before touching the credential at all, this signals its own readiness (a
+// marker file named after `LOCALDB_TEST_REFRESH_WORKER_ID` in
+// `LOCALDB_TEST_REFRESH_READY_DIR`) and then blocks until its sibling
+// worker's marker also appears. Only once both have arrived does either
+// process call into the refresh path. This is what makes the two
+// processes' *first*, unlocked reads of the stale credential genuinely
+// concurrent: neither can race ahead and finish (acquiring the credential
+// lock, refreshing, and writing the fresh entry) before the other has even
+// started, which is the scenario `CredentialLock` is supposed to serialize
+// correctly. Without this rendezvous, a merely sequential run — the second
+// process starting only after the first has fully finished — would also
+// pass every assertion below, without ever exercising the lock at all.
 #[test]
 fn refresh_process_worker() {
     let Ok(config) = std::env::var("LOCALDB_TEST_REFRESH_CONFIG") else {
         return;
     };
     let base = std::env::var("LOCALDB_TEST_REFRESH_URL").unwrap();
+    let ready_dir = std::env::var("LOCALDB_TEST_REFRESH_READY_DIR").unwrap();
+    let my_id = std::env::var("LOCALDB_TEST_REFRESH_WORKER_ID").unwrap();
+    let sibling_id = if my_id == "0" { "1" } else { "0" };
+
+    std::fs::write(
+        std::path::Path::new(&ready_dir).join(format!("ready-{my_id}")),
+        b"",
+    )
+    .unwrap();
+    let sibling_marker = std::path::Path::new(&ready_dir).join(format!("ready-{sibling_id}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !sibling_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sibling worker did not become ready in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
     let ctx = ctx_with_config(std::path::Path::new(&config));
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         if std::env::var("LOCALDB_TEST_REFRESH_PROACTIVE").is_ok() {
@@ -705,6 +737,27 @@ fn refresh_process_worker() {
     });
 }
 
+/// Two processes independently discover the same stale refresh token and
+/// call into `refresh_cached_bearer` at genuinely the same time (enforced
+/// by `refresh_process_worker`'s own readiness rendezvous, not by anything
+/// here). What this proves: the credential lock
+/// (`cli/src/daemon_client.rs`'s use of `CredentialLock` around the
+/// re-check + `/token` call + persist) correctly serializes that race —
+/// exactly one process ever redeems the refresh token (`rotations == 1`),
+/// the loser gets back the winner's freshly written access token without
+/// ever calling `/token` itself, and an unrelated origin's cached entry
+/// survives the read-modify-write untouched.
+///
+/// What this does *not* prove: that both processes are ever inside the
+/// mock `/token` handler at the same instant. By design, the loser's
+/// locked re-check of the credential (`daemon_client.rs`'s `needs_refresh`
+/// call taken under the lock, after `CredentialLock::acquire` returns)
+/// observes the winner's already-written fresh entry and returns early
+/// without calling `/token` at all — so a correct implementation never
+/// sends a second `/token` request in the first place. The mock's
+/// `count == 0` branch exists only as a defensive check: if a regression
+/// ever did let a second request through, it would hit `BAD_REQUEST` and
+/// fail one of the two child processes instead of silently passing.
 #[tokio::test]
 async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
     use std::sync::{
@@ -713,22 +766,10 @@ async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
     };
     let rotations = Arc::new(AtomicUsize::new(0));
     let counter = rotations.clone();
-    // Both child processes race to refresh the same stale refresh token.
-    // A `/token` call must not be answered until the overlap this test
-    // exercises has actually happened — otherwise the first response could
-    // land, get written to disk, and let the second process simply read
-    // the fresh credential instead of ever racing for a rotation. A
-    // `Barrier(2)` holds each request until the other has arrived too,
-    // guaranteeing both calls are genuinely concurrent; the timeout is a
-    // safety net for a design that ends up never sending a second request
-    // at all (so the test fails loudly instead of hanging).
-    let overlap = Arc::new(tokio::sync::Barrier::new(2));
     let app = axum::Router::new()
         .route("/token", axum::routing::post(move || {
             let counter = counter.clone();
-            let overlap = overlap.clone();
             async move {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), overlap.wait()).await;
                 let count = counter.fetch_add(1, Ordering::SeqCst);
                 let status = if count == 0 { axum::http::StatusCode::OK } else { axum::http::StatusCode::BAD_REQUEST };
                 (status, axum::Json(serde_json::json!({"access_token":"new_access", "refresh_token":"new_refresh", "expires_in":3600})))
@@ -746,6 +787,8 @@ async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
     let dir = TempDir::new().unwrap();
     let config = dir.path().join("config.yaml");
     let path = crate::credentials::credentials_path(&config);
+    let ready_dir = dir.path().join("ready");
+    std::fs::create_dir(&ready_dir).unwrap();
     crate::credentials::write_entry(
         &path,
         &base,
@@ -767,7 +810,7 @@ async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
     )
     .unwrap();
     let mut children = Vec::new();
-    for proactive in [false, true] {
+    for (worker_id, proactive) in [false, true].into_iter().enumerate() {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -777,6 +820,8 @@ async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
             ])
             .env("LOCALDB_TEST_REFRESH_CONFIG", &config)
             .env("LOCALDB_TEST_REFRESH_URL", &base)
+            .env("LOCALDB_TEST_REFRESH_READY_DIR", &ready_dir)
+            .env("LOCALDB_TEST_REFRESH_WORKER_ID", worker_id.to_string())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if proactive {

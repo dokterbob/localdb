@@ -189,6 +189,35 @@ fn write_entry_on_unreadable_directory_path_fails_rather_than_overwriting() {
     assert!(result.is_err());
 }
 
+#[test]
+fn ensure_loadable_for_write_succeeds_on_missing_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials.json");
+    assert!(ensure_loadable_for_write(&path).is_ok());
+}
+
+#[test]
+fn ensure_loadable_for_write_succeeds_on_well_formed_file() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"http://127.0.0.1:7700":{"secret":"ldb_cached"}}}"#,
+    );
+    assert!(ensure_loadable_for_write(&path).is_ok());
+}
+
+#[test]
+fn ensure_loadable_for_write_fails_on_malformed_file_and_names_it() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(&dir, "not json at all");
+
+    let error = ensure_loadable_for_write(&path).unwrap_err();
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "error should name the unparseable file: {error}"
+    );
+}
+
 // -----------------------------------------------------------------
 // Temp-file handling: a failed write must never leave the predictable
 // final path, or any temp file, behind.

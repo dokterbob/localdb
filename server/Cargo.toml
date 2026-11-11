@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "HTTP API daemon: axum REST API, file watching, job queue, unix socket"
+description = "HTTP API daemon: axum REST API, scheduled refresh, job queue, unix socket"
 
 [lib]
 # Keep the short crate name in code (`use server::…`); only the
@@ -44,6 +44,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+
+# File system notification (debounced file watching)
+# Use notify v6 since notify-debouncer-mini 0.4 depends on notify 6
+notify-debouncer-mini = "0.4"
 
 [dev-dependencies]
 libsql = { workspace = true }

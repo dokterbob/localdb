@@ -192,6 +192,150 @@ async fn logout_clears_cached_entry_and_revokes() {
     );
 }
 
+// -----------------------------------------------------------------
+// Preflight: a malformed credentials.json must fail before either login
+// flow does anything with a one-time side effect (consuming an
+// authorization code or an invite's single use).
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn perform_login_fails_preflight_on_malformed_credentials_file_without_opening_browser() {
+    let (dir, _state, base_url) = spawn_test_daemon().await;
+    let ctx = ctx_for(&dir);
+    let credentials_file = crate::credentials::credentials_path(&dir.path().join("config.yaml"));
+    std::fs::write(&credentials_file, "not json at all").unwrap();
+
+    let opener_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opener_called_clone = opener_called.clone();
+    let opener = move |_: &str| {
+        opener_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    };
+
+    let result = perform_login(
+        &ctx,
+        &base_url,
+        None,
+        false,
+        opener,
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+
+    let error = result.expect_err("a malformed credentials file must fail before login starts");
+    assert!(
+        matches!(error, Error::InvalidConfig { .. }),
+        "expected InvalidConfig (exit 2), got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("credentials.json"),
+        "error should name the credentials file: {message}"
+    );
+    assert!(
+        !message.contains("not json at all"),
+        "the error must not quote the file's own contents: {message}"
+    );
+    assert!(
+        !opener_called.load(std::sync::atomic::Ordering::SeqCst),
+        "the browser must never be opened when the preflight check fails"
+    );
+}
+
+#[tokio::test]
+async fn perform_invite_login_fails_preflight_without_consuming_the_invites_single_use() {
+    let (dir, state, base_url) = spawn_test_daemon().await;
+    let admin = state
+        .auth()
+        .create_user("admin-preflight", Role::Admin)
+        .await
+        .unwrap();
+    let issued = state
+        .auth()
+        .create_invite(
+            localdb_core::auth::InviteMode::Open,
+            &[],
+            1,
+            None,
+            &admin.id,
+        )
+        .await
+        .unwrap();
+    let ctx = ctx_for(&dir);
+    let credentials_file = crate::credentials::credentials_path(&dir.path().join("config.yaml"));
+    std::fs::write(&credentials_file, "not json at all").unwrap();
+
+    let result = perform_invite_login(
+        &ctx,
+        &base_url,
+        &issued.secret,
+        Some("preflight-user"),
+        std::time::Duration::from_millis(10),
+    )
+    .await;
+    let error =
+        result.expect_err("a malformed credentials file must fail before redeeming the invite");
+    assert!(
+        matches!(error, Error::InvalidConfig { .. }),
+        "expected InvalidConfig (exit 2), got {error:?}"
+    );
+
+    // Remove the malformed file and retry: if the first, failed attempt had
+    // already redeemed the invite, its single use would be gone and this
+    // would now fail too.
+    std::fs::remove_file(&credentials_file).unwrap();
+    let retry = perform_invite_login(
+        &ctx,
+        &base_url,
+        &issued.secret,
+        Some("preflight-user"),
+        std::time::Duration::from_millis(10),
+    )
+    .await;
+    assert!(
+        retry.is_ok(),
+        "the invite's only use must still be available after the preflight failure: {:?}",
+        retry.err()
+    );
+}
+
+#[tokio::test]
+async fn perform_login_with_a_missing_credentials_file_proceeds() {
+    // No credentials.json exists yet in this fresh TempDir — the preflight
+    // check must treat that as fine and let the flow run, exactly like
+    // `perform_login_happy_path_persists_credentials` already demonstrates
+    // end to end. This test only pins the preflight's own missing-file case.
+    let (dir, state, base_url) = spawn_test_daemon().await;
+    let user = state
+        .auth()
+        .create_user("preflight-missing-file", Role::Admin)
+        .await
+        .unwrap();
+    let api_key = state.auth().issue_api_key(&user.id).await.unwrap().secret;
+    let ctx = ctx_for(&dir);
+
+    assert!(
+        !crate::credentials::credentials_path(&dir.path().join("config.yaml")).exists(),
+        "precondition: no credentials.json yet"
+    );
+
+    let opener = fake_browser_opener(api_key);
+    let result = perform_login(
+        &ctx,
+        &base_url,
+        None,
+        false,
+        opener,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a missing credentials file must not block login: {:?}",
+        result.err()
+    );
+}
+
 #[tokio::test]
 async fn no_browser_setup_code_bootstrap_via_stdin_paste_placeholder() {
     // The oob (`--no-browser`) path reads the pasted code from stdin,

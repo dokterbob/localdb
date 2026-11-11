@@ -122,10 +122,10 @@ async fn redeem_invite_rejects_duplicate_requested_name() {
 
 #[tokio::test]
 async fn redeem_open_invite_failed_mint_does_not_burn_use_and_retry_succeeds() {
-    // Pins findings #3 + #7: a failed redemption (duplicate name
-    // colliding with `create_user`'s UNIQUE constraint) must not
-    // permanently consume the invite's only use — a fresh name must
-    // still be able to redeem the same `max_uses = 1` invite.
+    // A failed redemption (duplicate name colliding with `create_user`'s
+    // UNIQUE constraint) must not permanently consume the invite's only
+    // use — a fresh name must still be able to redeem the same
+    // `max_uses = 1` invite.
     let svc = service();
     svc.create_user("taken", Role::Member).await.unwrap();
     let issued = make_open_invite(&svc, 1).await;
