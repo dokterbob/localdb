@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 The format follows [Common Changelog](https://common-changelog.org).
 
+## [0.2.2] - 2026-11-11
+
+
 ## [0.2.1] - 2026-11-09
 
 ### Changed
