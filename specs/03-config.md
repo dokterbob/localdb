@@ -22,6 +22,12 @@ server:
   #   the .well-known responses (05-surfaces.md §3.1). Must be an absolute HTTP(S) URL
   #   without credentials, query, or fragment; optional path prefixes are allowed.
   job_workers: 1 # daemon job-queue workers; see §5
+  abuse_limits: # limits on the public, unauthenticated auth routes (05-surfaces.md §3.1)
+    enable: true # loopback callers are always exempt from the rate limit regardless
+    max_dynamic_clients: 1000 # POST /register cap; the built-in localdb-cli client is exempt
+    unused_client_ttl_secs: 86400 # how long an unused registration may sit before pruning
+    requests_per_second: 5 # per-client-IP token bucket across the limited public auth routes
+    burst: 20
 
 paths: # all optional; platform defaults in §4
   data: ~ # index data, socket
@@ -175,6 +181,11 @@ path; `paths.*` in config override the rest.
   always serialized via the per-store in-flight guard, regardless of worker count — see
   [05-surfaces.md](05-surfaces.md) §3. Embedded (non-daemon) CLI indexing is unaffected: it always
   runs its own single-worker queue and never reads this key.
+- **`server.abuse_limits`:** `max_dynamic_clients` (`u64`), `unused_client_ttl_secs` (`i64`),
+  `requests_per_second` (`u32`), and `burst` (`u32`) must each be `>= 1`; `0` is rejected with a
+  path-precise message for each key, the same convention as `http.rate_limit`. `enable` (`bool`,
+  default `true`) is the master switch for this whole section — see [05-surfaces.md](05-surfaces.md)
+  §3.1 for what each limit bounds and the loopback exemption.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the

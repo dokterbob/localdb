@@ -127,6 +127,22 @@ admin. Members can read only granted shared stores through all retrieval routes,
 listing. Their `/v1/status` response omits shared database diagnostics and counts only readable
 stores and their jobs.
 
+**Abuse limits on the public auth routes** (`server.abuse_limits`, defaults on): every route in the
+first table row above _except_ the two `GET /.well-known/*` discovery documents shares a
+per-client-IP token bucket (default 5 requests/second, burst 20) — loopback callers are always
+exempt, and behind a reverse proxy every client shares the proxy's address. Over the limit: `429`
+with `Retry-After` (seconds); `/token` and `/register` keep their existing OAuth-style
+`{"error", "error_description"}` body (`slow_down` / `temporarily_unavailable` respectively), every
+other route uses the standard `{"code": "rate_limited", "message": "..."}` shape below.
+`POST /register` also enforces a separate cap on how many dynamically registered clients may exist
+at once (default 1000, the built-in `localdb-cli` client never counts toward it) — once that cap is
+still reached after pruning clients that are both unused and past `unused_client_ttl_secs` (default
+24h), registration is refused the same way: `429`, `Retry-After`,
+`{"error": "temporarily_unavailable", ...}`. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.1 and
+[specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §1 for the
+full behavior and config keys.
+
 ### OAuth discovery + Dynamic Client Registration
 
 Once auth is enforced, three RFCs work together so a stock MCP client can onboard against `/mcp` (or
@@ -189,7 +205,9 @@ manually-typed client ID:
    returned. Unlike the built-in `localdb-cli` client (which gets an RFC 8252 §7.3
    loopback-_any-port_ exception, since the CLI binds a fresh ephemeral port per login), a
    registered client's redirect_uri is matched **exactly** against what it registered — no loopback
-   leniency.
+   leniency. `POST /register` is also subject to the registration cap and per-IP rate limit
+   described above — a `429` here means retry after the delay in `Retry-After`, not a malformed
+   request.
 
 5. It runs the ordinary code+PKCE flow (`GET/POST /authorize` → `POST /token`) using the `client_id`
    from step 4.

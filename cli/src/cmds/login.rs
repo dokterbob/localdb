@@ -384,6 +384,17 @@ async fn poll_until_decided(
             .await
             .map_err(|_| Error::DaemonUnreachable)?;
         let status = resp.status();
+        // A 429 from the daemon's per-IP rate limiter (specs/05-surfaces.md
+        // §3.1) is not a decision failure — it means this poll loop itself
+        // is the thing being throttled (e.g. several concurrent logins
+        // sharing one IP behind NAT). Wait the suggested delay and keep
+        // polling rather than surfacing an error for a condition this loop
+        // caused and can resolve by itself.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = retry_after_duration(resp.headers()).unwrap_or(poll_interval);
+            tokio::time::sleep(wait).await;
+            continue;
+        }
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
             return Err(crate::daemon_client::daemon_response_error(status, &body));
@@ -421,6 +432,19 @@ async fn poll_until_decided(
             }
         }
     }
+}
+
+/// Parse a `Retry-After` header as a plain integer number of seconds (the
+/// only form this daemon's rate limiter sends — `server::auth::rate_limit`).
+/// `None` for a missing or unparseable header, so the caller can fall back
+/// to its own poll interval rather than fail outright on a header shape
+/// this server never actually sends.
+fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 /// Persist a redeemed invite's API key into `credentials.json` under the

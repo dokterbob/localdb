@@ -171,6 +171,16 @@ pub struct OAuthClientRow {
     pub created_at: String,
 }
 
+/// Outcome of `AuthStore::prune_and_create_oauth_client`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterClientOutcome {
+    /// Pruning (if any ran) left room; `client` was inserted.
+    Created,
+    /// Still at `max_dynamic_clients` after pruning; nothing was inserted.
+    /// Any pruning that did run still committed.
+    CapReached,
+}
+
 /// A store-name/user-id grant (D7). Normalized: one row per grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreGrantRow {
@@ -366,6 +376,24 @@ pub trait AuthStore: Send + Sync + 'static {
     // ------------------------------------------------------------------
     async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error>;
     async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error>;
+    /// Atomically prune dynamically registered clients that have never
+    /// completed an authorization — no row in `auth_codes` names them as
+    /// `client_id`, the earliest point in the OAuth2 flow this schema
+    /// records client activity at, earlier than a token ever being minted —
+    /// and were registered before `unused_before` (RFC 3339), then insert
+    /// `client` iff the number of dynamically registered clients (every
+    /// `oauth_clients` row except `builtin_client_id`) is then below
+    /// `max_dynamic_clients`. Prune, cap check, and insert commit as one
+    /// transaction, so concurrent registrations can never together exceed
+    /// the cap (specs/05-surfaces.md §3.1). Pruning commits even when the
+    /// cap is still reached afterward and nothing is inserted.
+    async fn prune_and_create_oauth_client(
+        &self,
+        client: &OAuthClientRow,
+        builtin_client_id: &str,
+        unused_before: &str,
+        max_dynamic_clients: u64,
+    ) -> Result<RegisterClientOutcome, Error>;
 
     // ------------------------------------------------------------------
     // Grants

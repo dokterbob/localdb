@@ -4,6 +4,7 @@ use std::sync::Arc;
 use fetch::HttpUrlFetcher;
 use tokio::sync::RwLock;
 
+use crate::auth::rate_limit::AbuseLimiter;
 use crate::auth::{AuthMode, ServerAuthService};
 use localdb_core::{
     config::{
@@ -102,6 +103,12 @@ struct Inner {
     default_policy_version: String,
     job_queue: JobQueue,
     url_scheduler: UrlRefreshScheduler,
+    /// Per-client-IP rate limiter for the public auth routes
+    /// (specs/05-surfaces.md §3.1), built once from `yaml_config.server.
+    /// abuse_limits` at construction time (there is no config hot-reload,
+    /// §3-config §5, so this never needs rebuilding for the process's
+    /// lifetime).
+    abuse_limiter: AbuseLimiter,
     /// Shared embedder keyed by model policy, providers, and HTTP settings.
     embedder_cache: RwLock<Option<EmbedderCacheEntry>>,
     /// Shared HTTP fetchers keep per-host pacing and cooldowns process-wide.
@@ -196,6 +203,7 @@ impl AppState {
     ) -> Self {
         let default_indexing_policy = yaml_config.defaults.indexing.clone();
         let default_policy_version = compute_policy_version(&default_indexing_policy);
+        let abuse_limiter = AbuseLimiter::new(&yaml_config.server.abuse_limits);
 
         Self {
             inner: Arc::new(Inner {
@@ -208,6 +216,7 @@ impl AppState {
                 default_policy_version,
                 job_queue,
                 url_scheduler,
+                abuse_limiter,
                 embedder_cache: RwLock::new(None),
                 fetcher_cache: RwLock::new(None),
                 #[cfg(test)]
@@ -291,6 +300,11 @@ impl AppState {
     /// The auth enforcement mode resolved at startup.
     pub fn auth_mode(&self) -> AuthMode {
         self.inner.auth_context.mode
+    }
+
+    /// The per-client-IP rate limiter for the public auth routes.
+    pub fn abuse_limiter(&self) -> &AbuseLimiter {
+        &self.inner.abuse_limiter
     }
 
     /// Record the blake3 hash of the one-time setup code (D3b). Called once

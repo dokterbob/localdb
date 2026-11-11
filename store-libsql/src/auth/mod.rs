@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::auth::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
-    InviteRow, OAuthClientRow, Role, RotateOutcome, StoreGrantRow, UserRow,
+    InviteRow, OAuthClientRow, RegisterClientOutcome, Role, RotateOutcome, StoreGrantRow, UserRow,
 };
 use localdb_core::Error;
 
@@ -163,6 +163,23 @@ impl AuthStore for LibsqlAuthStore {
 
     async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error> {
         clients::find_oauth_client(&self.conn, id).await
+    }
+
+    async fn prune_and_create_oauth_client(
+        &self,
+        client: &OAuthClientRow,
+        builtin_client_id: &str,
+        unused_before: &str,
+        max_dynamic_clients: u64,
+    ) -> Result<RegisterClientOutcome, Error> {
+        clients::prune_and_create_oauth_client(
+            &self.conn,
+            client,
+            builtin_client_id,
+            unused_before,
+            max_dynamic_clients,
+        )
+        .await
     }
 
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {

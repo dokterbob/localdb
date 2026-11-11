@@ -20,9 +20,9 @@ pub use client::{
     is_known_client, registration_client_name_within_bounds,
     registration_redirect_uris_within_bounds, validate_redirect_uri,
     validate_registration_redirect_uri, validate_registration_request, RegistrationError,
-    LOCALDB_CLI_CLIENT_ID, MAX_REGISTRATION_CLIENT_NAME_LEN, MAX_REGISTRATION_REDIRECT_URIS,
-    MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI, SUPPORTED_GRANT_TYPES,
-    SUPPORTED_RESPONSE_TYPES,
+    RegistrationPolicy, LOCALDB_CLI_CLIENT_ID, MAX_REGISTRATION_CLIENT_NAME_LEN,
+    MAX_REGISTRATION_REDIRECT_URIS, MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI,
+    SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
 };
 pub use principal::{Principal, Role, SessionOrigin, StoreAccess};
 pub use service::{
@@ -33,8 +33,8 @@ pub use service::{
 pub use store::FakeAuthStore;
 pub use store::{
     first_unused_name, AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow,
-    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RotateOutcome, StoreGrantRow, TokenKind,
-    UserRow,
+    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RegisterClientOutcome, RotateOutcome,
+    StoreGrantRow, TokenKind, UserRow,
 };
 pub use token::{
     expires_within, generate_pkce_pair, hash_secret, is_expired, mint_secret, rfc3339_from_now,

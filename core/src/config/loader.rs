@@ -206,6 +206,33 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         });
     }
 
+    if config.server.abuse_limits.max_dynamic_clients < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.max_dynamic_clients must be greater than zero"
+                .to_string(),
+        });
+    }
+
+    if config.server.abuse_limits.unused_client_ttl_secs < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.unused_client_ttl_secs must be greater than zero"
+                .to_string(),
+        });
+    }
+
+    if config.server.abuse_limits.requests_per_second < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.requests_per_second must be greater than zero"
+                .to_string(),
+        });
+    }
+
+    if config.server.abuse_limits.burst < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.burst must be greater than zero".to_string(),
+        });
+    }
+
     // Rejected here rather than at first use: `user_agent` is handed to
     // `reqwest::ClientBuilder::user_agent`, and a value that is not a legal
     // header (a newline, a control character) makes *every* `build()` fail —

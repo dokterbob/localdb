@@ -600,6 +600,7 @@ async fn is_known_client_recognizes_builtin_and_registered() {
             None,
             None,
             None,
+            &test_registration_policy(),
         )
         .await
         .unwrap();
@@ -610,7 +611,7 @@ async fn is_known_client_recognizes_builtin_and_registered() {
 async fn register_client_rejects_empty_redirect_uris() {
     let svc = service();
     let err = svc
-        .register_client(vec![], None, None, None, None)
+        .register_client(vec![], None, None, None, None, &test_registration_policy())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -629,6 +630,7 @@ async fn register_client_rejects_invalid_redirect_uri() {
             None,
             None,
             None,
+            &test_registration_policy(),
         )
         .await
         .unwrap_err();
@@ -651,6 +653,7 @@ async fn register_client_accepts_https_and_loopback() {
             None,
             None,
             None,
+            &test_registration_policy(),
         )
         .await
         .unwrap();
@@ -668,6 +671,7 @@ async fn validate_client_redirect_uri_registered_client_exact_match_only() {
             None,
             None,
             None,
+            &test_registration_policy(),
         )
         .await
         .unwrap();
@@ -875,4 +879,67 @@ async fn a_rotated_descendant_token_still_carries_the_ancestor_family() {
         Some(family_a.clone())
     );
     assert_eq!(rotated_refresh_b.row.minted_by_family, Some(family_a));
+}
+
+// -----------------------------------------------------------------
+// `register_client`'s registration-cap policy (specs/05-surfaces.md §3.1):
+// the store-layer behavior itself is covered directly against
+// `FakeAuthStore`/`store-libsql` (`prune_and_create_oauth_client`); these
+// two just prove `AuthService::register_client` wires its `policy`
+// argument through and maps the outcome correctly.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn register_client_errors_cap_reached_once_the_cap_is_hit() {
+    let svc = service();
+    let policy = crate::auth::client::RegistrationPolicy {
+        max_dynamic_clients: 1,
+        unused_client_ttl_secs: 86400,
+    };
+    svc.register_client(
+        vec!["https://app.example.com/cb".to_string()],
+        None,
+        None,
+        None,
+        None,
+        &policy,
+    )
+    .await
+    .expect("first registration should succeed under the cap");
+
+    let err = svc
+        .register_client(
+            vec!["https://app2.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RegisterClientError::CapReached));
+}
+
+#[tokio::test]
+async fn register_client_cap_does_not_count_the_builtin_client() {
+    let svc = service();
+    // A cap of 1 is reachable by exactly one dynamic registration — the
+    // built-in `localdb-cli` client (seeded at the store layer in
+    // production, absent from `FakeAuthStore` by construction) must never
+    // count toward it either way.
+    let policy = crate::auth::client::RegistrationPolicy {
+        max_dynamic_clients: 1,
+        unused_client_ttl_secs: 86400,
+    };
+    svc.register_client(
+        vec!["https://app.example.com/cb".to_string()],
+        None,
+        None,
+        None,
+        None,
+        &policy,
+    )
+    .await
+    .expect("registering the only dynamic client under the cap should succeed");
 }

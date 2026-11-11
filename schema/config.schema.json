@@ -53,7 +53,14 @@
             "port": 7700,
             "auth": "auto",
             "public_url": null,
-            "job_workers": 1
+            "job_workers": 1,
+            "abuse_limits": {
+              "enable": true,
+              "max_dynamic_clients": 1000,
+              "unused_client_ttl_secs": 86400,
+              "requests_per_second": 5,
+              "burst": 20
+            }
           }
         },
         "paths": {
@@ -151,6 +158,17 @@
           "minimum": 1,
           "description": "Number of daemon job-queue workers. Jobs for the same store never run\nconcurrently regardless of this setting; values greater than 1 enable\ncross-store parallelism. Default 1. Must be at least 1 —\n`validate_config` (`core/src/config/loader.rs`) rejects `0` at load\ntime, so the emitted JSON Schema declares the same floor\n(`minimum: 1`, not schemars' derived-from-`usize` `minimum: 0`)\nrather than accepting a value the loader will turn around and\nreject — same fix as `RateLimitConfig`'s `requests_per_second`/\n`burst` below.",
           "default": 1
+        },
+        "abuse_limits": {
+          "$ref": "#/$defs/v1_AbuseLimitsConfig",
+          "description": "Abuse limits on the daemon's public, unauthenticated auth routes\n(specs/05-surfaces.md §3.1): the dynamic-client-registration cap/TTL\nand the per-client-IP rate limit.",
+          "default": {
+            "enable": true,
+            "max_dynamic_clients": 1000,
+            "unused_client_ttl_secs": 86400,
+            "requests_per_second": 5,
+            "burst": 20
+          }
         }
       },
       "description": "HTTP server configuration."
@@ -174,6 +192,46 @@
         }
       ],
       "description": "`server.auth` values (specs/05-surfaces.md §3). Unknown values are\nrejected at parse time like any other invalid enum content, consistent\nwith the strict unknown-key policy (specs/03-config.md §5)."
+    },
+    "v1_AbuseLimitsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "description": "Master switch for every limit in this section. Loopback callers are\nalways exempt from the rate limit regardless of this setting (a local\ndaemon must never throttle its own user) — this switch only affects\nnon-loopback callers and the registration cap/TTL.",
+          "default": true
+        },
+        "max_dynamic_clients": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "description": "Maximum number of dynamically registered OAuth2 clients\n(`POST /register`, RFC 7591) kept at once. The built-in `localdb-cli`\nclient does not count toward this and is never pruned. Must be at\nleast 1 — `validate_config` rejects `0`.",
+          "default": 1000
+        },
+        "unused_client_ttl_secs": {
+          "type": "integer",
+          "format": "int64",
+          "description": "How long (seconds) a dynamically registered client may sit unused —\nno authorization code ever issued to it — before a later\nregistration attempt may prune it to make room under\n`max_dynamic_clients`. Must be at least 1 — `validate_config` rejects\n`0`.",
+          "minimum": 1,
+          "default": 86400
+        },
+        "requests_per_second": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "description": "Maximum sustained requests per second from a single client IP across\nthe limited routes above. Must be at least 1 — `validate_config`\nrejects `0`.",
+          "default": 5
+        },
+        "burst": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "description": "Maximum burst size above the sustained rate (token bucket capacity).\nMust be at least 1 — `validate_config` rejects `0`.",
+          "default": 20
+        }
+      },
+      "description": "Abuse limits for the daemon's public, unauthenticated auth routes\n(specs/05-surfaces.md §3.1): `/authorize`, `/join`, `/token`, `/revoke`,\n`/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`. The\n`/.well-known/*` discovery documents are never limited — they are static,\ncheap to serve, and a client needs them before it can even attempt any\nof the routes above.\n\nMirrors `HttpConfig`/`RateLimitConfig`'s naming for the outbound\nper-host limiter (`requests_per_second`/`burst`), since both are the\nsame token-bucket shape applied in the opposite direction (inbound here,\nkeyed on client IP instead of destination host)."
     },
     "v1_PathsConfig": {
       "type": "object",

@@ -637,8 +637,53 @@ atomically. CLI refresh and cache mutations use one cross-process lock per crede
 enforces per-request size caps on registration metadata — at most 5 `redirect_uris`, each at most
 2048 characters, and an optional `client_name` at most 256 characters (`core::auth::client`'s
 `MAX_REGISTRATION_*` constants) — rejected as `400 invalid_client_metadata`/`invalid_redirect_uri`
-(RFC 7591 §3.2.2). These bound a single request's payload, not registration frequency; a global
-registration-count cap or rate limit is a separate, not-yet-implemented concern.
+(RFC 7591 §3.2.2). These bound a single request's payload, not registration frequency.
+
+**Registration-count cap and pruning (`server.abuse_limits`, §3-config §1):** `oauth_clients` keeps
+at most `max_dynamic_clients` (default 1000) dynamically registered rows at once; the built-in
+`localdb-cli` client never counts toward this and is never pruned. Before inserting a newly
+validated registration, `AuthService::register_client` prunes every dynamically registered client
+that is older than `unused_client_ttl_secs` (default 24h, RFC 3339 `created_at`) **and** has never
+completed an authorization — "completed an authorization" is derived from the existing `auth_codes`
+table (a row naming the client as `client_id`), the earliest point in the OAuth2 flow this schema
+records client activity at, strictly before any token is ever minted from that code; no new column
+was needed. If the table is still at the cap after pruning, the registration is refused with `429`
+and an RFC 7591 §3.2.2-shaped body (`error: "temporarily_unavailable"` — RFC 7591 defines no code
+for "capacity reached"; this is RFC 6749 §4.1.2.1's closest-fitting registered code) plus a fixed
+`Retry-After: 3600`. The prune, the cap check, and the insert commit as one `store-libsql`
+transaction (`AuthStore::prune_and_create_oauth_client`), so concurrent registrations can never
+together exceed the cap; `FakeAuthStore` mirrors the same atomicity under its own write lock.
+Pruning commits even when the cap is still reached afterward and nothing is inserted.
+
+**Rate limiting the public auth routes (`server.abuse_limits`):** `/authorize`, `/join`, `/token`,
+`/revoke`, `/register`, `/v1/invites/redeem`, and `/v1/invites/requests/{id}/poll` share a
+per-client-IP token-bucket limiter (`governor`, the same crate `fetch::http::limiter` uses for
+outbound pacing, independently implemented here so `server` does not pick up `fetch`'s outgoing-HTTP
+machinery just for this) — default 5 requests/second sustained, burst 20, comfortably above the
+CLI's 1s invite-poll interval (`cli::cmds::login::poll_until_decided`) even with several logins
+sharing one IP behind NAT. The `/.well-known/*` discovery documents are never limited — they are
+static and a client needs them before it can attempt any of the routes above. The limiter key is the
+TCP peer address (`axum::extract::ConnectInfo<SocketAddr>`, wired via
+`into_make_service_with_connect_info`), never the `X-Forwarded-For`/`Forwarded` headers (untrusted
+without an explicitly configured, trusted reverse proxy, which this daemon does not yet model) — a
+request with no `ConnectInfo` available (a test harness driving a handler directly, bypassing the
+real TCP listener) is never limited, the same "nothing to key on, so don't limit" rule a Unix-socket
+transport would get if the daemon ever served `/v1` that way; today it does not — the discovery
+socket (`server::socket::SocketGuard`) is a liveness probe only, never an HTTP transport. Loopback
+peers are always exempt (a local daemon must never throttle its own user), regardless of
+`abuse_limits.enable`. **Behind a reverse proxy, every client shares the proxy's address** — until
+this daemon trusts a configured proxy, operators who front it with one should not rely on the per-IP
+limit to distinguish their users. Over the limit: `429` with `Retry-After` (seconds, from the
+limiter's own computed wait); `/token` and `/register` keep their existing OAuth-style
+`{"error", "error_description"}` body (`error: "slow_down"` for `/token` — RFC 8628 §3.5's
+device-flow "poll too fast" code, reused since RFC 6749 §5.2 has no token-endpoint code for
+throttling; `error: "temporarily_unavailable"` for `/register`, consistent with its cap-reached
+`429` above), every other limited route uses the daemon's standard `{"code", "message"}` error shape
+(`server::error::ErrorResponse`) with `code: "rate_limited"`. The CLI's invite-approval poll
+(`poll_until_decided`) treats a `429` as "sleep `Retry-After` and keep polling", not a failure. The
+limiter's keyed state is bounded: a periodic task calls governor's `retain_recent`/`shrink_to_fit`
+so memory does not grow without bound as more distinct source IPs are seen over a long-running
+daemon's lifetime.
 
 ### 3.1.1 Invites (T6, D9)
 

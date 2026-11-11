@@ -560,6 +560,38 @@ impl AuthStore for FakeAuthStore {
         Ok(inner.oauth_clients.iter().find(|c| c.id == id).cloned())
     }
 
+    async fn prune_and_create_oauth_client(
+        &self,
+        client: &OAuthClientRow,
+        builtin_client_id: &str,
+        unused_before: &str,
+        max_dynamic_clients: u64,
+    ) -> Result<RegisterClientOutcome, Error> {
+        let mut inner = self.inner.write().await;
+        // Held across both the prune and the cap check/insert below, the
+        // same atomicity a real transaction gives the libsql store.
+        let used_client_ids: std::collections::HashSet<String> = inner
+            .auth_codes
+            .iter()
+            .map(|c| c.client_id.clone())
+            .collect();
+        inner.oauth_clients.retain(|c| {
+            c.id == builtin_client_id
+                || used_client_ids.contains(&c.id)
+                || c.created_at.as_str() >= unused_before
+        });
+        let dynamic_count = inner
+            .oauth_clients
+            .iter()
+            .filter(|c| c.id != builtin_client_id)
+            .count() as u64;
+        if dynamic_count >= max_dynamic_clients {
+            return Ok(RegisterClientOutcome::CapReached);
+        }
+        inner.oauth_clients.push(client.clone());
+        Ok(RegisterClientOutcome::Created)
+    }
+
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
         inner

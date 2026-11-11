@@ -70,6 +70,70 @@ pub(crate) async fn make_app_with_mode_and_public_url(
     (dir, state, router)
 }
 
+/// Like `make_app_with_mode`, but with an explicit `server.abuse_limits` —
+/// the registration-cap/TTL and rate-limit tests
+/// (`server/tests/abuse_limits.rs`) need a tiny burst/cap to assert
+/// deterministically, rather than every other call site's generous
+/// defaults.
+pub(crate) async fn make_app_with_abuse_limits(
+    abuse_limits: localdb_core::config::schema::AbuseLimitsConfig,
+) -> (TempDir, AppState, Router) {
+    let dir = tempfile::tempdir().expect("tempdir is created for isolated server API test");
+    let queue = JobQueue::new();
+    let mut yaml_config = fake_yaml_config();
+    yaml_config.server.abuse_limits = abuse_limits;
+    let state = AppState::new(
+        yaml_config,
+        dir.path().to_path_buf(),
+        dir.path().join("models"),
+        queue.clone(),
+        UrlRefreshScheduler::new(queue),
+        AuthMode::Open,
+    )
+    .await
+    .expect("fake daemon state should open a temp libsql database");
+
+    let router = build_router(
+        state.clone(),
+        std::sync::Arc::new(server::mcp_bridge::AppStateStoreProvider::new(
+            state.clone(),
+        )),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+    (dir, state, router)
+}
+
+/// A request with an explicit `ConnectInfo<SocketAddr>` extension, standing
+/// in for what `into_make_service_with_connect_info` would set from a real
+/// TCP accept — `oneshot()`-driven tests never go through that, so the
+/// rate-limit middleware (`server::auth::rate_limit::limit_abuse`) sees no
+/// peer address at all unless a test sets one explicitly.
+pub(crate) async fn request_from(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    peer: std::net::SocketAddr,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let request_body = match body {
+        Some(value) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    let mut req = builder
+        .body(request_body)
+        .expect("test request should be constructible");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    app.oneshot(req)
+        .await
+        .expect("router should answer test request")
+}
+
 fn fake_yaml_config() -> RawConfig {
     RawConfig {
         defaults: DefaultsConfig {

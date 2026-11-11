@@ -25,7 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use localdb_core::auth::{
-    RegisterClientError, RegistrationError, SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
+    RegisterClientError, RegistrationError, RegistrationPolicy, SUPPORTED_GRANT_TYPES,
+    SUPPORTED_RESPONSE_TYPES,
 };
 
 use crate::state::AppState;
@@ -99,6 +100,43 @@ fn internal_register_error() -> Response {
         .into_response()
 }
 
+/// Seconds suggested in `Retry-After` when the registration cap
+/// (`RegistrationPolicy::max_dynamic_clients`) is still reached after
+/// pruning. Fixed, independent of `server.abuse_limits.unused_client_ttl_secs`
+/// (which defaults to a full day): the TTL answers "when does an unused
+/// registration become prunable", not "when is a slot likely to actually
+/// free up" — a cap held by clients that *are* in active use won't free up
+/// on any schedule this server can predict, so suggesting the TTL itself
+/// would tell a caller to wait a day for no better reason than this number
+/// being convenient to compute.
+const REGISTRATION_CAP_RETRY_AFTER_SECS: u64 = 3600;
+
+/// `429` (RFC 7591 has no error code for "capacity reached"; `temporarily_unavailable`
+/// is RFC 6749 §4.1.2.1's closest-fitting registered code, reused here the
+/// same way `oauth.rs` reuses OAuth2 codes for conditions the exact RFC
+/// section never anticipated) plus `Retry-After`.
+fn registration_cap_reached_error() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(RegisterErrorBody {
+            error: "temporarily_unavailable",
+            error_description: Some(
+                "the server is not accepting new client registrations right now; retry later"
+                    .to_string(),
+            ),
+        }),
+    )
+        .into_response();
+    if let Ok(value) =
+        axum::http::HeaderValue::from_str(&REGISTRATION_CAP_RETRY_AFTER_SECS.to_string())
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
+}
+
 fn default_grant_types() -> Vec<String> {
     SUPPORTED_GRANT_TYPES
         .iter()
@@ -142,14 +180,20 @@ fn registration_error_code(err: &RegistrationError) -> &'static str {
 /// (`registration_error_code`). Every rejection is RFC 7591 §3.2.2-shaped
 /// (`register_error`) rather than the shared `{"code":...,"message":...}`
 /// `ApiError` envelope used elsewhere.
+///
+/// Also enforces `server.abuse_limits`' registration cap and unused-client
+/// TTL (`AuthService::register_client`'s `policy` argument) — see
+/// [`registration_cap_reached_error`] for the `429` this produces once the
+/// cap is still reached after pruning.
 pub async fn post_register(
     State(state): State<AppState>,
     Json(req): Json<RegisterClientRequest>,
 ) -> Response {
-    // `AuthService::register_client`'s bounds are per-request payload-size
-    // caps, not a rate limiter — a global registration-count cap / throttle
-    // on POST /register (this route is public/unauthenticated) is a
-    // separate, out-of-scope concern.
+    let limits = &state.yaml_config().server.abuse_limits;
+    let policy = RegistrationPolicy {
+        max_dynamic_clients: limits.max_dynamic_clients,
+        unused_client_ttl_secs: limits.unused_client_ttl_secs,
+    };
     let row = match state
         .auth()
         .register_client(
@@ -158,6 +202,7 @@ pub async fn post_register(
             req.token_endpoint_auth_method.as_deref(),
             req.grant_types.as_deref(),
             req.response_types.as_deref(),
+            &policy,
         )
         .await
     {
@@ -177,6 +222,7 @@ pub async fn post_register(
         Err(RegisterClientError::Store(e)) => {
             return register_error("invalid_client_metadata", e.to_string())
         }
+        Err(RegisterClientError::CapReached) => return registration_cap_reached_error(),
     };
 
     let grant_types = req.grant_types.unwrap_or_else(default_grant_types);

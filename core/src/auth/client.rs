@@ -104,11 +104,10 @@ pub const SUPPORTED_RESPONSE_TYPES: &[&str] = &["code"];
 /// DCR bound policy (specs/05-surfaces.md §3.1's DCR note): a public,
 /// unauthenticated `POST /register` must not let a single request
 /// grow `oauth_clients` metadata without limit. These are minimal,
-/// proportionate per-request caps, not a rate limiter — they bound how much
-/// a single registration can store, not how often a caller may register.
-/// A global registration-count cap / rate limit is a separate, out-of-scope
-/// concern (tracked as a `// TODO` at the call site in
-/// `server/src/auth/register.rs`).
+/// proportionate per-request caps — they bound how much a single
+/// registration can store, not how often a caller may register. The
+/// how-often concern is [`RegistrationPolicy`], enforced by
+/// `AuthService::register_client` via `AuthStore::prune_and_create_oauth_client`.
 ///
 /// At most this many `redirect_uris` entries per registration.
 pub const MAX_REGISTRATION_REDIRECT_URIS: usize = 5;
@@ -134,6 +133,26 @@ pub fn registration_client_name_within_bounds(client_name: Option<&str>) -> bool
     client_name
         .map(|name| name.len() <= MAX_REGISTRATION_CLIENT_NAME_LEN)
         .unwrap_or(true)
+}
+
+/// How-often abuse-limit policy for `POST /register` (specs/05-surfaces.md
+/// §3.1), applied by `AuthService::register_client` before any row is
+/// persisted. Distinct from the per-request `MAX_REGISTRATION_*` caps
+/// above: those bound a single request's payload size; this bounds how many
+/// dynamically registered clients may accumulate over time. Sourced from
+/// `server.abuse_limits` config (`core::config::schema::AbuseLimitsConfig`);
+/// kept as a plain struct here rather than importing that type, so `core`
+/// stays free of any dependency direction on `server`'s config module.
+#[derive(Debug, Clone, Copy)]
+pub struct RegistrationPolicy {
+    /// Maximum number of dynamically registered clients kept at once. The
+    /// built-in [`LOCALDB_CLI_CLIENT_ID`] client never counts toward this
+    /// and is never pruned.
+    pub max_dynamic_clients: u64,
+    /// How long a dynamically registered client may sit unused — no
+    /// authorization code ever issued to it — before it becomes eligible
+    /// for pruning at the next registration attempt.
+    pub unused_client_ttl_secs: i64,
 }
 
 /// A `POST /register` request that fails this server's DCR validation policy

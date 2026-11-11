@@ -555,3 +555,128 @@ async fn collect_access_request_refuses_a_credential_minted_by_a_compromised_fam
     );
     assert!(store.find_token("t1").await.unwrap().is_none());
 }
+
+// -----------------------------------------------------------------
+// `prune_and_create_oauth_client` (specs/05-surfaces.md §3.1): the
+// `FakeAuthStore` counterpart to `store-libsql`'s atomic prune-then-insert
+// tests — same behavior, verified against the in-memory implementation.
+// -----------------------------------------------------------------
+
+use crate::auth::client::LOCALDB_CLI_CLIENT_ID;
+
+const OLD_CREATED_AT: &str = "2000-01-01T00:00:00Z";
+const CUTOFF_AFTER_OLD: &str = "2010-01-01T00:00:00Z";
+const CUTOFF_BEFORE_OLD: &str = "1990-01-01T00:00:00Z";
+
+fn oauth_client(id: &str, created_at: &str) -> OAuthClientRow {
+    OAuthClientRow {
+        id: id.to_string(),
+        client_name: Some("Test Client".to_string()),
+        redirect_uris: vec!["https://app.example.com/cb".to_string()],
+        created_at: created_at.to_string(),
+    }
+}
+
+fn auth_code_for(client_id: &str) -> AuthCodeRow {
+    AuthCodeRow {
+        id: format!("code-for-{client_id}"),
+        client_id: client_id.to_string(),
+        user_id: "user-1".to_string(),
+        code_hash: format!("hash-{client_id}"),
+        code_challenge: "challenge".to_string(),
+        code_challenge_method: "S256".to_string(),
+        redirect_uri: "https://app.example.com/cb".to_string(),
+        expires_at: "2099-01-01T00:00:00Z".to_string(),
+        consumed_at: None,
+        created_at: OLD_CREATED_AT.to_string(),
+        minted_by_family: None,
+    }
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_inserts_when_under_cap() {
+    let store = FakeAuthStore::new();
+    let client = oauth_client("new-client", "2026-07-08T00:00:00Z");
+
+    let outcome = store
+        .prune_and_create_oauth_client(&client, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 5)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(store
+        .find_oauth_client("new-client")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_refuses_when_cap_reached_by_used_clients() {
+    let store = FakeAuthStore::new();
+    for id in ["used-1", "used-2"] {
+        store
+            .create_oauth_client(&oauth_client(id, OLD_CREATED_AT))
+            .await
+            .unwrap();
+        store.create_auth_code(&auth_code_for(id)).await.unwrap();
+    }
+
+    let candidate = oauth_client("candidate", "2026-07-08T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::CapReached);
+    assert!(store.find_oauth_client("used-1").await.unwrap().is_some());
+    assert!(store.find_oauth_client("used-2").await.unwrap().is_some());
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_prunes_unused_old_clients_then_succeeds() {
+    let store = FakeAuthStore::new();
+    for id in ["stale-1", "stale-2"] {
+        store
+            .create_oauth_client(&oauth_client(id, OLD_CREATED_AT))
+            .await
+            .unwrap();
+    }
+
+    let candidate = oauth_client("fresh", "2026-07-08T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(store.find_oauth_client("stale-1").await.unwrap().is_none());
+    assert!(store.find_oauth_client("stale-2").await.unwrap().is_none());
+    assert!(store.find_oauth_client("fresh").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_never_prunes_the_builtin_client() {
+    let store = FakeAuthStore::new();
+    store
+        .create_oauth_client(&oauth_client(LOCALDB_CLI_CLIENT_ID, "1970-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let client = oauth_client("new-client", "2026-07-08T00:00:00Z");
+
+    store
+        .prune_and_create_oauth_client(&client, LOCALDB_CLI_CLIENT_ID, "2099-01-01T00:00:00Z", 5)
+        .await
+        .unwrap();
+
+    assert!(store
+        .find_oauth_client(LOCALDB_CLI_CLIENT_ID)
+        .await
+        .unwrap()
+        .is_some());
+}

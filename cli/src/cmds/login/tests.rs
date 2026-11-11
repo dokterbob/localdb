@@ -1,4 +1,5 @@
 use super::*;
+use axum::response::IntoResponse;
 use localdb_core::auth::{AccessRequestState, AuthStore as _, Role};
 use localdb_core::config::schema::{
     DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, RawConfig,
@@ -708,6 +709,72 @@ async fn poll_until_decided_sends_the_secret_in_the_json_body_not_the_url() {
 
     let json_body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json_body["secret"], "ldb_topsecret");
+
+    server.abort();
+}
+
+/// A `429` from the daemon's per-IP rate limiter (specs/05-surfaces.md
+/// §3.1) must not end the poll loop as a failure — `poll_until_decided`
+/// sleeps the given `Retry-After` and keeps polling, so a login that
+/// happens to collide with another concurrent login sharing the same IP
+/// still completes.
+#[tokio::test]
+async fn poll_until_decided_survives_a_429_and_keeps_polling() {
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1/invites/requests/{id}/poll",
+        axum::routing::post(move |_body: axum::body::Bytes| {
+            let call_count = call_count_clone.clone();
+            async move {
+                let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "0")],
+                        axum::Json(serde_json::json!({
+                            "code": "rate_limited",
+                            "message": "too many requests"
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(serde_json::json!({ "state": "approved", "api_key": "ldb_minted" }))
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        poll_until_decided(
+            &reqwest::Client::new(),
+            &base,
+            "req-id",
+            "ldb_topsecret",
+            std::time::Duration::from_millis(1),
+        ),
+    )
+    .await
+    .expect("poll must terminate");
+
+    assert_eq!(
+        result.unwrap(),
+        "ldb_minted",
+        "the loop must survive the 429 and collect the key on the next poll"
+    );
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly one 429 then one success"
+    );
 
     server.abort();
 }

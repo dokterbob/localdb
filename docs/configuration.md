@@ -71,6 +71,12 @@ server:
   bind: 127.0.0.1 # loopback only; set to 0.0.0.0 to listen on all interfaces
   port: 7700 # set to 0 to let the OS assign an ephemeral port
   job_workers: 1 # daemon job-queue workers; jobs for the same store never run concurrently
+  # abuse_limits:   # limits on the public, unauthenticated auth routes (see below)
+  #   enable: true                  # loopback callers are always exempt from the rate limit
+  #   max_dynamic_clients: 1000     # POST /register cap; the built-in localdb-cli client is exempt
+  #   unused_client_ttl_secs: 86400 # how long an unused registration may sit before it's prunable
+  #   requests_per_second: 5        # per-client-IP token bucket across the public auth routes
+  #   burst: 20
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:
@@ -165,6 +171,12 @@ server:
   bind: 127.0.0.1 # interface to listen on (default: 127.0.0.1)
   port: 7700 # port (default: 7700)
   job_workers: 1 # daemon job-queue workers (default: 1)
+  abuse_limits:
+    enable: true # master switch for every limit in this section (default: true)
+    max_dynamic_clients: 1000 # POST /register cap (default: 1000)
+    unused_client_ttl_secs: 86400 # unused-registration prune threshold, seconds (default: 24h)
+    requests_per_second: 5 # per-client-IP token bucket (default: 5)
+    burst: 20 # token-bucket burst capacity (default: 20)
 ```
 
 | Field         | Default     | Notes                                                                                                                                                 |
@@ -176,6 +188,27 @@ server:
 > **Experimental:** the HTTP daemon is an early preview. It opens the same unified database
 > (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible, and `POST /v1/jobs` runs
 > real ingestion through an async job queue. See [Daemon limitations](#daemon-limitations).
+
+#### `server.abuse_limits`
+
+Limits on the daemon's public, unauthenticated auth routes (`/authorize`, `/join`, `/token`,
+`/revoke`, `/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`) — the
+`/.well-known/*` discovery documents are never limited.
+
+| Field                    | Default | Notes                                                                                                             |
+| ------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| `enable`                 | `true`  | Master switch for this whole section. Loopback callers are always exempt from the rate limit regardless.          |
+| `max_dynamic_clients`    | `1000`  | Cap on dynamically registered OAuth2 clients (`POST /register`). The built-in `localdb-cli` client never counts.  |
+| `unused_client_ttl_secs` | `86400` | How long an unused registration (no authorization ever completed) may sit before it becomes eligible for pruning. |
+| `requests_per_second`    | `5`     | Per-client-IP sustained request rate across the limited routes (integer; must be `>= 1`)                          |
+| `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                    |
+
+Over the limit: `429` with `Retry-After`. `/token` and `/register` keep their existing OAuth-style
+error body; every other limited route uses the daemon's standard `{"code", "message"}` shape. The
+rate limiter keys on the real TCP peer address, never `X-Forwarded-For`/`Forwarded` — behind a
+reverse proxy every client shares the proxy's address. See
+[specs/05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication)
+for the full behavior.
 
 ---
 

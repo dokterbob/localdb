@@ -105,6 +105,12 @@ pub struct ServerConfig {
     #[schemars(range(min = 1))]
     #[serde(default = "default_job_workers")]
     pub job_workers: usize,
+
+    /// Abuse limits on the daemon's public, unauthenticated auth routes
+    /// (specs/05-surfaces.md §3.1): the dynamic-client-registration cap/TTL
+    /// and the per-client-IP rate limit.
+    #[serde(default)]
+    pub abuse_limits: AbuseLimitsConfig,
 }
 
 impl Default for ServerConfig {
@@ -115,8 +121,96 @@ impl Default for ServerConfig {
             auth: ServerAuthMode::default(),
             public_url: None,
             job_workers: default_job_workers(),
+            abuse_limits: AbuseLimitsConfig::default(),
         }
     }
+}
+
+/// Abuse limits for the daemon's public, unauthenticated auth routes
+/// (specs/05-surfaces.md §3.1): `/authorize`, `/join`, `/token`, `/revoke`,
+/// `/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`. The
+/// `/.well-known/*` discovery documents are never limited — they are static,
+/// cheap to serve, and a client needs them before it can even attempt any
+/// of the routes above.
+///
+/// Mirrors `HttpConfig`/`RateLimitConfig`'s naming for the outbound
+/// per-host limiter (`requests_per_second`/`burst`), since both are the
+/// same token-bucket shape applied in the opposite direction (inbound here,
+/// keyed on client IP instead of destination host).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AbuseLimitsConfig {
+    /// Master switch for every limit in this section. Loopback callers are
+    /// always exempt from the rate limit regardless of this setting (a local
+    /// daemon must never throttle its own user) — this switch only affects
+    /// non-loopback callers and the registration cap/TTL.
+    #[serde(default = "default_abuse_limits_enable")]
+    pub enable: bool,
+
+    /// Maximum number of dynamically registered OAuth2 clients
+    /// (`POST /register`, RFC 7591) kept at once. The built-in `localdb-cli`
+    /// client does not count toward this and is never pruned. Must be at
+    /// least 1 — `validate_config` rejects `0`.
+    #[schemars(range(min = 1))]
+    #[serde(default = "default_max_dynamic_clients")]
+    pub max_dynamic_clients: u64,
+
+    /// How long (seconds) a dynamically registered client may sit unused —
+    /// no authorization code ever issued to it — before a later
+    /// registration attempt may prune it to make room under
+    /// `max_dynamic_clients`. Must be at least 1 — `validate_config` rejects
+    /// `0`.
+    #[schemars(range(min = 1))]
+    #[serde(default = "default_unused_client_ttl_secs")]
+    pub unused_client_ttl_secs: i64,
+
+    /// Maximum sustained requests per second from a single client IP across
+    /// the limited routes above. Must be at least 1 — `validate_config`
+    /// rejects `0`.
+    #[schemars(range(min = 1))]
+    #[serde(default = "default_abuse_requests_per_second")]
+    pub requests_per_second: u32,
+
+    /// Maximum burst size above the sustained rate (token bucket capacity).
+    /// Must be at least 1 — `validate_config` rejects `0`.
+    #[schemars(range(min = 1))]
+    #[serde(default = "default_abuse_burst")]
+    pub burst: u32,
+}
+
+impl Default for AbuseLimitsConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_abuse_limits_enable(),
+            max_dynamic_clients: default_max_dynamic_clients(),
+            unused_client_ttl_secs: default_unused_client_ttl_secs(),
+            requests_per_second: default_abuse_requests_per_second(),
+            burst: default_abuse_burst(),
+        }
+    }
+}
+
+fn default_abuse_limits_enable() -> bool {
+    true
+}
+
+fn default_max_dynamic_clients() -> u64 {
+    1000
+}
+
+fn default_unused_client_ttl_secs() -> i64 {
+    24 * 60 * 60
+}
+
+/// 5 req/s sustained comfortably clears the CLI invite-approval poll's 1s
+/// interval (`cli::cmds::login::poll_until_decided`) with headroom for
+/// several concurrent logins sharing one IP (e.g. behind NAT).
+fn default_abuse_requests_per_second() -> u32 {
+    5
+}
+
+fn default_abuse_burst() -> u32 {
+    20
 }
 
 /// `server.auth` values (specs/05-surfaces.md §3). Unknown values are

@@ -276,7 +276,10 @@ client created via `/register` is matched by **exact** redirect_uri only — no 
 leniency — and its `redirect_uris` must each be either an `https://` URL or a loopback `http://` URL
 (custom URI schemes such as `myapp://callback` are rejected; see
 `core::auth::validate_registration_redirect_uri`'s doc comment for the rationale). Public clients
-only — DCR never mints a `client_secret`.
+only — DCR never mints a `client_secret`. `POST /register` is also bounded over time, not just per
+request: a global cap on dynamically registered clients (default 1000, `server.abuse_limits`), with
+unused/expired registrations pruned to make room before the cap is enforced, and a per-client-IP
+rate limit shared with every other public auth route (specs/05-surfaces.md §3.1).
 
 **Authorization (D7).** Every user has a role, `admin` or `member`. Admins see and manage every
 store; members see/search only `shared`-visibility stores they hold an explicit grant for

@@ -10,6 +10,7 @@ pub mod base_url;
 pub mod join;
 pub mod middleware;
 pub mod oauth;
+pub mod rate_limit;
 pub mod register;
 
 use axum::response::Html;

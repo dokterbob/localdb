@@ -44,6 +44,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+# Per-client-IP rate limiting on the public auth routes
+# (`server::auth::rate_limit`, specs/05-surfaces.md §3.1): already a
+# workspace dependency of `fetch` (outbound per-host pacing); this adds no
+# new crate to the dependency graph, only a new direct user of it.
+governor = { workspace = true }
 
 # File system notification (debounced file watching)
 # Use notify v6 since notify-debouncer-mini 0.4 depends on notify 6
