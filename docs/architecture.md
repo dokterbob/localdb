@@ -546,12 +546,17 @@ it). In proxied mode the scope is enforced per request, on the `stores`/`store` 
 because `rmcp`'s Streamable HTTP service factory is synchronous and has no access to the request —
 so there is no transport-level channel for a per-connection scope (same root cause as gap 6 above).
 
-The residual gap is containment, not enforcement: the daemon's `/mcp` route is loopback and
-**unauthenticated**, so any process that can open a socket can bypass `localdb mcp` and talk to it
-unscoped. This stops an agent reading another project's docs by accident; it does not contain a
-hostile one. Closing it needs daemon-side auth, which v1 does not have. Embedded mode has no such
-endpoint, so there the scope is as strong as the process boundary. See
-[docs/mcp.md](mcp.md#store-scoping) and
+`--store` is scoping, not a security boundary: a caller that reaches `/mcp` directly sees every
+store its own credential is authorized for, regardless of what any `localdb mcp --store` proxy in
+front of it narrowed. Real containment is the daemon's own authorization (§3.1): once `server.auth`
+enforces (any non-loopback bind under `auto`, or `required`), reaching `/mcp` directly still
+requires a valid bearer token, and the tool results it returns are filtered to that principal's
+store access — admins see every store, members only the `shared` stores they hold a `StoreGrant`
+for. On a loopback bind under the default `auto`, `/mcp` is unauthenticated by design, the same
+trust boundary as every other daemonless command — so on that bind, any local process can still open
+the socket and bypass `localdb mcp --store`'s narrowing, the same way it could open the on-disk
+database directly. Embedded mode has no such endpoint, so there the scope is as strong as the
+process boundary. See [docs/mcp.md](mcp.md#store-scoping) and
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2.1.
 
 **8. `extractor_version` is dead code; PDF reindex relies on the content hash.** The

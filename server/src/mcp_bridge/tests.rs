@@ -34,10 +34,9 @@ async fn build_available_stores_succeeds_even_when_embedder_provider_unavailable
     // features in from `cli`'s unconditional/macOS-gated dependency
     // edges, so `local` can silently succeed here too).
     //
-    // Construction is lazy now, so this succeeds unconditionally —
-    // the failure only surfaces on the first `embed_documents` call,
-    // asserted below with the mapped error (not a hard-coded
-    // `ModelMissing`, the Codex-flagged bug this test now pins).
+    // Construction is lazy, so this succeeds unconditionally — the
+    // failure only surfaces on the first `embed_documents` call, asserted
+    // below with the mapped error, not a hard-coded `ModelMissing`.
     let mut yaml_config = RawConfig::default();
     yaml_config.defaults.indexing.embedding = EmbeddingPolicy {
         provider: "perplexity".to_string(),

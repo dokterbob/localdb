@@ -24,7 +24,7 @@ fn canonicalize_accepts_in_scope_name_and_returns_its_id() {
 
 #[test]
 fn canonicalize_accepts_in_scope_id_verbatim() {
-    // #144's citation round-trip passes `store.id`, not the name.
+    // A citation's round trip passes `store.id`, not the name.
     let scope = test_scope(
         &[("id-books", "books"), ("id-hydra", "hydra")],
         &["id-books"],

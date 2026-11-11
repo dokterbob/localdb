@@ -382,7 +382,7 @@ fn index_job_serializes_roundtrip() {
 
 #[test]
 fn index_job_error_code_defaults_to_none_when_absent_from_json() {
-    // A daemon predating this field (issue #187 review) emits `IndexJob`
+    // A daemon predating this field emits `IndexJob`
     // JSON with no `error_code` key at all — `#[serde(default)]` must
     // still deserialize it, not fail the whole response.
     let json = r#"{

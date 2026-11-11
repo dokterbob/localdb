@@ -8,7 +8,7 @@
 //! fn — tool validation and retrieval live in `tools`, with document-registry
 //! access restricted to the resolved visible stores.
 //!
-//! ## Principal resolution (specs/05-surfaces.md §4, T3)
+//! ## Principal resolution (specs/05-surfaces.md §4)
 //!
 //! On the HTTP transport, rmcp's `StreamableHttpService` injects the
 //! request's remaining `http::request::Parts` into the tool call's
@@ -25,10 +25,10 @@
 //!   `Principal` is an authentication error (fail closed) — never full
 //!   access.
 //!
-//! T5: admins (and `local_trust`) see every store; `member` principals are
-//! no longer rejected wholesale — instead the resolved store list is
-//! filtered per call to just the `shared` stores they hold a grant for
-//! (D7, D12), via `Principal::can_read_store`.
+//! Admins (and `local_trust`) see every store; `member` principals see only
+//! the `shared` stores they hold a `StoreGrant` for — the resolved store
+//! list is filtered per call via `Principal::can_read_store`, never gated
+//! wholesale by role.
 //!
 //! specs/05-surfaces.md §3.1: a store name a tool call explicitly asks for
 //! (`search`'s `stores` filter) that exists but was filtered out by D7 is a

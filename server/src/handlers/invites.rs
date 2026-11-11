@@ -1,4 +1,4 @@
-//! Invite management (T6, specs/05-surfaces.md §3.1, §2's `invite`
+//! Invite management (specs/05-surfaces.md §3.1, §2's `invite`
 //! CLI counterpart in `cli/src/cmds/invite.rs`).
 //!
 //! Admin-only management routes (`GET/POST /v1/invites`, `DELETE
@@ -8,7 +8,7 @@
 //! public redeem/poll routes (`redeem_invite`, `poll_request` — `POST
 //! /v1/invites/redeem`, `POST /v1/invites/requests/{id}/poll`) are in the
 //! second half, deliberately public — they *are* the join flow, mirroring
-//! how `/authorize`/`/token` are public for the OAuth2 flow (T4) — and are
+//! how `/authorize`/`/token` are public for the OAuth2 flow — and are
 //! mounted on the unlayered `public` router instead.
 //!
 //! HTTP shape only (specs/01-architecture.md §1): the invite/access-request
@@ -170,15 +170,15 @@ pub async fn create_invite(
     let mode = parse_invite_mode(&req.mode)?;
 
     // Resolve the consent URL's base *before* creating the invite (the same
-    // way discovery/T7 does — `server::auth::base_url::resolve_base_url`):
+    // way discovery does — `server::auth::base_url::resolve_base_url`):
     // prefer the operator-configured `server.public_url` (correct behind a
     // TLS-terminating reverse proxy), falling back to the request's own
-    // sanitized `Host` header only when no `public_url` is configured.
-    // Building this from a hard-coded `http://` + raw `Host` header (as
-    // before) ignored `public_url` entirely and could downgrade/break the
-    // show-once invite link (finding #9). Failing this check up front —
-    // rather than after `create_invite` below — avoids minting a usable
-    // invite the caller then can't learn the token for.
+    // sanitized `Host` header only when no `public_url` is configured. A
+    // hard-coded `http://` + raw `Host` header would ignore `public_url`
+    // entirely and could downgrade/break the show-once invite link. Failing
+    // this check up front — rather than after `create_invite` below —
+    // avoids minting a usable invite the caller then can't learn the token
+    // for.
     let host_header = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     let base = resolve_base_url(state.public_url(), host_header).ok_or_else(|| {
         ApiError(CoreError::InvalidRequest {
@@ -326,7 +326,7 @@ pub async fn deny_request(
 
 // ---------------------------------------------------------------------------
 // Public routes (specs/05-surfaces.md §3.1): the invite-redemption/status
-// surface, mounted outside the `require_auth` layer alongside the T4 OAuth
+// surface, mounted outside the `require_auth` layer alongside the OAuth
 // routes — see `daemon::build_router`.
 // ---------------------------------------------------------------------------
 

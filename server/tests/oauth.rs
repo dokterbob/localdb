@@ -1,4 +1,4 @@
-//! Integration tests for the T4 OAuth2 authorization-code + PKCE surface
+//! Integration tests for the OAuth2 authorization-code + PKCE surface
 //! (`GET/POST /authorize`, `POST /token`, `POST /revoke`) via
 //! `tower::ServiceExt::oneshot` against the full `build_router` router — the
 //! same router the daemon serves, auth layer included.
@@ -493,14 +493,13 @@ async fn setup_code_is_retired_after_authenticated_request() {
     );
 }
 
-/// Finding #5 regression: a first user created without `--admin` (a plain
-/// `Role::Member`) must not block the setup-code bootstrap. Before the fix,
-/// `generate_setup_code_if_needed` suppressed the code whenever
-/// `count_users() > 0` (member included), and `resolve_credential`'s
-/// defense-in-depth re-check made the same mistake — so even if a code had
-/// been minted, redeeming it against a member-only instance would fail with
-/// "an admin account already exists". Both must now key off admin
-/// existence, not mere user existence.
+/// A first user created without `--admin` (a plain `Role::Member`) must not
+/// block the setup-code bootstrap. `generate_setup_code_if_needed` and
+/// `resolve_credential`'s defense-in-depth re-check must both key off admin
+/// existence, not mere user existence — keying off `count_users() > 0`
+/// instead would suppress the code once any member exists, and even if a
+/// code had been minted, redeeming it against a member-only instance would
+/// then fail with "an admin account already exists".
 #[tokio::test]
 async fn setup_code_still_bootstraps_first_admin_when_only_members_exist() {
     let (_dir, state, app) = make_enforced_app().await;

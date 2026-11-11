@@ -1,4 +1,4 @@
-//! Persistence for OAuth2 authorization codes (`auth_codes` table, T4).
+//! Persistence for OAuth2 authorization codes (`auth_codes` table).
 //!
 //! Mirrors `tokens.rs`'s conventions: parameter binding, error mapping, and
 //! row decoding via `sql::row_to_auth_code`.

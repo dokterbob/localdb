@@ -165,7 +165,7 @@ fn write_file_removes_temp_file_when_rename_fails() {
 }
 
 // -----------------------------------------------------------------
-// T4: writer, login-token shape, atomicity, permissions
+// Writer, login-token shape, atomicity, permissions
 // -----------------------------------------------------------------
 
 #[test]
@@ -334,7 +334,7 @@ fn remove_entry_missing_returns_false() {
 
 #[test]
 fn legacy_secret_only_file_still_reads_via_lookup_entry() {
-    // Backward compatibility: an entry with only `secret` (pre-T4 shape,
+    // Backward compatibility: an entry with only `secret` (the legacy shape,
     // or an API key a human pasted in by hand) must still round-trip
     // through the richer `CredentialEntry` struct.
     let dir = TempDir::new().unwrap();

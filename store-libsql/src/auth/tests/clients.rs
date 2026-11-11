@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------
-// OAuth2 dynamic client registration (T7)
+// OAuth2 dynamic client registration
 // ---------------------------------------------------------------------
 
 fn make_oauth_client(id: &str, redirect_uris: &[&str]) -> localdb_core::auth::OAuthClientRow {

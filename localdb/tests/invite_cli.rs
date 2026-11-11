@@ -1,4 +1,4 @@
-//! T6 integration tests for the `localdb` binary's `invite` subcommands:
+//! Integration tests for the `localdb` binary's `invite` subcommands:
 //! daemon-routed requests against a mock daemon (method/path/bearer header
 //! assertions) and the direct-DB tmpdir fallback (embedded mode, no
 //! daemon) — mirrors `auth_cli.rs`'s style for `user`/`key`/`store grant`.

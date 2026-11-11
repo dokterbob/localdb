@@ -32,7 +32,7 @@ pub(crate) async fn make_app_with_mode(mode: AuthMode) -> (TempDir, AppState, Ro
 }
 
 /// Like `make_app_with_mode`, but with an explicit `server.public_url`
-/// (T7 discovery base-URL resolution — `server::auth::base_url`).
+/// (discovery base-URL resolution — `server::auth::base_url`).
 pub(crate) async fn make_app_with_mode_and_public_url(
     mode: AuthMode,
     public_url: Option<&str>,

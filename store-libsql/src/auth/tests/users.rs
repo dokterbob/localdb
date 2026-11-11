@@ -101,7 +101,7 @@ async fn count_users_tracks_inserts_and_deletes() {
 }
 
 // ---------------------------------------------------------------------
-// T5/finding #5: atomic last-admin guard
+// Atomic last-admin guard
 // ---------------------------------------------------------------------
 
 #[tokio::test]

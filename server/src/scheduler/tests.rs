@@ -166,7 +166,7 @@ async fn tick_twice_only_submits_once_when_not_due_yet() {
 
 /// Without `attach_state`, `tick()` still submits and the job still
 /// reaches a terminal state — but honestly: `Failed`, with a clear
-/// error, never a fabricated `Done` with zero stats (issue #187 §1).
+/// error, never a fabricated `Done` with zero stats.
 #[tokio::test]
 async fn submitted_job_without_attached_state_fails_honestly() {
     let queue = JobQueue::new();
@@ -210,7 +210,7 @@ async fn submitted_job_without_attached_state_fails_honestly() {
     }
 }
 
-/// #187 review F1: `tick()` submits the job, but must not stamp
+/// `tick()` submits the job, but must not stamp
 /// `last_refreshed` until the job actually reaches a terminal state.
 /// Uses the same deterministic fast-failure path as
 /// `submitted_job_without_attached_state_fails_honestly` above — no
@@ -339,7 +339,7 @@ async fn tick_skips_sources_with_an_unstamped_inflight_refresh() {
     );
 }
 
-/// #187 review F1: a failed job must still be stamped with
+/// A failed job must still be stamped with
 /// `last_refreshed`, so it waits out a full interval before being
 /// retried rather than tight-looping.
 #[tokio::test]
@@ -491,10 +491,9 @@ async fn cancelled_refresh_job_is_not_resubmitted_on_the_immediately_following_t
     );
 }
 
-/// The real regression test for #187 §1 on the scheduler path: with a
-/// real `AppState` attached (real store, real path source with content,
-/// fake embedder), `tick()` on a due source must produce genuine,
-/// nonzero stats — not the old stub's `IndexJobStats::default()`.
+/// With a real `AppState` attached (real store, real path source with
+/// content, fake embedder), `tick()` on a due source must produce genuine,
+/// nonzero stats on the scheduler path, not `IndexJobStats::default()`.
 #[tokio::test]
 async fn tick_with_attached_state_runs_real_ingestion_and_produces_nonzero_stats() {
     let content_dir = tempfile::tempdir().unwrap();
@@ -573,12 +572,11 @@ async fn tick_with_attached_state_runs_real_ingestion_and_produces_nonzero_stats
                     "expected nonzero chunks_written, got {:?}",
                     job.stats
                 );
-                // #187 review F1: `last_refreshed` must be recorded
-                // once the job actually completes, not back when it was
-                // merely submitted. The stamp itself lands on a
-                // separate task, so poll
-                // for it rather than asserting it's already visible the
-                // instant this loop observes `Done`.
+                // `last_refreshed` must be recorded once the job actually
+                // completes, not back when it was merely submitted. The
+                // stamp itself lands on a separate task, so poll for it
+                // rather than asserting it's already visible the instant
+                // this loop observes `Done`.
                 wait_for_last_refreshed_stamp(&scheduler, &source.id).await;
                 break;
             }
@@ -586,16 +584,16 @@ async fn tick_with_attached_state_runs_real_ingestion_and_produces_nonzero_stats
     }
 }
 
-/// Codex review finding G1 (issue #187): the scheduler's refresh closure
-/// used to call `state.get_or_build_embedder` unconditionally before
-/// `run_job` ran. For `IndexJobScope::Source`, an unresolvable source
-/// (e.g. deleted since it was registered for refresh) makes
-/// `resolve_job_sources` return `Err(SourceNotFound)` rather than an
-/// empty list — but under the old ordering that error surfaced only
-/// *after* an embedder had already been built and thrown away. Registers
-/// a refresh record for a source id that was never actually added to the
-/// store, ticks, and asserts the job fails with that source unresolved
-/// while the daemon's embedder cache is never built.
+/// The scheduler's refresh closure must not call
+/// `state.get_or_build_embedder` before `run_job` runs. For
+/// `IndexJobScope::Source`, an unresolvable source (e.g. deleted since it
+/// was registered for refresh) makes `resolve_job_sources` return
+/// `Err(SourceNotFound)` rather than an empty list, and that check has to
+/// happen before any embedder is built, or an embedder gets built and
+/// thrown away for nothing. Registers a refresh record for a source id
+/// that was never actually added to the store, ticks, and asserts the job
+/// fails with that source unresolved while the daemon's embedder cache is
+/// never built.
 #[tokio::test]
 async fn tick_with_unresolvable_source_never_builds_embedder() {
     let queue = JobQueue::new();

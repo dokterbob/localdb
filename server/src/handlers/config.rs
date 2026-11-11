@@ -28,9 +28,8 @@ pub struct EffectiveStoreView {
 /// content in this phase, not of server configuration.
 ///
 /// `yaml_config` reflects **startup state**: the config file is read once
-/// when the daemon starts and never reloaded (specs/03-config.md §5 — the
-/// hot-reload watcher was removed in T3). Edits to the file take effect on
-/// the next daemon restart.
+/// when the daemon starts and never reloaded (specs/03-config.md §5).
+/// Edits to the file take effect on the next daemon restart.
 pub async fn get_config(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,

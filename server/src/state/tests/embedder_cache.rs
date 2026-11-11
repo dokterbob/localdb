@@ -56,11 +56,10 @@ async fn get_or_build_embedder_rebuilds_on_policy_change() {
     );
 }
 
-/// After `reload_yaml_config` swaps in a config with a different
-/// embedding policy, the next `get_or_build_embedder` call (using the
-/// freshly reloaded snapshot, as every real call site does via
-/// `state.yaml_config()`) must rebuild exactly once — no explicit cache
-/// flush needed, since the policy comparison itself misses.
+/// Given a config whose embedding policy differs from the one the cache was
+/// built from, the next `get_or_build_embedder` call must rebuild exactly
+/// once — no explicit cache flush needed, since the policy comparison
+/// itself misses.
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_once_after_config_reload() {
     let (_dir, state) = make_state().await;
@@ -125,10 +124,10 @@ async fn get_or_build_embedder_rebuilds_on_provider_settings_change() {
 /// block (e.g. editing `max_retries` or `user_agent`) must still miss
 /// the cache and rebuild — the cache key is policy, providers, *and*
 /// `http`, not policy+providers alone (issue #207 adversarial review,
-/// finding 1). Without this, an operator flipping `http.max_retries` via
-/// a live config reload would keep getting an embedder built from the
-/// *old* `http:` snapshot indefinitely, since the policy/providers
-/// equality check alone would report a cache hit.
+/// finding 1). Without this, two calls sharing the same policy/providers
+/// but a changed `http.max_retries` would still hit the cache and return
+/// an embedder built from the *old* `http:` snapshot, since the
+/// policy/providers equality check alone would report a cache hit.
 #[tokio::test]
 async fn get_or_build_embedder_rebuilds_on_http_config_change() {
     let (_dir, state) = make_state().await;

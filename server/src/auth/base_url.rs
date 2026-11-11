@@ -1,4 +1,4 @@
-//! Base-URL resolution for OAuth discovery (T7, RFC 9728 §3.1 / RFC 8414):
+//! Base-URL resolution for OAuth discovery (RFC 9728 §3.1 / RFC 8414):
 //! the issuer/resource identifier used by the `.well-known` endpoints and by
 //! the `WWW-Authenticate: Bearer resource_metadata="..."` challenge on 401s.
 //!

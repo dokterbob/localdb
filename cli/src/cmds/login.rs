@@ -1,4 +1,4 @@
-//! `localdb login` / `logout` (specs/05-surfaces.md §2, §3.1, T4).
+//! `localdb login` / `logout` (specs/05-surfaces.md §2, §3.1).
 //!
 //! `login` drives the OAuth2 authorization-code + PKCE flow
 //! (`localdb_core::auth::generate_pkce_pair`/`OOB_REDIRECT_URI`) against a
@@ -35,7 +35,7 @@ const CLIENT_ID: &str = "localdb-cli";
 /// `localdb login [--url <base>] [--setup-code <code>] [--no-browser]
 /// [--invite <token>] [--name <name>]`
 ///
-/// T6: `--invite` takes an entirely different, browser-free path
+/// `--invite` takes an entirely different, browser-free path
 /// (`perform_invite_login`) — see its doc comment for why direct redemption
 /// is primary over forwarding to the `/authorize?invite=` consent page.
 #[allow(clippy::too_many_arguments)]
@@ -207,7 +207,7 @@ fn resolve_requested_name(name: Option<&str>) -> Result<String, Error> {
     })
 }
 
-/// `localdb login --invite <token>` (T6): redeems the invite directly
+/// `localdb login --invite <token>` redeems the invite directly
 /// against `POST /v1/invites/redeem` — no browser round trip needed. This
 /// is the *primary* closed-mode path (the consent page's invite branch,
 /// `server::auth::oauth::handle_invite_authorize`, exists too, but only for

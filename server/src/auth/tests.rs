@@ -41,7 +41,7 @@ async fn setup_code_generated_when_enforced_and_no_users() {
         code.starts_with(localdb_core::auth::TOKEN_PREFIX),
         "setup code should be a minted ldb_ secret, got: {code}"
     );
-    // The hash — and only the hash — is held in AppState for T4.
+    // The hash — and only the hash — is held in AppState.
     assert_eq!(
         state.setup_code_hash().as_deref(),
         Some(hash_secret(&code).as_str()),
@@ -67,11 +67,10 @@ async fn setup_code_not_generated_when_an_admin_exists() {
     assert!(state.setup_code_hash().is_none());
 }
 
-/// Finding #5 regression: a first user created *without* `--admin` (a
-/// plain `Role::Member`) must NOT suppress the setup code — the old
-/// "any user exists" check would otherwise leave the daemon
-/// auth-enforced with zero admins and no API-reachable way to create
-/// one.
+/// A first user created *without* `--admin` (a plain `Role::Member`) must
+/// NOT suppress the setup code — gating it on "any user exists" rather
+/// than "any admin exists" would leave the daemon auth-enforced with zero
+/// admins and no API-reachable way to create one.
 #[tokio::test]
 async fn setup_code_still_generated_when_only_member_users_exist() {
     let (_dir, state) = make_state(AuthMode::Enforced).await;

@@ -321,14 +321,13 @@ async fn create_credentials(conn: &Connection) -> Result<(), libsql::Error> {
     Ok(())
 }
 
-/// DDL for the auth subsystem (issue #98, D1/D5/D7/D13): `users`,
-/// `auth_tokens`, `oauth_clients`, `auth_codes`, `store_grants`, `invites`,
-/// `access_requests`.
+/// DDL for the auth subsystem: `users`, `auth_tokens`, `oauth_clients`,
+/// `auth_codes`, `store_grants`, `invites`, `access_requests`.
 ///
 /// Shared verbatim between fresh `create_schema` and the chain migration
 /// framework's `v6` entry (`create_auth_tables`,
 /// `store-libsql/src/migrations/chain.rs`) so both paths converge on an
-/// identical schema (D13, the write-twice rule — see `docs/migrations.md`).
+/// identical schema (the write-twice rule — see `docs/migrations.md`).
 /// `oauth_clients`/`auth_codes` have no corresponding `core::auth` Rust types
 /// yet — their DDL ships now (so this is the only migration this feature
 /// ever needs) but the OAuth2 code+PKCE flow lands in a later ticket.
@@ -403,8 +402,8 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
-    // Seed the built-in `localdb-cli` public client (T4,
-    // `localdb_core::auth::LOCALDB_CLI_CLIENT_ID`). Its recognition and
+    // Seed the built-in `localdb-cli` public client
+    // (`localdb_core::auth::LOCALDB_CLI_CLIENT_ID`). Its recognition and
     // redirect-uri policy (RFC 8252 §7.3 loopback exception) are pure-core
     // logic (`localdb_core::auth::validate_redirect_uri`) — this row exists
     // solely so `auth_codes.client_id`'s FK constraint is satisfiable when

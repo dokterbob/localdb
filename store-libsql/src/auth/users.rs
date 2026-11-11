@@ -111,8 +111,8 @@ pub(crate) async fn delete_user(db: &LibsqlDb, id: &str) -> Result<bool, Error> 
     Ok(n > 0)
 }
 
-/// Atomic "delete iff this wouldn't drop admins to zero" (D7 last-admin
-/// lockout guard, finding #5): the eligibility check — whether `id` is
+/// Atomic "delete iff this wouldn't drop admins to zero" (the last-admin
+/// lockout guard): the eligibility check — whether `id` is
 /// currently the *sole* admin — is folded into the `DELETE`'s own WHERE
 /// clause via a correlated subquery, so two concurrent guarded deletes (or a
 /// guarded delete racing `try_demote_user_unless_last_admin`) against the
@@ -195,9 +195,9 @@ pub(crate) async fn count_users(db: &LibsqlDb) -> Result<u64, Error> {
     Ok(count as u64)
 }
 
-/// Whether at least one `Role::Admin` user exists (finding #5) — backs the
-/// setup-code bootstrap decision, which must key off admin existence rather
-/// than mere user existence.
+/// Whether at least one `Role::Admin` user exists — backs the setup-code
+/// bootstrap decision, which must key off admin existence rather than mere
+/// user existence.
 pub(crate) async fn admin_exists(db: &LibsqlDb) -> Result<bool, Error> {
     let conn = db.reader();
     let mut rows = conn

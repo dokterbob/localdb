@@ -1,5 +1,5 @@
 //! `GET /.well-known/oauth-protected-resource` (RFC 9728) and
-//! `GET /.well-known/oauth-authorization-server` (RFC 8414) — T7,
+//! `GET /.well-known/oauth-authorization-server` (RFC 8414),
 //! specs/05-surfaces.md §3.1.
 //!
 //! Both routes are public (no bearer token — they *are* the discovery step

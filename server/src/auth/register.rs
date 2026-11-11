@@ -1,4 +1,4 @@
-//! `POST /register` — OAuth2 Dynamic Client Registration (RFC 7591, T7,
+//! `POST /register` — OAuth2 Dynamic Client Registration (RFC 7591,
 //! specs/05-surfaces.md §3.1).
 //!
 //! HTTP shape only (specs/01-architecture.md §1): every validation rule —
@@ -14,7 +14,7 @@
 //!
 //! This route is deliberately **public** (no bearer token) — DCR is part of
 //! the zero-config onboarding flow (401 → discovery → DCR → code+PKCE), the
-//! same reasoning that keeps `/authorize`/`/token`/`/revoke` public (T4).
+//! same reasoning that keeps `/authorize`/`/token`/`/revoke` public.
 
 use axum::{
     extract::State,
@@ -59,7 +59,7 @@ pub struct RegisterClientResponse {
 /// RFC 7591 §3.2.2 client-registration error body: every `POST /register`
 /// validation failure is `400` with an `error` member (mirrors `POST
 /// /token`'s `TokenErrorBody`/`token_error` in `server/src/auth/oauth.rs`,
-/// RFC 6749 §5.2's analogous shape) — finding #10. No `code`/`message`
+/// RFC 6749 §5.2's analogous shape). No `code`/`message`
 /// `ApiError` envelope on this route.
 #[derive(Debug, Serialize)]
 struct RegisterErrorBody {
@@ -82,7 +82,7 @@ fn register_error(code: &'static str, description: impl Into<String>) -> Respons
         .into_response()
 }
 
-/// Finding #4: a generic, detail-free `500` for a store-layer (internal
+/// A generic, detail-free `500` for a store-layer (internal
 /// -class) `register_client` failure — RFC 7591 has nothing to say about
 /// server-side faults, so this is RFC-neutral (mirrors `oauth.rs`'s
 /// `internal_token_error()`, RFC 6749 §5.2's analogous `server_error` shape).
@@ -132,15 +132,16 @@ fn registration_error_code(err: &RegistrationError) -> &'static str {
 /// `POST /register` (public, RFC 7591): register a new public OAuth2 client.
 ///
 /// Performs no validation of its own: every check — `token_endpoint_auth_method`
-/// must be `"none"` if present, `redirect_uris` non-empty and within the DCR
-/// size bounds, each entry an allowed shape, `client_name` within its
-/// length bound, and (if present) every `grant_types`/`response_types`
-/// entry supported — is `AuthService::register_client`'s own
-/// `validate_registration_request`, enforced in that exact precedence
-/// order; this handler only maps its [`RegistrationError`] onto the
-/// matching RFC 7591 §3.2.2 code (`registration_error_code`). Every
-/// rejection is RFC 7591 §3.2.2-shaped (`register_error`) rather than the
-/// shared `{"code":...,"message":...}` `ApiError` envelope used elsewhere.
+/// must be `"none"` if present, then `redirect_uris` non-empty, then within
+/// the DCR size bounds, then `client_name` within its length bound, then
+/// each `redirect_uris` entry an allowed shape, and finally (if present)
+/// every `grant_types`/`response_types` entry supported — is
+/// `AuthService::register_client`'s own `validate_registration_request`,
+/// enforced in that exact precedence order; this handler only maps its
+/// [`RegistrationError`] onto the matching RFC 7591 §3.2.2 code
+/// (`registration_error_code`). Every rejection is RFC 7591 §3.2.2-shaped
+/// (`register_error`) rather than the shared `{"code":...,"message":...}`
+/// `ApiError` envelope used elsewhere.
 pub async fn post_register(
     State(state): State<AppState>,
     Json(req): Json<RegisterClientRequest>,

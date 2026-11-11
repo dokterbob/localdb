@@ -1,14 +1,14 @@
 use super::*;
 
 impl<S: AuthStore> AuthService<S> {
-    /// Create an invite (T6): `mode` (open/closed), `store_grants` (name +
+    /// Create an invite: `mode` (open/closed), `store_grants` (name +
     /// visibility pairs — the caller resolves visibility via `StoreBackend`,
     /// the same seam `grant_store` uses), `max_uses` (>= 1), and an optional
     /// absolute RFC 3339 `expires_at`.
     ///
     /// Grants against a `private` store are rejected here at CREATE time
-    /// (`Forbidden`, reusing D7's "private stores are admin-only and
-    /// ungrantable" rule from `grant_store`) rather than deferred to
+    /// (`Forbidden`, reusing `grant_store`'s rule that private stores are
+    /// admin-only and ungrantable) rather than deferred to
     /// redemption — a bad invite should fail loudly for the admin who typo'd
     /// a store name, not silently for whoever redeems it later.
     pub async fn create_invite(

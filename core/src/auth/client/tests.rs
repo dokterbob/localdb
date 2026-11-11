@@ -102,7 +102,7 @@ fn host_substring_lookalikes_are_rejected() {
 }
 
 // -----------------------------------------------------------------
-// T7: DCR redirect_uri validation
+// DCR redirect_uri validation
 // -----------------------------------------------------------------
 
 #[test]
@@ -246,13 +246,11 @@ fn validate_registration_request_checks_bounds_before_per_uri_validity() {
 }
 
 // -----------------------------------------------------------------
-// `validate_registration_request`'s full precedence order: an
-// `token_endpoint_auth_method`/`grant_types`/`response_types` violation
-// must never outrank a `redirect_uris` violation — a request that violates
-// both must report the `redirect_uris` problem, matching the order this
-// server enforced before `token_endpoint_auth_method`/`grant_types`/
-// `response_types` moved from `server::auth::register::post_register`'s own
-// handler-side checks into this single validator.
+// `validate_registration_request`'s precedence order: `token_endpoint_auth_method` is
+// checked first and outranks every other violation, including an empty or otherwise
+// invalid `redirect_uris`. After that, `redirect_uris` emptiness is checked, then its
+// count/length bounds, then `client_name`'s length bound, then each URI's shape, then
+// `grant_types`, then `response_types`.
 // -----------------------------------------------------------------
 
 #[test]

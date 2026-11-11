@@ -1,10 +1,10 @@
-//! Daemon-side auth enforcement (T3).
+//! Daemon-side auth enforcement.
 //!
 //! ALL auth *policy* (token validation, principal construction, grant
 //! evaluation) lives in `localdb_core::auth` per the layering invariant
 //! (specs/01-architecture.md §1). This module is only the HTTP surface
 //! wiring: the resolved [`AuthMode`], the axum [`middleware`], and the
-//! one-time setup-code bootstrap seam (D3b, redeemed by `/authorize` in T4).
+//! one-time setup-code bootstrap seam, redeemed by `/authorize`.
 
 pub mod base_url;
 pub mod join;
@@ -74,9 +74,9 @@ pub(crate) fn page_shell(title: &str, body: &str) -> Html<String> {
 /// never be echoed back (it can carry internal detail, e.g. a raw SQL error
 /// via `Error::Internal`).
 ///
-/// Shared by `oauth.rs` (token issuance/rotation/auth-code redemption,
-/// finding #1) and `register.rs` (DCR store-persistence failures, finding
-/// #4) — a single classification so the two surfaces can never drift.
+/// Shared by `oauth.rs` (token issuance/rotation/auth-code redemption) and
+/// `register.rs` (DCR store-persistence failures) — a single classification
+/// so the two surfaces can never drift.
 pub(crate) fn is_internal_class_error(err: &Error) -> bool {
     matches!(
         err,

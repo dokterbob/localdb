@@ -1,4 +1,4 @@
-//! OAuth2 authorization-code + PKCE HTTP surface (T4, specs/05-surfaces.md
+//! OAuth2 authorization-code + PKCE HTTP surface (specs/05-surfaces.md
 //! §3.1): `GET/POST /authorize`, `POST /token`, `POST /revoke` (RFC 7009).
 //!
 //! HTTP shape only (specs/01-architecture.md §1) — the auth-code state
@@ -42,7 +42,7 @@ pub struct AuthorizeQuery {
     /// Pre-fills the consent form's credential field (D3b bootstrap UX) —
     /// the form still requires an explicit submit.
     pub setup_code: Option<String>,
-    /// T6: an invite token (`/authorize?invite=<token>`, the URL `POST
+    /// An invite token (`/authorize?invite=<token>`, the URL `POST
     /// /v1/invites` hands back) — switches the rendered form to the invite
     /// -redemption variant (a "your name" field instead of a
     /// setup-code/API-key credential field), see `render_consent_page`.
@@ -62,12 +62,12 @@ pub struct AuthorizeForm {
     /// which branch runs is decided by whether `invite` is present, in
     /// `post_authorize`.
     pub credential: Option<String>,
-    /// T6: an invite token, round-tripped from the hidden field
+    /// An invite token, round-tripped from the hidden field
     /// `render_consent_page`'s invite variant renders. Present iff this
     /// submission is an invite redemption rather than a setup-code/API-key
     /// login.
     pub invite: Option<String>,
-    /// T6: the requester's chosen user name, required alongside `invite`.
+    /// The requester's chosen user name, required alongside `invite`.
     pub requested_name: Option<String>,
 }
 
@@ -118,7 +118,7 @@ impl OAuthError {
 /// `FakeAuthStore`-backed `AuthService` with no real database — the same
 /// pattern `core::auth::service`'s own tests use.
 ///
-/// T7: `client_id` recognition and `redirect_uri` validation now go through
+/// `client_id` recognition and `redirect_uri` validation go through
 /// `AuthService::is_known_client`/`validate_client_redirect_uri`, which
 /// extend the built-in `localdb-cli` pure check with a store-backed lookup
 /// for `POST /register`-created clients (specs/05-surfaces.md §3.1). An
@@ -219,7 +219,7 @@ pub(super) fn escape_html(s: &str) -> String {
 /// interpolated value is HTML-escaped. The hidden fields round-trip the
 /// full set of OAuth params the POST handler re-validates.
 ///
-/// `invite_token`, when present (T6, `/authorize?invite=<token>`), switches
+/// `invite_token`, when present (`/authorize?invite=<token>`), switches
 /// the credential field for an invite-redemption variant: a hidden `invite`
 /// field carrying the token plus a "your name" text input, rather than the
 /// setup-code/API-key password field — an invite token IS the credential
@@ -368,7 +368,7 @@ pub async fn post_authorize(
         Err(e) => return oauth_error_page(e),
     };
 
-    // T6: an invite token takes an entirely different path — it identifies
+    // An invite token takes an entirely different path — it identifies
     // a *new* user (via `redeem_invite`, requiring a chosen name) rather
     // than an existing one, and a `closed`-mode invite doesn't continue the
     // OAuth flow at all (no admin has approved yet).
@@ -393,7 +393,7 @@ pub async fn post_authorize(
     issue_code_and_continue(&state, &params, &user_id, origin).await
 }
 
-/// T6: handle a consent-page submission that carries an invite token rather
+/// Handle a consent-page submission that carries an invite token rather
 /// than a setup-code/API-key credential (`AuthorizeForm::invite`).
 ///
 /// `open`-mode invites redeem immediately and continue the OAuth flow as
@@ -506,7 +506,7 @@ fn render_oob_success_page(code: &str) -> Html<String> {
 /// original: revoking the original also revokes that new session and
 /// anything minted under it.
 ///
-/// T6 seam: an invite-token redemption branch belongs here, tried alongside
+/// An invite-token redemption branch runs here, tried alongside
 /// (not necessarily before/after) the API-key fallback — invites identify a
 /// *new* user the way the setup code identifies the *first* one.
 async fn resolve_credential(
@@ -582,8 +582,8 @@ fn token_error(status: StatusCode, code: &'static str, description: impl Into<St
         .into_response()
 }
 
-/// Generic RFC 6749 §5.2 `server_error` body for an internal-class fault
-/// (finding #5): `500`, since RFC 6749's token-error status/code registry
+/// Generic RFC 6749 §5.2 `server_error` body for an internal-class fault:
+/// `500`, since RFC 6749's token-error status/code registry
 /// only constrains 4xx responses, and a fixed, generic description — never
 /// `err.to_string()` — so no internal detail leaks to the caller.
 fn internal_token_error() -> Response {

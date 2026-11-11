@@ -1,5 +1,5 @@
-//! T5 integration tests: admin-only user/key/grant management routes, the
-//! last-admin lockout guard rails, and D7 member store-visibility scoping —
+//! Integration tests: admin-only user/key/grant management routes, the
+//! last-admin lockout guard rails, and member store-visibility scoping —
 //! specs/05-surfaces.md §3.1. Built the same way as `auth_middleware.rs`:
 //! `oneshot` against the full `build_router` router in enforced mode, with
 //! real bearer tokens minted through the state's own `AuthService`.
@@ -619,7 +619,7 @@ async fn admin_sees_every_store_regardless_of_visibility() {
 }
 
 // ---------------------------------------------------------------------------
-// D7 member store visibility scoping — GET /v1/status (finding #6)
+// Member store visibility scoping — GET /v1/status
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

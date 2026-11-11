@@ -25,8 +25,8 @@
 //! correctness reason to hard-refuse here, only a possible race the warning
 //! makes visible.
 //!
-//! Grants and invites (beyond `store grant|revoke`, in `cli/src/cmds/store.rs`)
-//! are T6.
+//! Store grants live in `store grant|revoke` (`cli/src/cmds/store.rs`); invite
+//! management lives in `cli/src/cmds/invite.rs`.
 
 use localdb_core::{
     auth::{AuthStore as _, Role, UserRow},
@@ -283,7 +283,7 @@ async fn issue_key_for_user(
 }
 
 // ---------------------------------------------------------------------------
-// T5: daemon-routed-with-direct-DB-fallback commands
+// Daemon-routed-with-direct-DB-fallback commands
 // ---------------------------------------------------------------------------
 
 /// `localdb user list`

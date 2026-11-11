@@ -246,9 +246,9 @@ fn search_query_accepts_unquoted_multiple_words() {
 }
 
 /// A flag typed *after* the query words must still be parsed as a flag,
-/// not silently absorbed into the query (issue #224). Before the fix,
-/// `trailing_var_arg = true` made `--limit 5` here part of the query
-/// text instead of setting `limit`.
+/// not silently absorbed into the query: `trailing_var_arg = true` would
+/// otherwise make `--limit 5` here part of the query text instead of
+/// setting `limit`.
 #[test]
 fn search_flags_after_query_words_still_parse() {
     let cli = Cli::try_parse_from(["localdb", "search", "rank", "fusion", "--limit", "5"]).unwrap();
@@ -378,7 +378,7 @@ fn kind_path_and_url_parse() {
 /// `Command::Add` and `SourceCommand::Add` must expose identical arg
 /// names/requirements for the shared flags — they are hand-synced clap
 /// structs, and drift between them would silently desync `localdb add`
-/// from `localdb source add` (issue #116).
+/// from `localdb source add`.
 #[test]
 fn add_and_source_add_flags_are_in_parity() {
     use clap::CommandFactory;

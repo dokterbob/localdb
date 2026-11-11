@@ -34,10 +34,10 @@ archives stay independently scoped — searches can target either or both.
 
 ## Keeping the index current
 
-localdb does **not** yet re-index automatically when a memory file changes: the daemon's file
-watcher currently watches config changes only, not source paths (see the honest gap list in the
-[comparison doc](comparison.md#where-localdb-is-behind)). Until watch-triggered re-indexing lands,
-re-run indexing whenever memory has changed, whichever fits the harness:
+localdb does **not** yet re-index automatically when a memory file changes: there is no file watcher
+at all (see the honest gap list in the [comparison doc](comparison.md#where-localdb-is-behind)).
+Until watch-triggered re-indexing lands, re-run indexing whenever memory has changed, whichever fits
+the harness:
 
 - **Manually / on a schedule** — `localdb index --store agent-memory` is incremental (unchanged
   files are skipped), so a cron entry every few minutes is cheap.

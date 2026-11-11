@@ -41,7 +41,7 @@ async fn fresh_bearer_for_url_matches_credential_written_for_bracketed_ipv6_base
 }
 
 // -----------------------------------------------------------------
-// T4: 401-retry-with-refresh
+// 401-retry-with-refresh
 // -----------------------------------------------------------------
 
 /// A minimal stateful mock daemon (hand-rolled raw TCP, mirroring
@@ -713,11 +713,22 @@ async fn concurrent_processes_share_one_refresh_and_preserve_other_origins() {
     };
     let rotations = Arc::new(AtomicUsize::new(0));
     let counter = rotations.clone();
+    // Both child processes race to refresh the same stale refresh token.
+    // A `/token` call must not be answered until the overlap this test
+    // exercises has actually happened — otherwise the first response could
+    // land, get written to disk, and let the second process simply read
+    // the fresh credential instead of ever racing for a rotation. A
+    // `Barrier(2)` holds each request until the other has arrived too,
+    // guaranteeing both calls are genuinely concurrent; the timeout is a
+    // safety net for a design that ends up never sending a second request
+    // at all (so the test fails loudly instead of hanging).
+    let overlap = Arc::new(tokio::sync::Barrier::new(2));
     let app = axum::Router::new()
         .route("/token", axum::routing::post(move || {
             let counter = counter.clone();
+            let overlap = overlap.clone();
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), overlap.wait()).await;
                 let count = counter.fetch_add(1, Ordering::SeqCst);
                 let status = if count == 0 { axum::http::StatusCode::OK } else { axum::http::StatusCode::BAD_REQUEST };
                 (status, axum::Json(serde_json::json!({"access_token":"new_access", "refresh_token":"new_refresh", "expires_in":3600})))

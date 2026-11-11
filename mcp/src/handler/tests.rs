@@ -151,9 +151,9 @@ async fn http_injected_admin_principal_is_used() {
 
 #[tokio::test]
 async fn member_principal_is_no_longer_rejected_wholesale() {
-    // T5 lifts the T3 interim member-403 block: a member now passes
-    // (against an empty store set the call trivially succeeds with no
-    // stores, rather than erroring).
+    // A member principal is not rejected wholesale: against an empty store
+    // set the call succeeds trivially, with no stores, rather than
+    // erroring.
     let provider = Arc::new(StaticStoreProvider::new(vec![]));
     let handler = McpHandler::new(
         provider,
@@ -200,7 +200,7 @@ async fn member_default_principal_is_no_longer_gated_either() {
 }
 
 // -----------------------------------------------------------------
-// T5: D7 store filtering by principal
+// Store visibility filtering by principal
 // -----------------------------------------------------------------
 
 fn store_with_visibility(name: &str, visibility: &str) -> AvailableStore {

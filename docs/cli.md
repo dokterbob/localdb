@@ -1788,7 +1788,7 @@ and `server/src/job_exec.rs` for the cancellation contract)
 Start the HTTP API daemon.
 
 ```
-Start the HTTP API daemon (file watching, scheduled refresh, REST API)
+Start the HTTP API daemon (scheduled refresh, REST API)
 
 Usage: localdb serve [OPTIONS]
 

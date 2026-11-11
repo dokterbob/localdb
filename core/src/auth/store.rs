@@ -121,7 +121,7 @@ pub struct AuthTokenRow {
     pub minted_by_family: Option<String>,
 }
 
-/// A persisted OAuth2 authorization code (RFC 6749 §4.1, T4).
+/// A persisted OAuth2 authorization code (RFC 6749 §4.1).
 ///
 /// Single-use, bound at issue time to `client_id` + `redirect_uri` +
 /// `code_challenge` (PKCE S256) so a code minted for one exchange can't be
@@ -151,13 +151,14 @@ pub struct AuthCodeRow {
     pub minted_by_family: Option<String>,
 }
 
-/// A dynamically registered OAuth2 client (RFC 7591, T7).
+/// A dynamically registered OAuth2 client (RFC 7591).
 ///
-/// Public clients only (D1's "no passwords" ethos extends here: no
-/// `client_secret` is ever minted or stored) — `token_endpoint_auth_method`
+/// Public clients only (no `client_secret` is ever minted or stored, the
+/// same policy that keeps every other credential here as a hash rather than
+/// a plaintext secret) — `token_endpoint_auth_method`
 /// is always `"none"` and is not persisted, since it never varies.
-/// `redirect_uris` are matched **exactly** at `/authorize` time (T7 decision,
-/// specs/05-surfaces.md §3.1): registered clients get no loopback-any-port
+/// `redirect_uris` are matched **exactly** at `/authorize` time
+/// (specs/05-surfaces.md §3.1): registered clients get no loopback-any-port
 /// exception the way the built-in `localdb-cli` client does — see
 /// `core::auth::client::validate_registration_redirect_uri`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,8 +192,8 @@ pub enum InviteMode {
 
 /// A persisted invite.
 ///
-/// The full redeem/approve state machine lands in T6; the table ships now
-/// (D13) so a later ticket doesn't need another migration.
+/// The full redeem/approve state machine lives in `AuthService`; this row
+/// shape covers both `open` and `closed` modes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteRow {
     pub id: String,
@@ -263,7 +264,7 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn count_users(&self) -> Result<u64, Error>;
     /// Whether at least one `Role::Admin` user exists.
     ///
-    /// Finding #5: the one-time setup-code bootstrap
+    /// The one-time setup-code bootstrap
     /// (`server::auth::generate_setup_code_if_needed`) must key off this, not
     /// `count_users() > 0` — a first user created without `--admin` (e.g.
     /// direct `localdb user add bob`) is a `Role::Member`, and suppressing
@@ -350,7 +351,7 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn list_tokens_for_user(&self, user_id: &str) -> Result<Vec<AuthTokenRow>, Error>;
 
     // ------------------------------------------------------------------
-    // OAuth2 authorization codes (T4)
+    // OAuth2 authorization codes
     // ------------------------------------------------------------------
     async fn create_auth_code(&self, code: &AuthCodeRow) -> Result<(), Error>;
     async fn find_auth_code_by_hash(&self, code_hash: &str) -> Result<Option<AuthCodeRow>, Error>;
@@ -361,7 +362,7 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn consume_auth_code(&self, id: &str, consumed_at: &str) -> Result<bool, Error>;
 
     // ------------------------------------------------------------------
-    // OAuth2 dynamic client registration (RFC 7591, T7)
+    // OAuth2 dynamic client registration (RFC 7591)
     // ------------------------------------------------------------------
     async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error>;
     async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error>;
@@ -421,7 +422,7 @@ pub trait AuthStore: Send + Sync + 'static {
         invite_id: &str,
     ) -> Result<Vec<AccessRequestRow>, Error>;
     /// Every access request across every invite, newest-created last — backs
-    /// `GET /v1/invites/requests` (T6). Small admin-facing surface (no
+    /// `GET /v1/invites/requests`. Small admin-facing surface (no
     /// pagination): the number of pending/decided join requests is expected
     /// to be tiny relative to, say, chunk counts.
     async fn list_access_requests(&self) -> Result<Vec<AccessRequestRow>, Error>;

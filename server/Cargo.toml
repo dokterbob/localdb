@@ -45,10 +45,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 
-# File system notification (debounced file watching)
-# Use notify v6 since notify-debouncer-mini 0.4 depends on notify 6
-notify-debouncer-mini = "0.4"
-
 [dev-dependencies]
 libsql = { workspace = true }
 tempfile = { workspace = true }

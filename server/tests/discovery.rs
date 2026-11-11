@@ -1,4 +1,4 @@
-//! Integration tests for T7: RFC 9728 protected-resource metadata, RFC 8414
+//! Integration tests for RFC 9728 protected-resource metadata, RFC 8414
 //! authorization-server metadata, RFC 7591 Dynamic Client Registration, and
 //! the `WWW-Authenticate: Bearer resource_metadata="..."` 401 upgrade — all
 //! via `tower::ServiceExt::oneshot` against the full `build_router` router,
@@ -311,7 +311,7 @@ async fn register_rejects_non_loopback_http_redirect_uri() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = json_body(resp.into_body()).await;
-    // finding #10: RFC 7591 §3.2.2 shape — an `error` member, no `code`.
+    // RFC 7591 §3.2.2 shape — an `error` member, no `code`.
     assert_eq!(body["error"], "invalid_redirect_uri");
     assert!(body.get("code").is_none());
 }
@@ -345,7 +345,7 @@ async fn register_rejects_non_none_token_endpoint_auth_method() {
 }
 
 // ---------------------------------------------------------------------
-// POST /register DCR bounds (finding #8, RFC-shaped per finding #10)
+// POST /register DCR bounds (RFC 7591 §3.2.2-shaped error body)
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -432,7 +432,7 @@ async fn register_is_reachable_without_a_bearer_token() {
 }
 
 // ---------------------------------------------------------------------
-// POST /register grant_types/response_types validation (finding #3): an
+// POST /register grant_types/response_types validation: an
 // unsupported entry must not be echoed back in a 201 — this AS only ever
 // supports authorization_code + refresh_token grants and the code response
 // type (matches discovery::oauth_authorization_server's

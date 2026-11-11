@@ -272,7 +272,7 @@ impl AppState {
 
     /// The configured `server.public_url`, if any (specs/03-config.md §1) —
     /// the OAuth discovery base-URL resolution's preferred source
-    /// (`server::auth::base_url::resolve_base_url`, T7).
+    /// (`server::auth::base_url::resolve_base_url`).
     pub fn public_url(&self) -> Option<&str> {
         self.inner.yaml_config.server.public_url.as_deref()
     }
@@ -304,9 +304,9 @@ impl AppState {
             .expect("setup_code_hash lock poisoned") = Some(hash);
     }
 
-    /// The held setup-code hash, if a code was generated at startup. This is
-    /// the T4 seam: `/authorize` verifies a presented code against this hash
-    /// to bootstrap the first admin user.
+    /// The held setup-code hash, if a code was generated at startup.
+    /// `/authorize` verifies a presented code against this hash to
+    /// bootstrap the first admin user.
     pub fn setup_code_hash(&self) -> Option<String> {
         self.inner
             .auth_context

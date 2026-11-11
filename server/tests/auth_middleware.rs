@@ -1,4 +1,4 @@
-//! Integration tests for the T3 auth middleware (specs/05-surfaces.md §3.1)
+//! Integration tests for the auth middleware (specs/05-surfaces.md §3.1)
 //! via `tower::ServiceExt::oneshot` against the full `build_router` router —
 //! the same router the daemon serves, auth layer and `/mcp` mount included.
 
@@ -73,11 +73,10 @@ async fn enforced_valid_admin_key_reaches_auth_me_with_identity() {
 
 #[tokio::test]
 async fn enforced_member_key_passes_the_middleware_now() {
-    // T5 lifts the T3 interim wholesale member-403: a member principal now
-    // passes the auth *middleware* on every route — per-resource
-    // authorization (D7 store-grant scoping, admin-only routes) is enforced
-    // by the individual handlers instead (see server/tests/admin_management.rs
-    // and mcp_route.rs for that coverage).
+    // A member principal passes the auth *middleware* on every route —
+    // per-resource authorization (store-grant scoping, admin-only routes) is
+    // enforced by the individual handlers instead (see
+    // server/tests/admin_management.rs and mcp_route.rs for that coverage).
     let (_dir, state, app) = make_enforced_app().await;
     let secret = seed_user_with_key(&state, "bob", Role::Member).await;
 

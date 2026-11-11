@@ -77,7 +77,7 @@ async fn poison_next_revoke_makes_revoke_token_report_false_once() {
 }
 
 // -----------------------------------------------------------------
-// T5/finding #5: atomic last-admin guard at the store level
+// Atomic last-admin guard at the store level
 // -----------------------------------------------------------------
 
 #[tokio::test]
@@ -214,7 +214,7 @@ async fn count_users_reflects_inserts() {
 }
 
 // -----------------------------------------------------------------
-// Finding #5: `admin_exists` must key off role, not mere presence.
+// `admin_exists` must key off role, not mere presence.
 // -----------------------------------------------------------------
 
 #[tokio::test]

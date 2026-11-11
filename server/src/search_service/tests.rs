@@ -1,9 +1,9 @@
 use super::*;
 
 // `clamp_search_limit`/`SEARCH_MAX_LIMIT` are re-exported from
-// `localdb_core::search` (issue #187 review) — their own coverage lives
-// in `localdb_core::search::tests::clamp_search_limit_*` rather than
-// being duplicated here.
+// `localdb_core::search`; their own coverage lives in
+// `localdb_core::search::tests::clamp_search_limit_*` rather than being
+// duplicated here.
 
 #[test]
 fn resolve_page_end_adds_offset_and_limit() {

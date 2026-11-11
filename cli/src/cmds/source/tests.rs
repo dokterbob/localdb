@@ -203,8 +203,8 @@ fn resolve_source_add_kind_infers_path_and_url_without_override() {
 
 #[test]
 fn resolve_source_add_kind_override_bypasses_classification() {
-    // A URL-shaped string can be forced to "path": #116 says `--kind`
-    // overrides classification uniformly. (The reverse — forcing a
+    // A URL-shaped string can be forced to "path": `--kind` overrides
+    // classification uniformly. (The reverse — forcing a
     // non-URL string to "url" — is rejected; see the scheme-check tests
     // below.)
     let (kind, _) =
@@ -317,7 +317,7 @@ fn source_to_json_value_path_has_no_refresh_field() {
     assert!(v.get("refresh").is_none());
 }
 
-// -- auto-index embedder reuse (Codex review round 2, finding 6) --------
+// -- auto-index embedder reuse --------------------------------------
 
 /// `source add` scoped to two stores must build the (potentially ~706 MB
 /// local) embedder once for the whole request, not once per store.

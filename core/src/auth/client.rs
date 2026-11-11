@@ -1,18 +1,17 @@
-//! OAuth client recognition and redirect-URI validation (T4,
-//! specs/05-surfaces.md §3.1).
+//! OAuth client recognition and redirect-URI validation
+//! (specs/05-surfaces.md §3.1).
 //!
 //! Domain logic per specs/01-architecture.md §1: client registry lookup and
 //! redirect-uri validation policy live here (pure, I/O-free), not in
 //! `server/src/auth/oauth.rs` (HTTP shape only) or `store-libsql`
 //! (persistence only).
 //!
-//! T4 recognizes exactly one client: the built-in `localdb-cli` public
-//! client, seeded here as pure recognition logic — no `oauth_clients` DB row
-//! is required for it. The `oauth_clients` table exists in the schema
-//! already (T1, D13) for T7's dynamic client registration (`POST
-//! /register`), which will extend `is_known_client`/`validate_redirect_uri`
-//! with a store-backed lookup for registered clients alongside this
-//! built-in one.
+//! `is_known_client`/`validate_redirect_uri` here recognize exactly one
+//! client: the built-in `localdb-cli` public client, as pure recognition
+//! logic — no `oauth_clients` DB row is required for it. Dynamically
+//! registered clients (`POST /register`) are a separate, store-backed
+//! lookup against the `oauth_clients` table, layered on top at
+//! `AuthService::is_known_client`/`validate_client_redirect_uri`.
 
 /// The built-in CLI client ID (`localdb login`), always recognized.
 pub const LOCALDB_CLI_CLIENT_ID: &str = "localdb-cli";
@@ -29,9 +28,10 @@ pub const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 
 /// Is `client_id` a client this server recognizes?
 ///
-/// T4 recognizes exactly one: the built-in `localdb-cli` public client.
-/// T7's dynamic client registration will extend this with a store-backed
-/// lookup against `oauth_clients`.
+/// Recognizes exactly one: the built-in `localdb-cli` public client. A
+/// dynamically registered client is recognized separately, via a
+/// store-backed lookup against `oauth_clients` at
+/// `AuthService::is_known_client`.
 pub fn is_known_client(client_id: &str) -> bool {
     client_id == LOCALDB_CLI_CLIENT_ID
 }
@@ -45,9 +45,9 @@ pub fn is_known_client(client_id: &str) -> bool {
 /// CLI binds a fresh ephemeral port per login attempt, so the exact port
 /// can't be pre-registered. It also accepts the literal
 /// [`OOB_REDIRECT_URI`] sentinel for the no-browser fallback. Every other
-/// `client_id` is rejected in this ticket — there is no registered-client
-/// redirect-uri store yet (T7 adds one for `POST /register`-created
-/// clients).
+/// `client_id` is rejected here; a registered client (`POST /register`) is
+/// validated separately, against its own stored `redirect_uris`, at
+/// `AuthService::validate_client_redirect_uri`.
 pub fn validate_redirect_uri(client_id: &str, redirect_uri: &str) -> bool {
     if client_id != LOCALDB_CLI_CLIENT_ID {
         return false;
@@ -56,7 +56,7 @@ pub fn validate_redirect_uri(client_id: &str, redirect_uri: &str) -> bool {
 }
 
 /// Validate a redirect_uri presented at Dynamic Client Registration time
-/// (RFC 7591, T7, specs/05-surfaces.md §3.1 work item 4).
+/// (RFC 7591, specs/05-surfaces.md §3.1 work item 4).
 ///
 /// Accepts exactly two shapes: an `https://` URL with a non-empty host, or
 /// the same loopback pattern `localdb-cli` gets (`http://127.0.0.1[:port]/...`
@@ -64,7 +64,7 @@ pub fn validate_redirect_uri(client_id: &str, redirect_uri: &str) -> bool {
 /// Everything else, including custom URI schemes (`myapp://...`) some native
 /// apps use per RFC 8252 §7.1, is rejected.
 ///
-/// **Decision (T7):** custom schemes are deliberately out of scope. RFC 8252's
+/// Custom URI schemes are deliberately out of scope. RFC 8252's
 /// loopback-interface exception already covers the CLI/native-app redirect
 /// case (and is what the built-in `localdb-cli` client already uses); there is
 /// no evidence a stock MCP client needs a private-use URI scheme to complete
@@ -89,10 +89,10 @@ pub fn validate_registration_redirect_uri(redirect_uri: &str) -> bool {
 /// Grant types this authorization server supports (RFC 8414
 /// `grant_types_supported`; RFC 7591 §2 `grant_types`). Single source of
 /// truth for both `server::handlers::discovery`'s `.well-known` document and
-/// `server::auth::register`'s DCR validation (finding #3) — this AS only
-/// ever supports the authorization-code + refresh-token grants (T4/T7); a
-/// registrant asking for anything else (e.g. `client_credentials`) would get
-/// a 201 advertising a flow `/token` can't actually service.
+/// `server::auth::register`'s DCR validation — this AS only ever supports
+/// the authorization-code + refresh-token grants; a registrant asking for
+/// anything else (e.g. `client_credentials`) would get a 201 advertising a
+/// flow `/token` can't actually service.
 pub const SUPPORTED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
 
 /// Response types this authorization server supports (RFC 8414
@@ -101,8 +101,8 @@ pub const SUPPORTED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_toke
 /// token directly from `/authorize`.
 pub const SUPPORTED_RESPONSE_TYPES: &[&str] = &["code"];
 
-/// DCR bound policy (finding #8, specs/05-surfaces.md §3.1's DCR note): a
-/// public, unauthenticated `POST /register` must not let a single request
+/// DCR bound policy (specs/05-surfaces.md §3.1's DCR note): a public,
+/// unauthenticated `POST /register` must not let a single request
 /// grow `oauth_clients` metadata without limit. These are minimal,
 /// proportionate per-request caps, not a rate limiter — they bound how much
 /// a single registration can store, not how often a caller may register.

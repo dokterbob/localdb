@@ -86,10 +86,9 @@ async fn dispatch_routes_to_daemon_when_override_present() {
     // the routing decision without a real HTTP server.
     let ctx = test_ctx(Some("http://127.0.0.1:1"));
     // `open_db` panics if called at all — proves the daemon branch never
-    // opens the DB (issue #187 review, finding G4): before the fix every
-    // `dispatch` call site opened the local `AppDb` unconditionally, so a
-    // broken local store could preempt a healthy daemon that never
-    // needed it.
+    // opens the DB: every `dispatch` call site must route to the daemon
+    // without touching the local `AppDb`, so a broken local store can never
+    // preempt a healthy daemon that never needed it.
     let outcome = dispatch(&ProbeCmd, &ctx, &loader, || async {
         panic!("open_db must not be called when a daemon is routed to")
     })

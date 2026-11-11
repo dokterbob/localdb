@@ -1,6 +1,6 @@
 //! `StoreProvider` — the seam that makes MCP store resolution realtime.
 //!
-//! Design decision D12: `McpHandler` no longer holds a `Vec<AvailableStore>`
+//! `McpHandler` does not hold a `Vec<AvailableStore>`
 //! snapshot taken once at construction time. Instead it holds an
 //! `Arc<dyn StoreProvider>` and calls [`StoreProvider::available_stores`]
 //! fresh, at the top of every tool invocation. A store created after the
@@ -14,11 +14,13 @@
 //! `async fn` tool method does once the handler exists, which is exactly
 //! where `available_stores().await` is now called.
 //!
-//! A later ticket (T5) will filter a provider's result by an authenticated
-//! `Principal` per call; this trait's single async method — no request
-//! context threaded through it yet — is deliberately left room for that
-//! (e.g. a decorator provider wrapping another `Arc<dyn StoreProvider>`)
-//! without needing a signature change here.
+//! Per-principal filtering happens one layer up, in `mcp::handler`:
+//! `McpHandler::filter_visible` keeps only the stores the resolved
+//! `Principal` may read, and `authorize_and_resolve` runs that filter after
+//! calling this trait's `available_stores`. This trait's single async method
+//! carries no request context by design — scoping stays a caller-side
+//! concern, so a `StoreProvider` implementation never needs to know about
+//! principals.
 
 use async_trait::async_trait;
 

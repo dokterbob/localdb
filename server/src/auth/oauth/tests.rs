@@ -3,7 +3,7 @@ use localdb_core::auth::{AuthService, FakeAuthStore};
 use std::sync::Arc;
 
 /// A fresh in-memory `AuthService` — recognizes the built-in
-/// `localdb-cli` client purely (no DB row needed) plus whatever T7 test
+/// `localdb-cli` client purely (no DB row needed) plus whatever
 /// callers register on it, mirroring `core::auth::service`'s own test
 /// helper.
 fn fake_auth() -> AuthService<FakeAuthStore> {
@@ -20,15 +20,16 @@ fn fake_auth_with_store() -> (AuthService<FakeAuthStore>, Arc<FakeAuthStore>) {
 }
 
 // -----------------------------------------------------------------
-// Finding #5: internal-class token-issuance/rotation failures must map
+// Internal-class token-issuance/rotation failures must map
 // to 500, not 400 `server_error`/`invalid_grant`. `AuthService`'s
 // `FakeAuthStore` has no seam to make `issue_access_token`/
 // `issue_refresh_token`/`rotate_refresh_token` return a store-layer
 // error (its only poison hook, `poison_next_revoke`, makes
 // `revoke_token` report a lost race — which `rotate_refresh_token`
 // already turns into `Error::Unauthorized`, not an internal error), so
-// this is covered at the classification-helper level per the fix's own
-// guidance rather than end-to-end through a real store fault.
+// this test covers the classification directly at the
+// classification-helper level rather than end-to-end through a real
+// store fault.
 // -----------------------------------------------------------------
 
 #[test]
@@ -125,14 +126,14 @@ async fn token_error_for_failure_keeps_client_class_at_400_invalid_grant() {
 }
 
 // -----------------------------------------------------------------
-// Finding #1: `handle_auth_code_grant`'s `redeem_auth_code` failure arm
+// `handle_auth_code_grant`'s `redeem_auth_code` failure arm
 // must classify the error the same way the issuance/refresh paths do
 // (via `token_error_for_failure`), not collapse every failure to `400
 // invalid_grant` unconditionally. `FakeAuthStore` has no seam to make
 // `redeem_auth_code` itself return a store-layer error (its `auth_codes`
-// vec has no poison hook), so — per the fix's own guidance — this pins
-// the classification at this call site's exact description text rather
-// than driving a real internal fault end-to-end through the HTTP route.
+// vec has no poison hook), so this test pins the classification at this
+// call site's exact description text rather than driving a real
+// internal fault end-to-end through the HTTP route.
 // -----------------------------------------------------------------
 
 const AUTH_CODE_GRANT_FAILURE_DESCRIPTION: &str =
@@ -381,7 +382,7 @@ async fn validate_authorize_params_rejects_registered_client_mismatched_redirect
         .unwrap();
     // A different port/path than what was registered must be rejected —
     // registered clients get exact match only, no loopback-any-port
-    // exception (T7 decision).
+    // exception.
     let err = validate_authorize_params(
         &auth,
         Some("code"),

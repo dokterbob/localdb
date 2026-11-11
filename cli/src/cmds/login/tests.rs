@@ -1,5 +1,5 @@
 use super::*;
-use localdb_core::auth::{AuthStore as _, Role};
+use localdb_core::auth::{AccessRequestState, AuthStore as _, Role};
 use localdb_core::config::schema::{
     DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, RawConfig,
 };
@@ -214,7 +214,7 @@ async fn no_browser_setup_code_bootstrap_via_stdin_paste_placeholder() {
 }
 
 // -----------------------------------------------------------------
-// T6: `localdb login --invite <token>`
+// `localdb login --invite <token>`
 // -----------------------------------------------------------------
 
 #[tokio::test]
@@ -329,16 +329,45 @@ async fn perform_invite_login_closed_mode_polls_until_admin_approves() {
         }
     });
 
-    // Wait for the access request to appear, then let the poll loop run
-    // a few iterations before approving.
+    // Wait for the access request to appear, failing fast (rather than
+    // hanging) if the login task exits before it does — that would mean the
+    // request was never created, not that we should keep waiting.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let request_id = loop {
+        if login_task.is_finished() {
+            let result = login_task.await;
+            panic!("login task finished before its access request appeared: {result:?}");
+        }
         let reqs = state.auth_store().list_access_requests().await.unwrap();
         if let Some(r) = reqs.iter().find(|r| r.requested_name == "closed-newbie") {
             break r.id.clone();
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the access request to appear"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     };
-    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+
+    // Let the poll loop run a few real iterations before approving: observe
+    // the request actually staying `Pending` (and the login task still
+    // running) across a few poll_interval-spaced checks, instead of
+    // sleeping a fixed, arbitrary duration.
+    for _ in 0..3 {
+        if login_task.is_finished() {
+            let result = login_task.await;
+            panic!("login task finished before approval: {result:?}");
+        }
+        let reqs = state.auth_store().list_access_requests().await.unwrap();
+        let still_pending = reqs
+            .iter()
+            .any(|r| r.id == request_id && r.state == AccessRequestState::Pending);
+        assert!(
+            still_pending,
+            "access request should still be pending before approval"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     state.auth().approve_request(&request_id).await.unwrap();
 
     let result = login_task.await.unwrap();
@@ -391,11 +420,20 @@ async fn perform_invite_login_closed_mode_denied_fails_with_clear_error() {
         }
     });
 
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let request_id = loop {
+        if login_task.is_finished() {
+            let result = login_task.await;
+            panic!("login task finished before its access request appeared: {result:?}");
+        }
         let reqs = state.auth_store().list_access_requests().await.unwrap();
         if let Some(r) = reqs.iter().find(|r| r.requested_name == "denied-newbie") {
             break r.id.clone();
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the access request to appear"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     };
     state.auth().deny_request(&request_id).await.unwrap();

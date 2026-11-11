@@ -1,4 +1,4 @@
-//! Authentication and authorization domain module (issue #98).
+//! Authentication and authorization domain module.
 //!
 //! ALL auth policy lives here per the layering invariant in
 //! specs/01-architecture.md §1 — no domain logic in surface crates.
@@ -7,8 +7,8 @@
 //! implemented there.
 //!
 //! See specs/02-domain-model.md (entities) and specs/05-surfaces.md §3.1
-//! (route-level behavior — lands incrementally across T1-T7; this ticket is
-//! foundation only: no daemon/CLI/MCP wiring).
+//! (route-level behavior, including the daemon, CLI and MCP surfaces that
+//! enforce it).
 
 mod client;
 mod principal;

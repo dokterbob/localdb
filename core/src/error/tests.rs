@@ -313,7 +313,7 @@ fn conflict_errors_exit_4() {
 /// mechanism `cli::job_attach::finish_job` relies on to give a
 /// daemon-attached CLI (e.g. `localdb index` watching a job someone else
 /// cancelled) the same exit code (4) a direct `job cancel` caller gets,
-/// with zero special-casing in `finish_job` itself (issue #218).
+/// with zero special-casing in `finish_job` itself.
 #[test]
 fn job_cancelled_round_trips_through_from_code() {
     assert_eq!(

@@ -369,7 +369,7 @@ async fn closed_invite_approve_then_poll_once_then_already_collected() {
 
 #[tokio::test]
 async fn poll_request_mint_failure_does_not_permanently_brick_collection() {
-    // Pins finding #7: if `issue_api_key` fails on the collecting poll
+    // If `issue_api_key` fails on the collecting poll
     // (simulated via `poison_next_insert_token`), `collected_at` must
     // NOT have been set — otherwise every subsequent poll would
     // observe `AlreadyCollected` forever and the requester could never

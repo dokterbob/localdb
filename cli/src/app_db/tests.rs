@@ -67,7 +67,7 @@ async fn app_db_store_add_list_remove() {
 }
 
 // -----------------------------------------------------------------------
-// AppDbStoreProvider — T2 realtime MCP store resolution
+// AppDbStoreProvider — realtime MCP store resolution
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -295,13 +295,12 @@ async fn scope_default_store_present_returns_it() {
     assert_eq!(rows[0].name, DEFAULT_STORE_NAME);
 }
 
-/// Finding 5 (Codex review): an invalid `--store` name must be rejected
-/// as `Error::InvalidRequest` (exit 2) *before* the daemon store list is
-/// fetched — the daemon base URL here (`127.0.0.1:0`) is guaranteed
-/// connection-refused (see `daemon_client::tests::probe_stale_removes_both_socket_and_url_file`
-/// for the same idiom), so if validation ran after the fetch this would
-/// surface `Error::DaemonUnreachable` (exit 5) instead — exactly the
-/// ordering bug the function's doc comment already promised was fixed.
+/// An invalid `--store` name must be rejected as `Error::InvalidRequest`
+/// (exit 2) *before* the daemon store list is fetched — the daemon base URL
+/// here (`127.0.0.1:0`) is guaranteed connection-refused (see
+/// `daemon_client::tests::probe_stale_removes_both_socket_and_url_file` for
+/// the same idiom), so if validation ran after the fetch this would surface
+/// `Error::DaemonUnreachable` (exit 5) instead.
 #[tokio::test]
 async fn resolve_daemon_store_scope_inner_validates_before_fetching() {
     let ctx = test_ctx(vec!["../bad"]);

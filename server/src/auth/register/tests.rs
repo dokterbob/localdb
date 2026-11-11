@@ -43,14 +43,14 @@ fn registration_error_code_maps_every_other_violation_to_invalid_client_metadata
 }
 
 // -----------------------------------------------------------------
-// Finding #4: a store-layer (internal-class) `register_client` failure
+// A store-layer (internal-class) `register_client` failure
 // must become a generic, detail-free 500 (`internal_register_error`),
 // never a `400 invalid_client_metadata` echoing `e.to_string()`.
 // `LibsqlAuthStore` has no seam to make `create_oauth_client` itself
-// return a store-layer error, so — mirroring the same limitation noted
-// for finding #1 in `oauth.rs` — this is covered at the
-// response-shaping level rather than end-to-end through a real store
-// fault; the shared classification predicate itself
+// return a store-layer error, so — mirroring the same limitation in
+// `oauth.rs` — this test covers the response-shaping level rather
+// than end-to-end through a real store fault; the shared
+// classification predicate itself
 // (`crate::auth::is_internal_class_error`) is exercised by `oauth.rs`'s
 // own `internal_class_errors_are_classified_internal`/
 // `client_input_errors_are_not_classified_internal` tests, which cover

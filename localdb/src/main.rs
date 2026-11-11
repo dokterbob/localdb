@@ -107,7 +107,7 @@ pub enum Command {
         download_model: bool,
     },
 
-    /// Start the HTTP API daemon (file watching, scheduled refresh, REST API).
+    /// Start the HTTP API daemon (scheduled refresh, REST API).
     ///
     /// The daemon serves every store in the database. Not store-scoped:
     /// passing `--store` exits 2.
@@ -293,7 +293,7 @@ pub enum Command {
         no_browser: bool,
 
         /// Redeem an invite token instead of an interactive login
-        /// (specs/05-surfaces.md §2, T6): `open`-mode invites complete
+        /// (specs/05-surfaces.md §2): `open`-mode invites complete
         /// immediately; `closed`-mode invites wait and poll until an admin
         /// approves or denies. Mutually exclusive with `--setup-code` and
         /// `--no-browser`'s browser flow — no browser is opened at all.
@@ -314,7 +314,7 @@ pub enum Command {
         url: Option<String>,
     },
 
-    /// Manage invites and pending access requests (admin only, T6).
+    /// Manage invites and pending access requests (admin only).
     #[command(subcommand)]
     Invite(InviteCommand),
     /// Generate a shell completion script on stdout.
@@ -335,7 +335,7 @@ pub enum Command {
     Internal(InternalCommand),
 }
 
-/// Invite management subcommands (specs/05-surfaces.md §2, T6).
+/// Invite management subcommands (specs/05-surfaces.md §2).
 #[derive(Debug, Subcommand)]
 pub enum InviteCommand {
     /// Create an invite. Prints a show-once token and a ready-made consent

@@ -126,7 +126,7 @@ fn rate_limit_fields_have_minimum_one_not_schemars_default_zero() {
 }
 
 /// Same trap as `rate_limit_fields_have_minimum_one_not_schemars_default_zero`
-/// above, for `ServerConfig::job_workers` (issue #208): `usize`'s
+/// above, for `ServerConfig::job_workers`: `usize`'s
 /// derived range is `minimum: 0`, but `validate_config` rejects `0` at
 /// load time. Without `#[schemars(range(min = 1))]` on `job_workers` in
 /// `core/src/config/schema.rs`, the published schema would call `0`

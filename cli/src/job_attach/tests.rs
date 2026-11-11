@@ -260,8 +260,8 @@ async fn run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset
 /// A task that floods far more than one broadcast channel's worth of
 /// progress events with no `.await` in between must not deadlock or
 /// panic `drive_embedded_job` — the receiver's first `recv()` observes
-/// `RecvError::Lagged` and skips ahead (issue #83's lossy-tolerant
-/// progress contract), rather than every individual event.
+/// `RecvError::Lagged` and skips ahead under the progress channel's
+/// lossy-tolerant contract, rather than every individual event.
 #[tokio::test]
 async fn drive_embedded_job_skips_ahead_past_a_lagging_progress_receiver() {
     let queue = JobQueue::new();
@@ -717,11 +717,10 @@ async fn attach_daemon_job_falls_back_to_polling_when_the_sse_route_404s() {
 }
 
 // -----------------------------------------------------------------
-// split_next_line: pure helper, unit-tested directly (Codex review
-// finding F3 — the SSE byte stream must be buffered as `Vec<u8>` and
-// decoded only on completed lines, so a multi-byte UTF-8 character
-// split across two network chunks doesn't get corrupted into
-// replacement characters).
+// split_next_line: pure helper, unit-tested directly — the SSE byte
+// stream must be buffered as `Vec<u8>` and decoded only on completed
+// lines, so a multi-byte UTF-8 character split across two network
+// chunks doesn't get corrupted into replacement characters.
 // -----------------------------------------------------------------
 
 /// `é` (U+00E9) encodes as the two UTF-8 bytes `0xC3 0xA9`. Pushing them
@@ -998,7 +997,7 @@ fn finish_job_failed_with_no_error_text_falls_back_to_a_generic_message() {
     );
 }
 
-/// Issue #187 review, finding 3: a failed job carrying a recognized
+/// A failed job carrying a recognized
 /// `error_code` (e.g. `invalid_config`, the code an embedder-construction
 /// failure classifies as) must reconstruct the *original* typed error
 /// under `StrictExit` — not collapse to `Error::Internal` — so a
@@ -1032,12 +1031,12 @@ fn finish_job_failed_with_a_recognized_error_code_reconstructs_the_typed_error()
 /// message: `localdb_core::fail_index_job_with_error` populates
 /// `job.error`/`job.error_code` exactly as the daemon worker does
 /// (`server::job_queue::run_worker`), and this feeds that output
-/// straight into `finish_job`'s reconstruction. Guards against the
-/// producer/consumer prefix-doubling regression (issue #187 review,
-/// finding F4): before the fix, the producer stored `error.to_string()`
-/// ("invalid config: unconfigured embedder provider"), and
-/// `Error::from_code` re-added the same prefix on reconstruction,
-/// doubling it in the final `Display`ed error.
+/// straight into `finish_job`'s reconstruction. Guards against
+/// producer/consumer prefix-doubling: the producer must store the bare
+/// message, not `error.to_string()` (which already carries the
+/// "invalid config: " prefix), since `Error::from_code` adds its own
+/// prefix on reconstruction and would otherwise double it in the final
+/// `Display`ed error.
 #[test]
 fn finish_job_round_trips_fail_index_job_with_error_output_without_doubling_the_prefix() {
     use localdb_core::fail_index_job_with_error;

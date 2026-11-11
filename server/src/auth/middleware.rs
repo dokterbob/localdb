@@ -13,23 +13,22 @@
 //!   both the resulting `Principal` and its `SessionOrigin` — the latter
 //!   lets `POST /v1/users/{id}/keys` taint a key minted under this request's
 //!   session. Missing/invalid credentials → 401 with the standard
-//!   error envelope plus `WWW-Authenticate: Bearer` (D6, added by
+//!   error envelope plus `WWW-Authenticate: Bearer` (added by
 //!   `ApiError::into_response`), upgraded here to carry
-//!   `resource_metadata="<base>/.well-known/oauth-protected-resource"` (T7,
-//!   RFC 9728 §5.1) — the trigger a stock MCP client uses to discover this
+//!   `resource_metadata="<base>/.well-known/oauth-protected-resource"`
+//!   (RFC 9728 §5.1) — the trigger a stock MCP client uses to discover this
 //!   daemon's AS and onboard with zero static config. `ApiError` itself has
 //!   no access to the request's `Host` header or `AppState`, so this
 //!   middleware post-processes the 401 response it already built rather than
 //!   restructuring `ApiError` to carry a base URL — see
 //!   `add_resource_metadata_challenge` below.
 //!
-//! T5 lifts the T3 interim policy that rejected every authenticated
-//! `member` principal wholesale: this middleware now inserts *any*
+//! This middleware applies no wholesale role gate: it inserts *any*
 //! authenticated principal — admin or member — and authorization is
-//! enforced per-resource by the individual handlers instead (D7: members
+//! enforced per-resource by the individual handlers instead. Members
 //! read only the `shared` stores they hold a grant for via
 //! `Principal::can_read_store`; admin-only management routes call
-//! `Principal::require_admin`). See specs/05-surfaces.md §3.1 for the route
+//! `Principal::require_admin`. See specs/05-surfaces.md §3.1 for the route
 //! table.
 //!
 //! The inserted `Principal` is what `/v1/auth/me` reads back, and what rmcp
@@ -123,7 +122,7 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
             if let Err(error) = state.auth().complete_bootstrap(&principal).await {
                 return ApiError(error).into_response();
             }
-            // T5: no wholesale role gate here — every authenticated
+            // No wholesale role gate here — every authenticated
             // principal passes; per-resource authorization (store-grant
             // scoping, admin-only management routes) is enforced by the
             // handlers themselves.

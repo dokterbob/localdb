@@ -1,7 +1,7 @@
 use super::*;
 
 // ---------------------------------------------------------------------
-// OAuth2 authorization codes (T4)
+// OAuth2 authorization codes
 // ---------------------------------------------------------------------
 
 fn make_auth_code(id: &str, user_id: &str, code_hash: &str) -> AuthCodeRow {

@@ -108,14 +108,13 @@ async fn mcp_route_lists_and_calls_tools_over_real_http() {
     server_task.abort();
 }
 
-/// The point of T2: a store created *after* the router (and thus the `/mcp`
-/// service) is built must be visible over MCP without any restart. Before
-/// T2, `build_router`'s `mcp_stores` argument was a `Vec<AvailableStore>`
-/// snapshot taken once at construction — `McpHandler` held it directly.
-/// Now `McpHandler` holds an `Arc<dyn StoreProvider>` (see
-/// `mcp::store_provider`) that re-resolves the store list from the same
-/// live `AppState` on every tool call, so this test creates the store via a
-/// real `POST /v1/stores` call against a second `Router` handle sharing the
+/// A store created *after* the router (and thus the `/mcp` service) is
+/// built must be visible over MCP without any restart. `build_router` does
+/// not give `McpHandler` a `Vec<AvailableStore>` snapshot taken once at
+/// construction; instead `McpHandler` holds an `Arc<dyn StoreProvider>`
+/// (see `mcp::store_provider`) that re-resolves the store list from the
+/// same live `AppState` on every tool call, so this test creates the store
+/// via a real `POST /v1/stores` call against a second `Router` handle sharing the
 /// same `AppState` (through `oneshot`, alongside the `axum::serve`-driven
 /// handle the MCP client actually talks to) and asserts `list_stores` picks
 /// it up on the next call, no reconnect needed.
@@ -372,9 +371,9 @@ fn call_tool_json(result: CallToolResult) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// T5: D7 store-grant filtering over MCP (D12 composition — the realtime
-// StoreProvider pin means a grant change is visible on the very next tool
-// call, no reconnect or restart needed).
+// Store-grant filtering over MCP: because the StoreProvider re-resolves the
+// store list fresh on every tool call, a grant change is visible on the
+// very next call, with no reconnect or restart needed.
 // ---------------------------------------------------------------------------
 
 /// Spin up a real HTTP server for `app` and connect an MCP client to it,

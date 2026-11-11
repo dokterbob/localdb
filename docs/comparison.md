@@ -236,10 +236,8 @@ In the interest of the same honesty as [Known gaps](architecture.md#known-gaps):
   Memory already has one.
 - **File-watch-triggered re-indexing isn't live yet.** `POST /v1/jobs` itself runs real ingestion
   through the daemon's async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)),
-  and `localdb index` (embedded or daemon-attached) drives it with live progress — but nothing yet
-  _triggers_ a job automatically when a watched file changes: `server/src/watcher.rs` currently only
-  watches for config-file changes in the running daemon, not path-source roots (see
-  `core/src/ingestion.rs`, which notes the daemon "adds file watching" as a T11 follow-up). Today,
+  and `localdb index` (embedded or daemon-attached) drives it with live progress — but there is no
+  file watcher at all, so nothing triggers a job automatically when a source file changes. Today,
   keeping an index current still means running `localdb index` again — incremental, but not
   automatic.
 

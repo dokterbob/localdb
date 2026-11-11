@@ -516,7 +516,7 @@ impl<S: AuthStore> AuthService<S> {
 
     /// Mint a single-use OAuth2 authorization code (RFC 6749 §4.1), bound to
     /// `client_id` + `redirect_uri` + PKCE `code_challenge` at issue time
-    /// and expiring in [`AUTH_CODE_TTL_SECS`] (T4, specs/05-surfaces.md
+    /// and expiring in [`AUTH_CODE_TTL_SECS`] (specs/05-surfaces.md
     /// §3.1 R5). Redirect-uri validation policy is the caller's
     /// responsibility (`core::auth::validate_redirect_uri`, checked by
     /// `server/src/auth/oauth.rs` before calling this).
@@ -559,9 +559,8 @@ impl<S: AuthStore> AuthService<S> {
 
     /// Whether `client_id` is recognized: the built-in `localdb-cli` public
     /// client (pure, no store lookup — `client::is_known_client`) or a
-    /// dynamically registered client (T7, `POST /register`) found in the
-    /// `oauth_clients` table. Extends the T4 seam documented on
-    /// `client::is_known_client`.
+    /// dynamically registered client (`POST /register`) found in the
+    /// `oauth_clients` table.
     pub async fn is_known_client(&self, client_id: &str) -> Result<bool, Error> {
         if client::is_known_client(client_id) {
             return Ok(true);
@@ -569,9 +568,9 @@ impl<S: AuthStore> AuthService<S> {
         Ok(self.store.find_oauth_client(client_id).await?.is_some())
     }
 
-    /// Validate `redirect_uri` for `client_id` (T7 extension of the T4 seam
-    /// documented on `client::validate_redirect_uri`): the built-in
-    /// `localdb-cli` client keeps its RFC 8252 §7.3 loopback-any-port
+    /// Validate `redirect_uri` for `client_id`, extending
+    /// `client::validate_redirect_uri`: the built-in `localdb-cli` client
+    /// keeps its RFC 8252 §7.3 loopback-any-port
     /// exception; a registered client gets **exact match only** against its
     /// own stored `redirect_uris` — no loopback exception, since a registered
     /// client's redirect is a fixed, pre-declared value (specs/05-surfaces.md
@@ -591,7 +590,7 @@ impl<S: AuthStore> AuthService<S> {
         }
     }
 
-    /// Dynamic Client Registration (RFC 7591, T7): register a new public
+    /// Dynamic Client Registration (RFC 7591): register a new public
     /// client with the given `redirect_uris` (validated one-by-one via
     /// `client::validate_registration_redirect_uri` — exact `https://` or
     /// loopback `http://` only, see that function's doc comment for the
@@ -795,7 +794,7 @@ impl<S: AuthStore> AuthService<S> {
     /// (`ON DELETE CASCADE`, specs/02-domain-model.md §9), so no separate
     /// token-revocation step is needed here.
     ///
-    /// **Concurrency (finding #5 fix):** the guard is enforced atomically at
+    /// **Concurrency:** the guard is enforced atomically at
     /// the store layer (`AuthStore::try_delete_user_unless_last_admin`, a
     /// conditional `DELETE ... WHERE role <> 'admin' OR (admin count) >
     /// 1`), not merely by a check-then-act pre-check — two concurrent
@@ -857,7 +856,7 @@ impl<S: AuthStore> AuthService<S> {
     }
 }
 
-/// Outcome of `AuthService::redeem_invite` (T6, D9).
+/// Outcome of `AuthService::redeem_invite`.
 #[derive(Debug, Clone)]
 pub enum RedeemOutcome {
     /// `open`-mode invite: the user, its store grants (echoed back for
@@ -877,7 +876,9 @@ pub enum RedeemOutcome {
     },
 }
 
-/// Outcome of `AuthService::poll_request` (T6, D9).
+/// Outcome of `AuthService::poll_request`: invites redeem without a bearer
+/// token, and a `closed`-mode invite resolves through this request/poll
+/// flow rather than completing immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollOutcome {
     Pending,

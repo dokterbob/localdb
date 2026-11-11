@@ -3,10 +3,10 @@
 //!
 //! `credentials.json` lives next to `config.yaml` and caches locally-issued
 //! API keys/tokens, keyed by the daemon's base URL so a machine talking to
-//! multiple daemons keeps a separate credential per one. T3 shipped the
-//! read-only lookup for the legacy `{"secret": "ldb_..."}` API-key shape;
-//! T4 (`localdb login`/`logout`) adds an atomic writer plus a richer entry
-//! shape carrying an access/refresh token pair:
+//! multiple daemons keeps a separate credential per one. Two entry shapes
+//! coexist: the legacy `{"secret": "ldb_..."}` API-key shape (read-only
+//! lookup), and a richer shape written by `localdb login`/`logout` through
+//! an atomic writer, carrying an access/refresh token pair:
 //!
 //! ```json
 //! {
@@ -23,7 +23,8 @@
 //! ```
 //!
 //! Both shapes coexist in the same file — an API key entry (`secret`, from
-//! `localdb key create` pasted manually, or a pre-T4 file) and a login-token
+//! `localdb key create` pasted manually, or an older file written before
+//! login-token support) and a login-token
 //! entry (`access_token`/`refresh_token`/`access_expires_at`, from
 //! `localdb login`) are both valid per base-URL entries; `lookup_secret`
 //! prefers `access_token` when both are present. The `LOCALDB_API_KEY`
@@ -39,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single base-URL's cached credential. Every field is optional so the
 /// same struct represents both the legacy API-key shape (`secret` only)
-/// and the T4 login-token shape (`access_token`/`refresh_token`/
+/// and the login-token shape (`access_token`/`refresh_token`/
 /// `access_expires_at`) — and tolerates whichever fields a future version
 /// adds, since unknown fields are simply absent here rather than rejected.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

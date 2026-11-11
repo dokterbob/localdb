@@ -334,9 +334,9 @@ async fn try_decide_access_request_approves_with_resulting_user() {
     assert_eq!(found.decided_at.as_deref(), Some("2026-06-11T00:00:00Z"));
 }
 
-/// Finding #4: two decisions racing the same request must never both take
-/// effect — the second (whichever it is) must observe the first's decision
-/// already landed and report `false` rather than overwriting it.
+/// Two decisions racing the same request must never both take effect — the
+/// second (whichever it is) must observe the first's decision already
+/// landed and report `false` rather than overwriting it.
 #[tokio::test]
 async fn try_decide_access_request_refuses_once_already_decided() {
     let (_dir, _backend, store) = make_store().await;
@@ -581,9 +581,9 @@ async fn collect_access_request_unknown_id_returns_false() {
         .unwrap());
 }
 
-/// T6's documented concurrency choice (`AuthService::redeem_invite`'s doc
-/// comment): a double-redemption race can over-count an invite's `uses`,
-/// but it must never double-mint a user under the same requested name — the
+/// `AuthService::redeem_invite`'s documented concurrency choice: a
+/// double-redemption race can over-count an invite's `uses`, but it must
+/// never double-mint a user under the same requested name — the
 /// `users.name` UNIQUE constraint is the backstop that makes that safe, at
 /// the store level, independent of whatever ordering the service layer
 /// uses. This simulates two racing redeemers who both decided to use the

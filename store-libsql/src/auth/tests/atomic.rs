@@ -235,15 +235,15 @@ async fn redeem_closed_invite_revoked_or_expired_leaves_no_partial_state() {
     assert!(store.find_access_request("ar2").await.unwrap().is_none());
 }
 
-/// Finding #6/#7-class guard, direct-store coverage: a redemption whose
-/// credential inherits a `minted_by_family` already recorded in
-/// `auth_compromised_families` must be refused, not minted, even though the
-/// invite use is otherwise eligible to reserve. Mirrors
+/// Direct-store coverage: a redemption whose credential inherits a
+/// `minted_by_family` already recorded in `auth_compromised_families` must
+/// be refused, not minted, even though the invite use is otherwise eligible
+/// to reserve. Mirrors
 /// `core::auth::store::tests::redeem_open_invite_refuses_a_credential_minted_by_a_compromised_family`
 /// (the fake store's equivalent) — this is the real libsql transaction's own
 /// `insert_token_on` check (`atomic.rs`'s `redeem_open_invite`), which that
-/// fake-store test alone never exercises. Removing the `if
-/// !insert_token_on(&tx, credential).await?` guard in
+/// fake-store test alone never exercises. Removing the
+/// `if !insert_token_on(&tx, credential).await?` guard in
 /// `redeem_open_invite` turns this test's `unwrap_err()` into a panic.
 #[tokio::test]
 async fn redeem_open_invite_refuses_a_credential_minted_by_a_compromised_family() {

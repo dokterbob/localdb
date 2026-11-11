@@ -20,7 +20,7 @@ pub const ACCESS_TOKEN_TTL_SECS: i64 = 60 * 60;
 /// Refresh token TTL (D1): 30 days, rotated on use.
 pub const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// Authorization-code TTL (T4, specs/05-surfaces.md §3.1 R5): 10 minutes,
+/// Authorization-code TTL (specs/05-surfaces.md §3.1 R5): 10 minutes,
 /// single-use.
 pub const AUTH_CODE_TTL_SECS: i64 = 10 * 60;
 

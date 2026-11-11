@@ -1,5 +1,5 @@
 //! Persistence for dynamically registered OAuth2 clients (`oauth_clients`
-//! table, T7, RFC 7591). Mirrors `auth_codes.rs`'s conventions.
+//! table, RFC 7591). Mirrors `auth_codes.rs`'s conventions.
 
 use localdb_core::auth::OAuthClientRow;
 use localdb_core::Error;

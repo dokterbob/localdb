@@ -1,4 +1,4 @@
-//! T6 integration tests: invite create/list/revoke, closed-mode access
+//! Integration tests: invite create/list/revoke, closed-mode access
 //! request approve/deny, and the public redeem/poll surface — via
 //! `tower::ServiceExt::oneshot` against the full `build_router` router, the
 //! same shape `admin_management.rs`/`oauth.rs` use.
@@ -58,8 +58,8 @@ async fn body_string(body: Body) -> String {
 }
 
 /// Like `request_with_bearer`, but also sets a `Host` header — needed since
-/// `POST /v1/invites`'s `consent_url` is built from `resolve_base_url`
-/// (finding #9), which requires either a configured `server.public_url` or a
+/// `POST /v1/invites`'s `consent_url` is built from `resolve_base_url`,
+/// which requires either a configured `server.public_url` or a
 /// `Host` header to resolve a base URL at all. `oneshot` requests carry no
 /// `Host` header unless one is set explicitly (unlike a real TCP listener),
 /// so every `create_invite` call needs one to keep resolving successfully.
@@ -249,7 +249,7 @@ async fn admin_invite_create_list_revoke_happy_path() {
 }
 
 // ---------------------------------------------------------------------------
-// consent_url base resolution (finding #9): `server.public_url` when
+// consent_url base resolution: `server.public_url` when
 // configured, else the sanitized `Host` header, else 400 — matching
 // `server::auth::base_url::resolve_base_url` and how discovery.rs already
 // tests it against the `.well-known` endpoints.
@@ -703,7 +703,7 @@ async fn poll_route_works_without_a_bearer_when_auth_is_enforced() {
 }
 
 // ---------------------------------------------------------------------------
-// Consent page (T4 seam): open-mode issues an OAuth code as the new user;
+// Consent page: open-mode issues an OAuth code as the new user;
 // closed-mode shows a request-submitted page; hostile params are escaped.
 // ---------------------------------------------------------------------------
 

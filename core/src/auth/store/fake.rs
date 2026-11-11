@@ -24,7 +24,7 @@ struct FakeAuthStoreInner {
     /// Test-only hook (see `FakeAuthStore::poison_next_insert_token`): when
     /// `true`, the *next* `insert_token` call fails instead of persisting —
     /// simulates a transient store failure partway through a multi-step
-    /// mint (T6 finding #6/#7 regression tests).
+    /// mint, for testing how a redemption's own partial-mint guards react.
     poison_next_insert_token: bool,
     /// Test-only hook (see `FakeAuthStore::poison_next_find_oauth_client`):
     /// when `true`, the *next* `find_oauth_client` call fails instead of

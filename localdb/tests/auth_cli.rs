@@ -1,4 +1,4 @@
-//! Integration tests for the T3 auth surface of the `localdb` binary:
+//! Integration tests for the auth surface of the `localdb` binary:
 //! break-glass `user add` / `key create` (embedded, direct-DB), the
 //! daemon-running refusal, exit code 6 on 401/403 daemon answers, and
 //! bearer injection (`LOCALDB_API_KEY`, `credentials.json`) into
@@ -133,12 +133,11 @@ fn key_create_for_unknown_user_exits_2_with_hint() {
 
 #[test]
 fn user_add_without_direct_db_routes_to_daemon_and_reports_unreachable() {
-    // T5: `user add` without `--direct-db` now prefers the daemon when one
+    // `user add` without `--direct-db` prefers the daemon when one
     // appears to be running (LOCALDB_DAEMON_URL override, same trick every
     // other daemon-routing test uses) — nothing is actually listening on
     // this port, so the HTTP attempt fails with daemon_unreachable (exit 5),
-    // not a refusal. This replaces the old T3 behavior where `user add`
-    // hard-refused (exit 4) whenever a daemon appeared to be running.
+    // not a refusal, even though a daemon appears to be running.
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
@@ -186,8 +185,9 @@ fn user_add_direct_db_flag_bypasses_daemon_even_when_running() {
 
 #[test]
 fn user_add_daemon_routed_succeeds_with_admin_bearer() {
-    // The primary T5 path: a daemon is genuinely up, and an admin bearer
-    // routes the write over HTTP instead of falling back to direct-DB.
+    // The primary daemon-routed path: a daemon is genuinely up, and an
+    // admin bearer routes the write over HTTP instead of falling back to
+    // direct-DB.
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
@@ -364,8 +364,8 @@ fn credentials_json_is_used_when_env_key_absent() {
     let base_url = format!("http://127.0.0.1:{port}");
 
     // credentials.json lives next to config.yaml, keyed by daemon base URL
-    // (specs/03-config.md §6). Written by `localdb login` in T4; hand-rolled
-    // here since T3 ships only the reader.
+    // (specs/03-config.md §6). `localdb login` writes it; hand-rolled here
+    // since this binary only reads it.
     std::fs::write(
         dir.path().join("credentials.json"),
         format!(r#"{{"version":1,"credentials":{{"{base_url}":{{"secret":"ldb_cached_key"}}}}}}"#),
@@ -410,7 +410,7 @@ fn user_and_key_subcommands_are_registered() {
 }
 
 // ---------------------------------------------------------------------------
-// T4: login / logout CLI surface
+// login / logout CLI surface
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -468,7 +468,7 @@ fn logout_without_a_cached_credential_reports_nothing_to_clear() {
 }
 
 // ---------------------------------------------------------------------------
-// T5: user list/remove/set-role, key list/revoke, store grant/revoke
+// user list/remove/set-role, key list/revoke, store grant/revoke
 // (direct-DB, daemon-absent mode).
 // ---------------------------------------------------------------------------
 
@@ -828,7 +828,7 @@ fn store_grant_on_private_store_exits_6() {
 }
 
 // ---------------------------------------------------------------------------
-// T5: member key against a mock daemon that answers 403 for an admin op
+// member key against a mock daemon that answers 403 for an admin op
 // ---------------------------------------------------------------------------
 
 /// A mock daemon that always answers 403 Forbidden, regardless of path or

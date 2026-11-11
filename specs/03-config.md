@@ -162,6 +162,9 @@ path; `paths.*` in config override the rest.
 - **Validation:** fail fast at load with path-precise errors
   (`stores[0].sources[1].refresh: invalid duration`). Surfaces map this to `invalid_config`
   ([05-surfaces.md](05-surfaces.md) §5).
+- **Load time:** the daemon reads its configuration once at startup; it does not watch the file or
+  re-read it while running. Edits to the config file take effect only on the next
+  `localdb serve`/daemon restart.
 - **`http.rate_limit`:** `requests_per_second` and `burst` are both `u32` and must each be `>= 1`;
   `0` is rejected with a path-precise message
   (`http.rate_limit.requests_per_second must be greater than zero`, and likewise for `burst`) rather
