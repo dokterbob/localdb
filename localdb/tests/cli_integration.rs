@@ -61,7 +61,7 @@ fn write_default_config(dir: &TempDir) {
 /// `$XDG_DATA_HOME`/`$XDG_CACHE_HOME`/`$XDG_STATE_HOME`, falling back to
 /// `$HOME`-derived defaults when any of those are unset. Setting all five
 /// env vars covers both platforms CI runs on (`.github/workflows/ci.yml`:
-/// `ubuntu-latest`/`ubuntu-22.04` and `macos-14`/`macos-latest`).
+/// `ubuntu-latest`/`ubuntu-22.04` and `macos-15`/`macos-latest`).
 fn cmd_with_fresh_dir(dir: &TempDir) -> Command {
     let mut c = cmd();
     c.env("LOCALDB_CONFIG", dir.path().join("config.yaml"));
