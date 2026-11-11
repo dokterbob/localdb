@@ -74,6 +74,97 @@ fn lookup_returns_none_for_malformed_json() {
 // primitives it builds on.
 
 // -----------------------------------------------------------------
+// Mutation paths must never treat an unreadable/malformed file as empty:
+// only a missing file is empty; anything else is a reported error so a
+// write/remove can't silently replace credentials it failed to parse.
+// -----------------------------------------------------------------
+
+#[test]
+fn write_entry_fails_on_malformed_json_instead_of_overwriting() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(&dir, "not json at all");
+
+    let result = write_entry(
+        &path,
+        "http://127.0.0.1:7700",
+        CredentialEntry {
+            secret: Some("ldb_new".into()),
+            ..Default::default()
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "not json at all",
+        "a malformed file must be left untouched, not replaced with the new entry alone"
+    );
+}
+
+#[test]
+fn remove_entry_fails_on_malformed_json_instead_of_overwriting() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(&dir, "not json at all");
+
+    let result = remove_entry(&path, "http://127.0.0.1:7700");
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json at all");
+}
+
+#[test]
+fn write_entry_error_names_the_file() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(&dir, "not json at all");
+
+    let error = write_entry(&path, "http://x", CredentialEntry::default()).unwrap_err();
+
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "error should name the unparseable file: {error}"
+    );
+}
+
+#[test]
+fn write_entry_on_unreadable_directory_path_fails_rather_than_overwriting() {
+    // A credentials_file path that is itself a directory can't be read as a
+    // file; this must surface as an error, not be treated as "missing".
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials.json");
+    std::fs::create_dir(&path).unwrap();
+
+    let result = write_entry(&path, "http://x", CredentialEntry::default());
+    assert!(result.is_err());
+}
+
+// -----------------------------------------------------------------
+// Temp-file handling: a failed write must never leave the predictable
+// final path, or any temp file, behind.
+// -----------------------------------------------------------------
+
+#[test]
+fn write_file_removes_temp_file_when_rename_fails() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("credentials.json");
+    // Occupy the destination with a directory so the final rename fails
+    // (a regular file can never be renamed onto an existing directory).
+    std::fs::create_dir(&path).unwrap();
+
+    let result = write_file(&path, &CredentialsFile::default());
+
+    assert!(result.is_err());
+    let leftover: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "a failed rename must not leave a temp file behind: {leftover:?}"
+    );
+}
+
+// -----------------------------------------------------------------
 // T4: writer, login-token shape, atomicity, permissions
 // -----------------------------------------------------------------
 

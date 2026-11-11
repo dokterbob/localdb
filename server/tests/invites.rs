@@ -119,7 +119,7 @@ async fn redeem_invite(app: Router, token: &str, name: &str) -> (StatusCode, Val
         app,
         Method::POST,
         "/v1/invites/redeem",
-        Some(json!({ "token": token, "name": name })),
+        Some(json!({ "token": token, "requested_name": name })),
         None,
     )
     .await;

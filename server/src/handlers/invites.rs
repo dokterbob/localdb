@@ -333,7 +333,7 @@ pub async fn deny_request(
 #[derive(Debug, Deserialize)]
 pub struct RedeemInviteRequest {
     pub token: String,
-    pub name: String,
+    pub requested_name: String,
 }
 
 /// `POST /v1/invites/redeem` (public): `open` mode -> `201` with the new
@@ -349,12 +349,16 @@ pub async fn redeem_invite(
     State(state): State<AppState>,
     SecretJson(req): SecretJson<RedeemInviteRequest>,
 ) -> Result<Response, ApiError> {
-    if req.token.trim().is_empty() || req.name.trim().is_empty() {
+    if req.token.trim().is_empty() || req.requested_name.trim().is_empty() {
         return Err(ApiError(CoreError::InvalidRequest {
-            message: "token and name are both required".to_string(),
+            message: "token and requested_name are both required".to_string(),
         }));
     }
-    match state.auth().redeem_invite(&req.token, &req.name).await? {
+    match state
+        .auth()
+        .redeem_invite(&req.token, &req.requested_name)
+        .await?
+    {
         RedeemOutcome::Open {
             user,
             grants,

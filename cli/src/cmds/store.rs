@@ -394,6 +394,11 @@ pub(crate) async fn run_store_revoke_async(ctx: &CliContext, store: &str, user: 
     let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
+    let prompt = format!("This revokes '{user}' access to store '{store}'. Continue?");
+    if !confirm_destructive(ctx, &prompt) {
+        return;
+    }
+
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let url = format!(
             "{base_url}/v1/stores/{store}/grants/{user}",

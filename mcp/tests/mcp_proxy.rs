@@ -739,6 +739,43 @@ async fn proxy_connect_unknown_store_name_errors() {
     }
 }
 
+/// An upstream that rejects the connect handshake itself with a 401 must
+/// surface as `ProxyConnectError::Unauthorized` (-> exit 6), not
+/// `Unreachable` (-> exit 5): the daemon answered, and answered that the
+/// caller has no valid credential — a problem `localdb login`/
+/// `LOCALDB_API_KEY` fixes, not a reachability problem a retry or a daemon
+/// restart would.
+#[tokio::test]
+async fn proxy_connect_rejects_unauthorized_upstream_with_unauthorized_not_unreachable() {
+    async fn reject_unauthorized() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::UNAUTHORIZED)
+            .header(axum::http::header::WWW_AUTHENTICATE, "Bearer")
+            .body(axum::body::Body::empty())
+            .expect("building a fixed 401 response")
+    }
+    let app = Router::new().fallback(reject_unauthorized);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback listener");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let bearer: Arc<dyn mcp::proxy::BearerSource> =
+        Arc::new(mcp::proxy::StaticBearer("ldb_test".to_string()));
+    let err = ProxyHandler::connect_with_auth(&base_url, &[], Some(bearer))
+        .await
+        .err()
+        .expect("a 401 at connect must fail");
+
+    match err {
+        mcp::ProxyConnectError::Unauthorized => {}
+        other => panic!("expected Unauthorized (-> exit 6), got {other:?}"),
+    }
+}
+
 /// A scoped session serves only the five tools whose store semantics the
 /// proxy knows. Any other name is refused rather than relayed, so the first
 /// mutating tool added under `--allow-write` cannot silently bypass the

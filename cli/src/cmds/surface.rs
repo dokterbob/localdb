@@ -211,6 +211,16 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                 Err(ProxyConnectError::StoreNotFound(name)) => {
                     exit_err(&Error::StoreNotFound { id: name }, ctx.json);
                 }
+                Err(ProxyConnectError::Unauthorized) => {
+                    exit_err(
+                        &Error::Unauthorized {
+                            message: "not authenticated; run `localdb login` or set \
+                                      LOCALDB_API_KEY"
+                                .to_string(),
+                        },
+                        ctx.json,
+                    );
+                }
                 Err(ProxyConnectError::Unreachable(e)) => {
                     // The underlying transport/handshake error (`e`) is otherwise
                     // discarded — `exit_err` below only ever prints the generic

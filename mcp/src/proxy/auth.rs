@@ -193,7 +193,7 @@ impl StreamableHttpClient for RefreshingHttpClient {
 /// whose `response.error_for_status()` call turns any 401 into one,
 /// `WWW-Authenticate` or not). Either way, asking the source for a fresh
 /// token and retrying once is the right response.
-fn is_auth_rejection(error: &StreamableHttpError<reqwest::Error>) -> bool {
+pub(super) fn is_auth_rejection(error: &StreamableHttpError<reqwest::Error>) -> bool {
     match error {
         StreamableHttpError::AuthRequired(_) => true,
         StreamableHttpError::Client(e) => e.status() == Some(reqwest::StatusCode::UNAUTHORIZED),

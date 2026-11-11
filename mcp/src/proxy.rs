@@ -81,14 +81,15 @@ impl ProxyScope {
     /// store the *upstream* would resolve it to, or `None` if it names no
     /// store at all.
     ///
-    /// Id pass before name pass, matching `tools::select_mcp_stores` exactly:
-    /// ids are unique and machine-generated, names are user-chosen and may
-    /// legitimately collide with some other store's id.
+    /// Id pass before name pass, matching `tools::select_mcp_stores` exactly
+    /// — both go through `crate::store_lookup::resolve_by_id_then_name`.
     fn resolve(&self, value: &str) -> Option<&UpstreamStore> {
-        self.upstream_stores
-            .iter()
-            .find(|s| s.id == value)
-            .or_else(|| self.upstream_stores.iter().find(|s| s.name == value))
+        crate::store_lookup::resolve_by_id_then_name(
+            &self.upstream_stores,
+            value,
+            |s| s.id.as_str(),
+            |s| s.name.as_str(),
+        )
     }
 
     /// Whether `id` is inside the scope.
@@ -162,8 +163,15 @@ fn scope_rejection(requested: &str, allowed: &str) -> CallToolResult {
 #[derive(Debug)]
 pub enum ProxyConnectError {
     /// The upstream could not be reached, or its handshake/`list_stores`
-    /// call failed -> `daemon_unreachable`, exit 5.
+    /// call failed for a reason other than authentication ->
+    /// `daemon_unreachable`, exit 5.
     Unreachable(anyhow::Error),
+    /// The upstream rejected the connect handshake itself with a 401 ->
+    /// unauthenticated, exit 6. Distinct from `Unreachable`: the daemon
+    /// answered, and answered that the caller has no valid credential, which
+    /// is a problem `localdb login`/`LOCALDB_API_KEY` fixes, not one that
+    /// goes away by retrying or restarting the daemon.
+    Unauthorized,
     /// A `--store` name the daemon does not have -> `store_not_found`, exit 3.
     StoreNotFound(String),
 }
@@ -172,12 +180,57 @@ impl std::fmt::Display for ProxyConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(e) => write!(f, "mcp proxy: upstream unreachable: {e}"),
+            Self::Unauthorized => write!(
+                f,
+                "mcp proxy: upstream rejected the connection as unauthenticated"
+            ),
             Self::StoreNotFound(name) => write!(f, "store not found: {name}"),
         }
     }
 }
 
 impl std::error::Error for ProxyConnectError {}
+
+/// Classify a failed upstream `initialize` handshake: a transport error
+/// whose cause, anywhere in its `source()` chain, is the upstream rejecting
+/// the connection as unauthenticated becomes [`ProxyConnectError::Unauthorized`];
+/// everything else (connection refused, timeout, protocol mismatch, ...)
+/// stays [`ProxyConnectError::Unreachable`].
+///
+/// Both transports this module builds (`RefreshingHttpClient` and the plain
+/// `reqwest::Client` from `StreamableHttpClientTransport::from_config`) have
+/// `StreamableHttpClient::Error = reqwest::Error`, so the transport-level
+/// error rmcp boxes into `ClientInitializeError::TransportError` is always a
+/// `StreamableHttpError<reqwest::Error>` — the same type
+/// `proxy::auth::is_auth_rejection` already classifies for a rejected
+/// in-session call.
+fn connect_error_from_initialize(error: rmcp::service::ClientInitializeError) -> ProxyConnectError {
+    let is_unauthorized = match &error {
+        rmcp::service::ClientInitializeError::TransportError { error: boxed, .. } => {
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(boxed.error.as_ref());
+            let mut found = false;
+            while let Some(current) = cause {
+                if let Some(http_error) = current.downcast_ref::<
+                    rmcp::transport::streamable_http_client::StreamableHttpError<reqwest::Error>,
+                >() {
+                    if auth::is_auth_rejection(http_error) {
+                        found = true;
+                        break;
+                    }
+                }
+                cause = current.source();
+            }
+            found
+        }
+        _ => false,
+    };
+
+    if is_unauthorized {
+        ProxyConnectError::Unauthorized
+    } else {
+        ProxyConnectError::Unreachable(error.into())
+    }
+}
 
 /// A `ServerHandler` that proxies every `tools/list`/`tools/call` request to
 /// an upstream rmcp server reached over Streamable HTTP — used when
@@ -249,14 +302,14 @@ impl ProxyHandler {
                 rmcp::model::ClientConfig::default()
                     .serve(transport)
                     .await
-                    .map_err(|e| ProxyConnectError::Unreachable(e.into()))?
+                    .map_err(connect_error_from_initialize)?
             }
             None => {
                 let transport = StreamableHttpClientTransport::from_config(config);
                 rmcp::model::ClientConfig::default()
                     .serve(transport)
                     .await
-                    .map_err(|e| ProxyConnectError::Unreachable(e.into()))?
+                    .map_err(connect_error_from_initialize)?
             }
         };
 

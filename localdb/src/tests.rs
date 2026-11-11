@@ -502,6 +502,45 @@ fn short_store_flag_after_subcommand() {
     }
 }
 
+/// `--invite` drives an entirely separate, browser-free redemption path
+/// (`cli::cmds::login::perform_invite_login`) — combining it with either
+/// `--setup-code` or `--no-browser` (both of which only make sense for the
+/// interactive OAuth flow) must be rejected at the clap level (exit 2),
+/// never silently ignored.
+#[test]
+fn login_invite_conflicts_with_setup_code() {
+    let result = Cli::try_parse_from([
+        "localdb",
+        "login",
+        "--invite",
+        "ldb_token",
+        "--setup-code",
+        "ldb_setup",
+    ]);
+    assert!(
+        result.is_err(),
+        "--invite and --setup-code together must be rejected"
+    );
+}
+
+#[test]
+fn login_invite_conflicts_with_no_browser() {
+    let result = Cli::try_parse_from(["localdb", "login", "--invite", "ldb_token", "--no-browser"]);
+    assert!(
+        result.is_err(),
+        "--invite and --no-browser together must be rejected"
+    );
+}
+
+#[test]
+fn login_invite_alone_still_parses() {
+    let cli = Cli::try_parse_from(["localdb", "login", "--invite", "ldb_token"]).unwrap();
+    match cli.command {
+        Command::Login { invite, .. } => assert_eq!(invite, Some("ldb_token".to_string())),
+        other => panic!("expected Login command, got: {other:?}"),
+    }
+}
+
 /// Verify global flags exist.
 #[test]
 fn global_flags_present() {

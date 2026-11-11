@@ -545,9 +545,10 @@ fn user_set_role_then_remove_non_last_admin() {
         .success()
         .stdout(predicates::str::contains("admin"));
 
-    // carla can now be removed — dan remains an admin.
+    // carla can now be removed — dan remains an admin. `user remove` is
+    // destructive, so it now prompts for confirmation; `--yes` skips it.
     cmd_with_dir(&dir)
-        .args(["user", "remove", "carla"])
+        .args(["user", "remove", "carla", "--yes"])
         .assert()
         .success();
 
@@ -588,8 +589,10 @@ fn user_remove_last_admin_exits_2() {
         .assert()
         .success();
 
+    // `--yes` so this exercises the last-admin guard itself, not the
+    // (also exit-2) destructive-confirmation refusal `user remove` now has.
     let output = cmd_with_dir(&dir)
-        .args(["user", "remove", "solo"])
+        .args(["user", "remove", "solo", "--yes"])
         .output()
         .unwrap();
     assert_eq!(
@@ -667,6 +670,49 @@ fn key_list_shows_keys_without_secrets_then_revoke() {
     );
 }
 
+/// Human-readable `key list` shows the owning user only once a listing
+/// actually spans more than one user — a `--user`-filtered (single-user)
+/// listing has no need to repeat it.
+#[test]
+fn key_list_human_output_shows_owner_only_when_more_than_one_user() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["user", "add", "gina"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["user", "add", "hank"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["key", "create", "--user", "gina"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["key", "create", "--user", "hank"])
+        .assert()
+        .success();
+
+    let single_user = cmd_with_dir(&dir)
+        .args(["key", "list", "--user", "gina"])
+        .output()
+        .unwrap();
+    let single_stdout = String::from_utf8_lossy(&single_user.stdout);
+    assert!(
+        !single_stdout.contains("gina"),
+        "a single-user listing must not repeat the already-implied owner: {single_stdout}"
+    );
+
+    let all_users = cmd_with_dir(&dir).args(["key", "list"]).output().unwrap();
+    let all_stdout = String::from_utf8_lossy(&all_users.stdout);
+    assert!(
+        all_stdout.contains("gina") && all_stdout.contains("hank"),
+        "a listing spanning more than one user must show each row's owner: {all_stdout}"
+    );
+}
+
 #[test]
 fn key_revoke_unknown_id_exits_2() {
     let dir = TempDir::new().unwrap();
@@ -701,15 +747,19 @@ fn store_grant_revoke_direct_db_roundtrip() {
         .success()
         .stdout(predicates::str::contains("frank"));
 
+    // `store revoke` is destructive, so it now prompts for confirmation;
+    // `--yes` skips it.
     cmd_with_dir(&dir)
-        .args(["store", "revoke", "shared-notes", "frank"])
+        .args(["store", "revoke", "shared-notes", "frank", "--yes"])
         .assert()
         .success()
         .stdout(predicates::str::contains("frank"));
 
-    // Revoking again (no grant left) is a no-op error.
+    // Revoking again (no grant left) is a no-op error, not the
+    // (also exit-2) destructive-confirmation refusal — `--yes` again so
+    // this exercises the no-grant-left check itself.
     let output = cmd_with_dir(&dir)
-        .args(["store", "revoke", "shared-notes", "frank"])
+        .args(["store", "revoke", "shared-notes", "frank", "--yes"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));

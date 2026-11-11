@@ -896,6 +896,15 @@ rm <data_dir>/daemon.sock
 After removing the socket, `localdb status` should report `daemon: not running (embedded mode)` and
 the MCP server will start normally.
 
+### `not authenticated; run localdb login or set LOCALDB_API_KEY` (exit 6)
+
+When `localdb mcp` proxies to a daemon running with `server.auth: required`, it sends whatever
+credential it has — a cached token from `localdb login`, or `LOCALDB_API_KEY` — on the connect
+handshake itself. If the daemon rejects that handshake with `401`, `localdb mcp` exits 6 with this
+message rather than the generic "daemon is unreachable" (exit 5): the daemon answered, and answered
+that the connection has no valid credential, which `localdb login` or `LOCALDB_API_KEY` fixes — not
+a reachability problem a retry or a daemon restart would.
+
 ### A remote HTTP MCP client reports "needs authentication"
 
 This isn't an auth prompt — it's almost always `rmcp`'s DNS-rebinding `Host`-header check rejecting

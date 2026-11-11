@@ -94,6 +94,7 @@ pub mod entrypoint;
 pub mod handler;
 pub mod http;
 pub mod proxy;
+mod store_lookup;
 pub mod store_provider;
 pub mod tools;
 

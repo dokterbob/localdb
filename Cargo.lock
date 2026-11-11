@@ -3034,6 +3034,7 @@ dependencies = [
  "localdb-server",
  "localdb-store-libsql",
  "percent-encoding",
+ "rand 0.8.8",
  "reqwest 0.13.5",
  "serde",
  "serde_json",

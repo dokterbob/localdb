@@ -417,8 +417,12 @@ Arguments:
   <USER>   User name or ID
 ```
 
+Destructive, so it prompts for confirmation (`-y`/`--yes` skips the prompt; non-interactive without
+`--yes` is `invalid_request`, exit 2) — the same rule `store remove` applies.
+
 ```
 $ localdb store revoke shared-docs alice
+This revokes 'alice' access to store 'shared-docs'. Continue? [y/N] y
 Revoked alice's access to 'shared-docs'
 ```
 
@@ -449,25 +453,34 @@ Options:
 Without `--invite`, drives the browser OAuth2 authorization-code + PKCE flow: opens a browser at the
 daemon's `/authorize` consent page, receives the resulting code on a local loopback listener, and
 exchanges it for an access + refresh token pair at `/token`, caching both in `credentials.json`.
-`--no-browser` skips opening a browser and instead prints a URL to visit and reads the resulting
-code back from stdin (useful over SSH/headless).
+`--no-browser` skips opening a browser and instead prints a URL to visit (and a paste prompt) to
+**stderr** and reads the resulting code back from stdin (useful over SSH/headless) — `--json`
+guarantees stdout carries nothing but the final JSON result, even in this interactive mode.
+`--invite` conflicts with both `--setup-code` and `--no-browser` (exit 2): it takes a wholly
+separate, browser-free path, so neither flag has anything to apply to.
 
 With `--invite <token>` (T6): redeems the invite directly against `POST /v1/invites/redeem` — no
 browser round trip. `open`-mode invites persist the redeemed API key immediately; `closed`-mode
 invites print a "waiting for admin approval" message and poll until an admin approves (credential
 persisted) or denies (non-zero exit).
 
+On success (either path), `login` fetches the caller's resolved identity via `GET /v1/auth/me` using
+the credential it just cached, and reports it:
+
 ```
 $ localdb login
-Opening browser to http://127.0.0.1:7700/authorize?...
-Waiting for authorization...
-Logged in as alice (admin)
+Logged in to http://127.0.0.1:7700 as 'alice' (admin).
 ```
 
 ```
 $ localdb login --invite ldb_abc123 --name bob
-Redeeming invite...
-Logged in as bob (member)
+Logged in to http://127.0.0.1:7700 as 'bob' (member).
+```
+
+`--json` carries the same identity, additively, alongside the existing `status`/`base_url` fields:
+
+```json
+{ "status": "ok", "base_url": "http://127.0.0.1:7700", "name": "alice", "role": "admin" }
 ```
 
 ## `localdb logout`
@@ -545,11 +558,16 @@ alice (admin)
 bob (member)
 
 $ localdb user remove bob
+This permanently removes user 'bob' and revokes their credentials. Continue? [y/N] y
 Removed user bob
 
 $ localdb user set-role bob admin
 Set bob's role to admin
 ```
+
+`user remove` is destructive, so it prompts for confirmation (`-y`/`--yes` skips the prompt;
+non-interactive without `--yes` is `invalid_request`, exit 2) — the same rule `store remove`
+applies.
 
 Deleting or demoting the **last remaining admin** is rejected (`invalid_request`, exit `2`) — this
 guard rail checks the resulting state generically, not just self-targeted calls.
@@ -601,6 +619,16 @@ $ localdb key list --user alice
 
 $ localdb key revoke 01K...
 Revoked key 01K...
+```
+
+Without `--user`, `key list` lists every user's keys. The owner is only shown when the listing
+actually spans more than one user — a single-user listing (via `--user`, or because only one user
+has any keys) omits it, since every row's owner is already implied:
+
+```
+$ localdb key list
+01K...1 (alice)
+01K...2 (bob)
 ```
 
 ---

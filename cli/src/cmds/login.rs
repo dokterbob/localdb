@@ -22,10 +22,13 @@ use serde_json::json;
 use crate::{
     credentials::CredentialEntry,
     daemon_client::{
-        encode_path_segment, probe_daemon, resolved_config_file, CliContext, DaemonState,
+        build_http_client, encode_path_segment, probe_daemon, resolved_config_file, CliContext,
+        DaemonState,
     },
     normalize::{exit_err, print_json},
 };
+
+mod callback;
 
 const CLIENT_ID: &str = "localdb-cli";
 
@@ -71,15 +74,7 @@ pub(crate) async fn run_login_async(
         )
         .await
         {
-            Ok(joined_name) => {
-                if ctx.json {
-                    print_json(
-                        &json!({ "status": "ok", "base_url": base_url, "name": joined_name }),
-                    );
-                } else {
-                    println!("Logged in to {base_url} as '{joined_name}'.");
-                }
-            }
+            Ok(_joined_name) => report_login_success(ctx, &base_url).await,
             Err(e) => exit_err(&e, ctx.json),
         }
         return;
@@ -97,15 +92,76 @@ pub(crate) async fn run_login_async(
     )
     .await
     {
-        Ok(_summary) => {
-            if ctx.json {
-                print_json(&json!({ "status": "ok", "base_url": base_url }));
-            } else {
-                println!("Logged in to {base_url}.");
-            }
-        }
+        Ok(()) => report_login_success(ctx, &base_url).await,
         Err(e) => exit_err(&e, ctx.json),
     }
+}
+
+/// Report a completed login: fetch the caller's resolved identity via
+/// `GET /v1/auth/me`, using the credential this invocation just persisted
+/// (read back through the same `fresh_bearer_for_url` path every other
+/// daemon-bound request resolves its bearer through), and print/emit it
+/// alongside `base_url`. Shared by both the OAuth and invite login paths, so
+/// the two report identically rather than the invite path only ever
+/// knowing the name it asked for (not the daemon's actual, possibly
+/// different, resolved role).
+///
+/// A failure here exits non-zero even though the credential is already
+/// cached: the identity line is part of what a successful `login` reports,
+/// not a best-effort decoration bolted on after the real work is done.
+async fn report_login_success(ctx: &CliContext, base_url: &str) {
+    let bearer = match crate::daemon_client::fresh_bearer_for_url(ctx, base_url).await {
+        Some(bearer) => bearer,
+        None => exit_err(
+            &Error::Internal {
+                message: "no cached credential immediately after persisting one".to_string(),
+                correlation_id: "login_identity_bearer".to_string(),
+            },
+            ctx.json,
+        ),
+    };
+    let (name, role) = match fetch_identity(base_url, &bearer).await {
+        Ok(identity) => identity,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+    if ctx.json {
+        print_json(&json!({ "status": "ok", "base_url": base_url, "name": name, "role": role }));
+    } else {
+        println!("Logged in to {base_url} as '{name}' ({role}).");
+    }
+}
+
+/// `GET /v1/auth/me` with the given bearer, returning `(name, role)`.
+async fn fetch_identity(base_url: &str, bearer: &str) -> Result<(String, String), Error> {
+    let client = build_http_client(std::time::Duration::from_secs(10))?;
+    let resp = client
+        .get(format!("{base_url}/v1/auth/me"))
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .map_err(|_| Error::DaemonUnreachable)?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        return Err(crate::daemon_client::daemon_response_error(status, &body));
+    }
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Internal {
+            message: "auth/me response is missing name".to_string(),
+            correlation_id: "login_identity_response".to_string(),
+        })?
+        .to_string();
+    let role = body
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Internal {
+            message: "auth/me response is missing role".to_string(),
+            correlation_id: "login_identity_response".to_string(),
+        })?
+        .to_string();
+    Ok((name, role))
 }
 
 /// The requested user name for an invite redemption: `--name` if given,
@@ -153,17 +209,11 @@ async fn perform_invite_login(
 ) -> Result<String, Error> {
     let requested_name = resolve_requested_name(name)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Internal {
-            message: format!("cannot build HTTP client: {e}"),
-            correlation_id: "login_invite_client".to_string(),
-        })?;
+    let client = build_http_client(std::time::Duration::from_secs(30))?;
 
     let resp = client
         .post(format!("{base_url}/v1/invites/redeem"))
-        .json(&json!({ "token": invite_token, "name": requested_name }))
+        .json(&json!({ "token": invite_token, "requested_name": requested_name }))
         .send()
         .await
         .map_err(|_| Error::DaemonUnreachable)?;
@@ -357,13 +407,7 @@ async fn revoke_and_remove(path: &std::path::Path, base_url: &str) -> Result<boo
         .await
         .map_err(storage_error)?;
     if let Some(entry) = lock.lookup(base_url) {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| Error::Internal {
-                message: e.to_string(),
-                correlation_id: "logout_client".into(),
-            })?;
+        let client = build_http_client(std::time::Duration::from_secs(10))?;
         for secret in [entry.access_token, entry.refresh_token, entry.secret]
             .into_iter()
             .flatten()
@@ -408,11 +452,6 @@ async fn resolve_login_base_url(ctx: &CliContext, url: Option<&str>) -> String {
     }
 }
 
-struct LoginSummary {
-    #[allow(dead_code)]
-    base_url: String,
-}
-
 /// Drive the authorization-code + PKCE flow end to end. `open_browser` is
 /// injected so tests can substitute a fake "browser" (an HTTP client that
 /// submits the consent form) instead of actually launching one; production
@@ -428,17 +467,22 @@ async fn perform_login(
     no_browser: bool,
     open_browser: impl Fn(&str) -> bool,
     callback_timeout: std::time::Duration,
-) -> Result<LoginSummary, Error> {
+) -> Result<(), Error> {
     let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
     let (csrf_state, _) = localdb_core::auth::generate_pkce_pair();
 
-    let (redirect_uri, code, returned_state) = if no_browser {
+    let (redirect_uri, code) = if no_browser {
         let redirect_uri = localdb_core::auth::OOB_REDIRECT_URI.to_string();
         let authorize_url =
             build_authorize_url(base_url, &redirect_uri, &csrf_state, &challenge, setup_code);
-        println!("Open this URL in a browser to authorize `localdb login`:\n\n  {authorize_url}\n");
-        print!("Paste the code shown after authorizing: ");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // Instructions and the paste prompt go to stderr, never stdout:
+        // `--json` guarantees stdout is pure JSON, and these apply
+        // regardless of `--json` since they are not part of the result.
+        eprintln!(
+            "Open this URL in a browser to authorize `localdb login`:\n\n  {authorize_url}\n"
+        );
+        eprint!("Paste the code shown after authorizing: ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         let mut line = String::new();
         std::io::stdin()
             .read_line(&mut line)
@@ -446,9 +490,7 @@ async fn perform_login(
                 message: format!("failed to read the pasted code from stdin: {e}"),
                 correlation_id: "login_stdin".to_string(),
             })?;
-        // No real callback round trip happened in oob mode, so there is no
-        // `state` to check for CSRF — trust our own freshly generated value.
-        (redirect_uri, line.trim().to_string(), csrf_state.clone())
+        (redirect_uri, line.trim().to_string())
     } else {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -468,21 +510,21 @@ async fn perform_login(
             build_authorize_url(base_url, &redirect_uri, &csrf_state, &challenge, setup_code);
 
         if !open_browser(&authorize_url) {
-            println!(
-                "Could not open a browser automatically. Open this URL to continue:\n\n  {authorize_url}\n"
+            eprintln!(
+                "Could not open a browser automatically. On a remote or headless session, \
+                 re-run with --no-browser. Otherwise open this URL on this machine:\n\n  \
+                 {authorize_url}\n"
             );
         }
 
-        let (code, returned_state) = wait_for_callback(listener, callback_timeout).await?;
-        (redirect_uri, code, returned_state)
+        // `callback::wait_for_callback` enforces the `state` match itself —
+        // it only ever returns once a callback carrying exactly
+        // `csrf_state` arrives (or the deadline passes), so there is
+        // nothing left for this function to re-check.
+        let code = callback::wait_for_callback(listener, &csrf_state, callback_timeout).await?;
+        (redirect_uri, code)
     };
 
-    if returned_state != csrf_state {
-        return Err(Error::Unauthorized {
-            message: "state parameter mismatch on the login callback; aborting (possible CSRF)"
-                .to_string(),
-        });
-    }
     if code.is_empty() {
         return Err(Error::InvalidRequest {
             message: "no authorization code was received".to_string(),
@@ -509,9 +551,7 @@ async fn perform_login(
             correlation_id: "login_persist_write".to_string(),
         })?;
 
-    Ok(LoginSummary {
-        base_url: base_url.to_string(),
-    })
+    Ok(())
 }
 
 fn build_authorize_url(
@@ -538,92 +578,13 @@ fn build_authorize_url(
     format!("{base_url}/authorize?{query}")
 }
 
-/// Accept exactly one connection on `listener` (the ephemeral loopback
-/// callback), parse `code`/`state` (or `error`) off its request line, reply
-/// with a minimal "you can close this window" page, and return what was
-/// found. A tiny hand-rolled accept loop, per design — no HTTP server crate
-/// needed for a single one-shot request.
-async fn wait_for_callback(
-    listener: tokio::net::TcpListener,
-    timeout: std::time::Duration,
-) -> Result<(String, String), Error> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let (mut stream, _) = tokio::time::timeout(timeout, listener.accept())
-        .await
-        .map_err(|_| Error::Unauthorized {
-            message: "timed out waiting for the browser to complete login".to_string(),
-        })?
-        .map_err(|e| Error::Internal {
-            message: format!("callback listener accept failed: {e}"),
-            correlation_id: "login_callback_accept".to_string(),
-        })?;
-
-    let (read_half, mut write_half) = stream.split();
-    let mut reader = BufReader::new(read_half);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .await
-        .map_err(|e| Error::Internal {
-            message: format!("callback read failed: {e}"),
-            correlation_id: "login_callback_read".to_string(),
-        })?;
-
-    // Drain the remaining request headers (we don't need them).
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| Error::Internal {
-                message: format!("callback header read failed: {e}"),
-                correlation_id: "login_callback_headers".to_string(),
-            })?;
-        if n == 0 || line == "\r\n" {
-            break;
-        }
-    }
-
-    let path_and_query = request_line.split_whitespace().nth(1).unwrap_or("");
-    let query = path_and_query.split_once('?').map(|x| x.1).unwrap_or("");
-    let params: std::collections::HashMap<String, String> =
-        url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
-
-    let body = "<html><body>Login complete &mdash; you can close this window.</body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = write_half.write_all(response.as_bytes()).await;
-    let _ = write_half.shutdown().await;
-
-    if let Some(err) = params.get("error") {
-        return Err(Error::Unauthorized {
-            message: format!("authorization failed: {err}"),
-        });
-    }
-    let code = params.get("code").cloned().unwrap_or_default();
-    let state = params.get("state").cloned().unwrap_or_default();
-    Ok((code, state))
-}
-
 async fn exchange_code_for_tokens(
     base_url: &str,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<(String, Option<String>, i64), Error> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Internal {
-            message: format!("cannot build HTTP client: {e}"),
-            correlation_id: "login_token_client".to_string(),
-        })?;
+    let client = build_http_client(std::time::Duration::from_secs(30))?;
     let resp = client
         .post(format!("{base_url}/token"))
         .form(&[
@@ -646,7 +607,7 @@ async fn exchange_code_for_tokens(
             .or_else(|| json.get("error").and_then(|v| v.as_str()))
             .unwrap_or("token exchange failed")
             .to_string();
-        return Err(Error::Unauthorized { message: msg });
+        return Err(classify_token_error(status, msg));
     }
 
     let access_token = json
@@ -667,6 +628,27 @@ async fn exchange_code_for_tokens(
         .unwrap_or(3600);
 
     Ok((access_token, refresh_token, expires_in))
+}
+
+/// Classify an unsuccessful `/token` response by HTTP status, rather than
+/// collapsing every failure into `Unauthorized`: a `5xx` means the daemon
+/// itself broke while handling the exchange — the caller's credentials were
+/// never actually judged — so it is reported as an internal failure, not a
+/// rejected login. Every other status (RFC 6749's `/token` errors —
+/// `invalid_grant`, `invalid_client`, etc. — are all `4xx`) is a genuine
+/// authentication failure.
+fn classify_token_error(status: reqwest::StatusCode, message: String) -> Error {
+    if status.is_server_error() {
+        Error::Internal {
+            message: format!(
+                "daemon's /token endpoint returned {}: {message}",
+                status.as_u16()
+            ),
+            correlation_id: "login_token_server_error".to_string(),
+        }
+    } else {
+        Error::Unauthorized { message }
+    }
 }
 
 #[cfg(test)]

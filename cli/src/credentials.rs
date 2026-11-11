@@ -104,21 +104,55 @@ fn normalize_base_url(base_url: &str) -> &str {
     base_url.trim_end_matches('/')
 }
 
-/// Load the credentials file, or a fresh empty one if it's missing,
-/// unreadable, or malformed — a broken/absent file simply means no cached
-/// credentials exist yet, never a hard error.
-fn load_file(credentials_file: &Path) -> CredentialsFile {
-    std::fs::read_to_string(credentials_file)
-        .ok()
-        .and_then(|s| serde_json::from_str::<CredentialsFile>(&s).ok())
-        .unwrap_or_default()
-        .canonicalized()
+/// Load the credentials file strictly, for a mutation: a missing file is
+/// empty credentials, but any other read or parse failure is an error
+/// naming the file. A mutation must never treat "unreadable" or
+/// "malformed" the same as "absent" — doing so would let `write_entry`/
+/// `remove_entry` replace a file they couldn't actually parse, destroying
+/// every other daemon's cached credential in it.
+fn load_file_for_write(credentials_file: &Path) -> std::io::Result<CredentialsFile> {
+    let contents = match std::fs::read_to_string(credentials_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CredentialsFile::default());
+        }
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", credentials_file.display()),
+            ));
+        }
+    };
+    let file: CredentialsFile = serde_json::from_str(&contents).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot parse {}: {error}", credentials_file.display()),
+        )
+    })?;
+    Ok(file.canonicalized())
+}
+
+/// Load the credentials file for a read-only lookup: missing, unreadable or
+/// malformed all collapse to "no cached credentials", since a lookup only
+/// ever needs to decide whether one exists. Unlike a missing file, an
+/// unreadable or malformed one is reported on stderr — it most likely means
+/// a previous write was interrupted or the file was hand-edited into an
+/// invalid state, and the caller should know even though the lookup itself
+/// degrades gracefully.
+fn load_file_for_read(credentials_file: &Path) -> CredentialsFile {
+    match load_file_for_write(credentials_file) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("warning: {error}");
+            CredentialsFile::default()
+        }
+    }
 }
 
 /// Look up the cached entry for `base_url`, if the file exists, parses, and
 /// has one.
 pub(crate) fn lookup_entry(credentials_file: &Path, base_url: &str) -> Option<CredentialEntry> {
-    let file = load_file(credentials_file);
+    let file = load_file_for_read(credentials_file);
     file.credentials.get(normalize_base_url(base_url)).cloned()
 }
 
@@ -165,7 +199,7 @@ pub(crate) fn lookup_entry_for_url(
     credentials_file: &Path,
     url: &str,
 ) -> Option<(String, CredentialEntry)> {
-    let file = load_file(credentials_file);
+    let file = load_file_for_read(credentials_file);
     let key = match_key(&file, url)?.to_string();
     let entry = file.credentials.get(&key)?.clone();
     Some((key, entry))
@@ -242,7 +276,7 @@ pub(crate) fn write_entry(
     base_url: &str,
     entry: CredentialEntry,
 ) -> std::io::Result<()> {
-    let mut file = load_file(credentials_file);
+    let mut file = load_file_for_write(credentials_file)?;
     file.credentials
         .insert(normalize_base_url(base_url).to_string(), entry);
     write_file(credentials_file, &file)
@@ -251,13 +285,54 @@ pub(crate) fn write_entry(
 /// Remove the entry for `base_url`, if any. Returns `true` if an entry was
 /// removed. Same atomic write as [`write_entry`].
 pub(crate) fn remove_entry(credentials_file: &Path, base_url: &str) -> std::io::Result<bool> {
-    let mut file = load_file(credentials_file);
+    let mut file = load_file_for_write(credentials_file)?;
     let removed = file
         .credentials
         .remove(normalize_base_url(base_url))
         .is_some();
     write_file(credentials_file, &file)?;
     Ok(removed)
+}
+
+/// Create the temp file a write replaces `credentials_file` with: a random
+/// name (never a predictable `.tmp-<pid>` a pre-planted symlink could
+/// follow) and `create_new` (refuse to open through an existing path at
+/// all, symlink or otherwise), with `0600` permissions established by the
+/// open call itself rather than applied afterward, so the secret is never
+/// briefly accessible under whatever mode a pre-existing file would have
+/// had.
+fn create_temp_file(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use rand::distributions::Alphanumeric;
+    use rand::Rng as _;
+
+    let mut last_error = None;
+    for _ in 0..8 {
+        let suffix: String = rand::thread_rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let tmp_path = dir.join(format!(".credentials.json.tmp-{suffix}"));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&tmp_path) {
+            Ok(file) => return Ok((tmp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other("could not create a unique credentials temp file")
+    }))
 }
 
 fn write_file(credentials_file: &Path, file: &CredentialsFile) -> std::io::Result<()> {
@@ -268,29 +343,21 @@ fn write_file(credentials_file: &Path, file: &CredentialsFile) -> std::io::Resul
     std::fs::create_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(file).unwrap_or_default();
 
-    let tmp_name = format!(".credentials.json.tmp-{}", std::process::id());
-    let tmp_path = dir.join(tmp_name);
+    let (tmp_path, mut tmp_file) = create_temp_file(&dir)?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        f.write_all(json.as_bytes())?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(json.as_bytes())?;
-        f.sync_all()?;
+    let write_result = tmp_file
+        .write_all(json.as_bytes())
+        .and_then(|()| tmp_file.sync_all());
+    drop(tmp_file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
     }
 
-    std::fs::rename(&tmp_path, credentials_file)?;
+    if let Err(error) = std::fs::rename(&tmp_path, credentials_file) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
     Ok(())
 }
 

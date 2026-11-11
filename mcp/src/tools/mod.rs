@@ -213,11 +213,13 @@ pub(crate) fn select_mcp_stores(
             // another store's id. Resolve by id first so that exact,
             // unambiguous signal always wins over a same-named but unrelated
             // store — only fall back to a name match when no id matches.
-            match stores
-                .iter()
-                .find(|s| &s.descriptor.id == name)
-                .or_else(|| stores.iter().find(|s| &s.descriptor.name == name))
-            {
+            // Shared with `proxy::ProxyScope::resolve`, which must agree.
+            match crate::store_lookup::resolve_by_id_then_name(
+                stores,
+                name,
+                |s| s.descriptor.id.as_str(),
+                |s| s.descriptor.name.as_str(),
+            ) {
                 Some(s) => selected.push((
                     s.descriptor.id.clone(),
                     s.descriptor.name.clone(),

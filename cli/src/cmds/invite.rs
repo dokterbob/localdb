@@ -219,7 +219,7 @@ fn print_created_invite(ctx: &CliContext, v: &serde_json::Value, via_daemon: boo
     match v.get("consent_url").and_then(|c| c.as_str()) {
         Some(url) => println!("Consent URL: {url}"),
         None => {
-            println!("Consent URL: start a daemon and visit <daemon base url>/join?invite={token}")
+            println!("Start a daemon and visit <daemon base url>/join?invite={token} to redeem it.")
         }
     }
 }

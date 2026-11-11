@@ -297,7 +297,7 @@ pub enum Command {
         /// immediately; `closed`-mode invites wait and poll until an admin
         /// approves or denies. Mutually exclusive with `--setup-code` and
         /// `--no-browser`'s browser flow — no browser is opened at all.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["setup_code", "no_browser"])]
         invite: Option<String>,
 
         /// The requested user name for `--invite` (default: the OS login

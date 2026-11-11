@@ -153,9 +153,13 @@ pub(crate) fn resolved_config_file(ctx: &CliContext) -> Option<std::path::PathBu
     localdb_core::config::loader::resolve_config_path(&options, ctx.config_env.as_deref()).ok()
 }
 
-fn build_http_client() -> Result<reqwest::Client, Error> {
+/// Build a `reqwest::Client` with a fixed request timeout. The one place
+/// every daemon-bound HTTP exchange in `cli` builds its client, so a change
+/// to client defaults (timeout policy, redirect policy, ...) only has to
+/// happen here instead of at each call site.
+pub(crate) fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client, Error> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .build()
         .map_err(|e| Error::Internal {
             message: format!("cannot build HTTP client: {}", e),
@@ -197,7 +201,7 @@ async fn redeem_refresh_token(
     base_url: &str,
     refresh_token: &str,
 ) -> Option<(String, crate::credentials::CredentialEntry)> {
-    let client = build_http_client().ok()?;
+    let client = build_http_client(std::time::Duration::from_secs(30)).ok()?;
     let token_url = format!("{base_url}/token");
     let resp = client
         .post(&token_url)
@@ -353,7 +357,7 @@ pub(crate) async fn daemon_request_async(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, Error> {
-    let client = build_http_client()?;
+    let client = build_http_client(std::time::Duration::from_secs(30))?;
     let bearer = fresh_bearer_for_url(ctx, url).await;
     let (status, json) = send_once(
         &client,

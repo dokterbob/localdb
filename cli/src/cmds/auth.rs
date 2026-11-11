@@ -39,7 +39,7 @@ use crate::{
     daemon_client::{
         daemon_request_async, encode_path_segment, probe_daemon, CliContext, DaemonState,
     },
-    normalize::{exit_err, print_json},
+    normalize::{confirm_destructive, exit_err, print_json},
 };
 
 /// Render `Role` as the wire string used by both the HTTP API and the CLI's
@@ -350,6 +350,12 @@ pub(crate) async fn run_user_remove_async(ctx: &CliContext, name: &str) {
     let config_loader = crate::app_db::load_config_scaffolded(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
+    let prompt =
+        format!("This permanently removes user '{name}' and revokes their credentials. Continue?");
+    if !confirm_destructive(ctx, &prompt) {
+        return;
+    }
+
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let id = resolve_user_id_via_daemon(ctx, &base_url, name).await;
         let url = format!("{base_url}/v1/users/{id}", id = encode_path_segment(&id));
@@ -458,16 +464,31 @@ fn key_view_json(t: &localdb_core::auth::AuthTokenRow) -> serde_json::Value {
 fn print_key_list(ctx: &CliContext, keys: &[serde_json::Value]) {
     if ctx.json {
         print_json(&json!({ "keys": keys }));
-    } else if keys.is_empty() {
+        return;
+    }
+    if keys.is_empty() {
         println!("No keys.");
-    } else {
-        for k in keys {
-            let revoked = if k["revoked_at"].is_string() {
-                " (revoked)"
-            } else {
-                ""
-            };
-            println!("{}{}", k["id"].as_str().unwrap_or("?"), revoked);
+        return;
+    }
+    // Showing the owner is only useful once a listing actually spans more
+    // than one user (an unfiltered `key list`, or `--user` narrowed the
+    // targets to a single distinct one anyway) — with exactly one user
+    // represented, every row's owner is already implied.
+    let distinct_users: std::collections::HashSet<&str> =
+        keys.iter().filter_map(|k| k["user"].as_str()).collect();
+    let show_owner = distinct_users.len() > 1;
+    for k in keys {
+        let revoked = if k["revoked_at"].is_string() {
+            " (revoked)"
+        } else {
+            ""
+        };
+        let id = k["id"].as_str().unwrap_or("?");
+        if show_owner {
+            let owner = k["user"].as_str().unwrap_or("?");
+            println!("{id} ({owner}){revoked}");
+        } else {
+            println!("{id}{revoked}");
         }
     }
 }

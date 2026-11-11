@@ -525,6 +525,64 @@ async fn poll_until_decided_sends_the_secret_in_the_json_body_not_the_url() {
     server.abort();
 }
 
+// -----------------------------------------------------------------
+// `GET /v1/auth/me` identity fetch (login success reports identity)
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_identity_returns_name_and_role_for_a_valid_bearer() {
+    let (_dir, state, base_url) = spawn_test_daemon().await;
+    let user = state
+        .auth()
+        .create_user("identity-admin", Role::Admin)
+        .await
+        .unwrap();
+    let api_key = state.auth().issue_api_key(&user.id).await.unwrap().secret;
+
+    let (name, role) = fetch_identity(&base_url, &api_key).await.unwrap();
+    assert_eq!(name, "identity-admin");
+    assert_eq!(role, "admin");
+}
+
+#[tokio::test]
+async fn fetch_identity_fails_for_an_invalid_bearer() {
+    let (_dir, _state, base_url) = spawn_test_daemon().await;
+    let result = fetch_identity(&base_url, "ldb_not-a-real-key").await;
+    assert!(result.is_err());
+}
+
+// -----------------------------------------------------------------
+// `/token` error classification (5xx must not report as Unauthorized)
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_token_error_5xx_is_not_unauthorized() {
+    for status in [500, 502, 503] {
+        let error = classify_token_error(
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            "boom".to_string(),
+        );
+        assert!(
+            !matches!(error, Error::Unauthorized { .. }),
+            "a {status} /token response must not classify as Unauthorized: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn classify_token_error_4xx_oauth_errors_are_unauthorized() {
+    for status in [400, 401] {
+        let error = classify_token_error(
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            "invalid_grant".to_string(),
+        );
+        assert!(
+            matches!(error, Error::Unauthorized { .. }),
+            "a {status} /token response must classify as Unauthorized: {error:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn failed_logout_keeps_cache_for_retry() {
     let dir = TempDir::new().unwrap();
