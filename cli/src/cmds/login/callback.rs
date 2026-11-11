@@ -6,12 +6,18 @@
 //! `accept()`: anyone on the machine can connect to this loopback port
 //! before the real browser redirect arrives, so the first connection cannot
 //! be trusted to be the real one. [`wait_for_callback`] keeps accepting
-//! connections — reading each one with its own share of the remaining
-//! deadline, and discarding anything that doesn't parse or doesn't carry
-//! the expected `state` — until either a matching callback arrives or the
-//! overall deadline passes. Each read is also bounded in size (not just
-//! time): a connection that never sends a request terminator, or sends an
-//! oversized one, is dropped rather than buffered without limit.
+//! connections while handling previously accepted ones concurrently — each
+//! gets its own short read deadline rather than a share of whatever time
+//! remains overall, so one connection that stays open and silent cannot
+//! hold up the accept loop while the real browser callback is still on its
+//! way. Anything that doesn't parse, times out on its own deadline, or
+//! doesn't carry the expected `state` is discarded and accepting continues;
+//! the first connection whose `state` matches wins, and everything else is
+//! dropped without affecting the outcome. Each read is also bounded in
+//! size (not just time): a connection that never sends a request
+//! terminator, or sends an oversized one, is dropped rather than buffered
+//! without limit. The number of connections handled at once is bounded too,
+//! so a flood of local connections can't grow the task set without limit.
 
 use std::collections::HashMap;
 
@@ -33,12 +39,26 @@ const MAX_HEADER_TOTAL_BYTES: usize = 32 * 1024;
 /// total byte count (guards against many short lines).
 const MAX_HEADER_LINES: usize = 200;
 
-/// Accept connections on `listener` until one carries a `state` parameter
-/// equal to `expected_state`, or `deadline` elapses — whichever comes
+/// Per-connection deadline for reading one request, independent of how much
+/// of the overall deadline is left. A real browser redirect completes in
+/// well under a second; this is generous headroom for a loaded machine, not
+/// an attempt to accommodate a slow client — a connection that cannot
+/// finish sending its request in this window is not worth holding onto.
+const PER_CONNECTION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum number of connections read concurrently. Bounds the task set a
+/// burst of local connections can create; once the limit is reached,
+/// accepting pauses until an in-flight connection finishes (matches,
+/// mismatches, or times out).
+const MAX_IN_FLIGHT_CONNECTIONS: usize = 16;
+
+/// Accept connections on `listener`, handling each concurrently with a
+/// short deadline of its own, until one carries a `state` parameter equal
+/// to `expected_state`, or the overall `deadline` elapses — whichever comes
 /// first. Returns the callback's `code` parameter (possibly empty; the
 /// caller rejects that). A connection whose request doesn't parse, is
-/// oversized, or carries no (or the wrong) `state` is discarded and
-/// accepting continues with whatever time remains.
+/// oversized, times out, or carries no (or the wrong) `state` is discarded
+/// and accepting continues with whatever time remains.
 ///
 /// A callback that *does* match `expected_state` but carries an `error`
 /// parameter (the user denied consent, or the daemon rejected the request)
@@ -54,41 +74,61 @@ pub(super) async fn wait_for_callback(
         message: "timed out waiting for the browser to complete login".to_string(),
     };
 
+    let mut in_flight: tokio::task::JoinSet<Result<HashMap<String, String>, Error>> =
+        tokio::task::JoinSet::new();
+
     loop {
-        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        if tokio::time::Instant::now() >= deadline_at {
             return Err(timed_out());
         }
-        let mut stream = match tokio::time::timeout(remaining, listener.accept()).await {
-            Ok(Ok((stream, _))) => stream,
-            // A transient accept error on this one connection attempt
-            // doesn't exhaust the deadline for the whole exchange.
-            Ok(Err(_)) => continue,
-            Err(_) => return Err(timed_out()),
-        };
 
-        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(timed_out());
+        tokio::select! {
+            accepted = listener.accept(), if in_flight.len() < MAX_IN_FLIGHT_CONNECTIONS => {
+                let mut stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    // A transient accept error on this one connection attempt
+                    // doesn't exhaust the deadline for the whole exchange.
+                    Err(_) => continue,
+                };
+                let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+                let per_connection_deadline = PER_CONNECTION_READ_TIMEOUT.min(remaining);
+                in_flight.spawn(async move {
+                    match tokio::time::timeout(
+                        per_connection_deadline,
+                        read_callback_request(&mut stream),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::InvalidRequest {
+                            message: "callback connection did not send a complete request \
+                                      within its read deadline"
+                                .to_string(),
+                        }),
+                    }
+                });
+            }
+            joined = in_flight.join_next(), if !in_flight.is_empty() => {
+                let params = match joined {
+                    Some(Ok(Ok(params))) => params,
+                    // Malformed, oversized, too-slow, or panicked: not the
+                    // real callback — discard and keep listening.
+                    Some(Ok(Err(_))) | Some(Err(_)) | None => continue,
+                };
+                if params.get("state").map(String::as_str) != Some(expected_state) {
+                    continue;
+                }
+                if let Some(err) = params.get("error") {
+                    return Err(Error::Unauthorized {
+                        message: format!("authorization failed: {err}"),
+                    });
+                }
+                return Ok(params.get("code").cloned().unwrap_or_default());
+            }
+            () = tokio::time::sleep_until(deadline_at) => {
+                return Err(timed_out());
+            }
         }
-        let params = match tokio::time::timeout(remaining, read_callback_request(&mut stream)).await
-        {
-            Ok(Ok(params)) => params,
-            // Malformed, oversized, or too-slow request: not the real
-            // callback (or a browser request that errored out before
-            // finishing) — discard and keep listening.
-            Ok(Err(_)) | Err(_) => continue,
-        };
-
-        if params.get("state").map(String::as_str) != Some(expected_state) {
-            continue;
-        }
-        if let Some(err) = params.get("error") {
-            return Err(Error::Unauthorized {
-                message: format!("authorization failed: {err}"),
-            });
-        }
-        return Ok(params.get("code").cloned().unwrap_or_default());
     }
 }
 

@@ -464,8 +464,11 @@ browser round trip. `open`-mode invites persist the redeemed API key immediately
 invites print a "waiting for admin approval" message and poll until an admin approves (credential
 persisted) or denies (non-zero exit).
 
-On success (either path), `login` fetches the caller's resolved identity via `GET /v1/auth/me` using
-the credential it just cached, and reports it:
+On success (either path), `login` looks up the caller's resolved identity via `GET /v1/auth/me`,
+using the bearer the login flow just obtained, and reports it. This lookup is best-effort: the
+credential is already cached by the time it runs, so a failure (timeout, error status, malformed
+body) prints a one-line warning to stderr and does not affect the exit code — `name`/`role` are
+`null` and the human-readable line falls back to a plain confirmation:
 
 ```
 $ localdb login
@@ -477,10 +480,21 @@ $ localdb login --invite ldb_abc123 --name bob
 Logged in to http://127.0.0.1:7700 as 'bob' (member).
 ```
 
-`--json` carries the same identity, additively, alongside the existing `status`/`base_url` fields:
+```
+$ localdb login
+warning: login succeeded but could not resolve the logged-in identity: ...
+Logged in to http://127.0.0.1:7700.
+```
+
+`--json` carries the same identity, additively, alongside the existing `status`/`base_url` fields.
+`name`/`role` are `null` when the identity lookup failed:
 
 ```json
 { "status": "ok", "base_url": "http://127.0.0.1:7700", "name": "alice", "role": "admin" }
+```
+
+```json
+{ "status": "ok", "base_url": "http://127.0.0.1:7700", "name": null, "role": null }
 ```
 
 ## `localdb logout`

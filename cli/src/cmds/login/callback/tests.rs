@@ -89,6 +89,41 @@ async fn a_bogus_first_connection_does_not_prevent_the_real_callback_from_succee
     assert_eq!(result.unwrap(), "the-real-code");
 }
 
+/// A first connection that connects and then sends nothing at all must not
+/// block a later, real callback: each connection gets its own short read
+/// deadline and is handled concurrently with accepting further
+/// connections, so the valid callback completes promptly — well before the
+/// (deliberately long) overall deadline — instead of waiting out the first
+/// connection's silence.
+#[tokio::test]
+async fn a_silent_first_connection_does_not_block_a_later_real_callback() {
+    let (listener, addr) = bound_listener().await;
+
+    let waiter = tokio::spawn(wait_for_callback(
+        listener,
+        "expected-state",
+        std::time::Duration::from_secs(30),
+    ));
+
+    let silent = TcpStream::connect(&addr).await.unwrap();
+
+    let mut real = TcpStream::connect(&addr).await.unwrap();
+    real.write_all(b"GET /callback?code=good&state=expected-state HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect(
+            "a silent connection must not block the real callback from completing \
+             well short of the 30s overall deadline",
+        )
+        .expect("task must not panic");
+
+    assert_eq!(result.unwrap(), "good");
+    drop(silent);
+}
+
 /// An oversized request line (no terminator within the byte cap) must be
 /// discarded rather than buffered without limit — and must not abort the
 /// whole exchange, so a later well-formed callback can still succeed.

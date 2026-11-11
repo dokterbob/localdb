@@ -74,7 +74,7 @@ pub(crate) async fn run_login_async(
         )
         .await
         {
-            Ok(_joined_name) => report_login_success(ctx, &base_url).await,
+            Ok((_joined_name, bearer)) => report_login_success(ctx, &base_url, &bearer).await,
             Err(e) => exit_err(&e, ctx.json),
         }
         return;
@@ -92,42 +92,59 @@ pub(crate) async fn run_login_async(
     )
     .await
     {
-        Ok(()) => report_login_success(ctx, &base_url).await,
+        Ok(bearer) => report_login_success(ctx, &base_url, &bearer).await,
         Err(e) => exit_err(&e, ctx.json),
     }
 }
 
-/// Report a completed login: fetch the caller's resolved identity via
-/// `GET /v1/auth/me`, using the credential this invocation just persisted
-/// (read back through the same `fresh_bearer_for_url` path every other
-/// daemon-bound request resolves its bearer through), and print/emit it
-/// alongside `base_url`. Shared by both the OAuth and invite login paths, so
-/// the two report identically rather than the invite path only ever
-/// knowing the name it asked for (not the daemon's actual, possibly
-/// different, resolved role).
+/// Report a completed login: look up the caller's resolved identity via
+/// `GET /v1/auth/me`, using `bearer` — the credential the login flow that
+/// just ran (OAuth or invite) obtained directly, not re-resolved through
+/// `fresh_bearer_for_url`/`ctx.api_key`, which could belong to an entirely
+/// different user (a `LOCALDB_API_KEY`/`--api-key` left over from another
+/// session) and would then report the wrong identity, or fail, regardless
+/// of whether the login that just ran succeeded. Shared by both the OAuth
+/// and invite login paths, so the two report identically rather than the
+/// invite path only ever knowing the name it asked for (not the daemon's
+/// actual, possibly different, resolved role).
 ///
-/// A failure here exits non-zero even though the credential is already
-/// cached: the identity line is part of what a successful `login` reports,
-/// not a best-effort decoration bolted on after the real work is done.
-async fn report_login_success(ctx: &CliContext, base_url: &str) {
-    let bearer = match crate::daemon_client::fresh_bearer_for_url(ctx, base_url).await {
-        Some(bearer) => bearer,
-        None => exit_err(
-            &Error::Internal {
-                message: "no cached credential immediately after persisting one".to_string(),
-                correlation_id: "login_identity_bearer".to_string(),
-            },
-            ctx.json,
-        ),
-    };
-    let (name, role) = match fetch_identity(base_url, &bearer).await {
-        Ok(identity) => identity,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+/// The identity lookup is best-effort: by the time this runs, the
+/// credential is already persisted, so a failure here (timeout, error
+/// status, malformed body) must not turn a successful login into a
+/// non-zero exit — that would make automation re-run a login whose side
+/// effect (e.g. consuming a single-use invite) already happened.
+async fn report_login_success(ctx: &CliContext, base_url: &str, bearer: &str) {
+    let identity = resolve_identity_best_effort(base_url, bearer).await;
+    emit_login_result(ctx, base_url, identity.as_ref());
+}
+
+/// Look up the identity behind `bearer`, warning on stderr and returning
+/// `None` instead of propagating an error — see [`report_login_success`]
+/// for why a failure here must not be fatal.
+async fn resolve_identity_best_effort(base_url: &str, bearer: &str) -> Option<(String, String)> {
+    match fetch_identity(base_url, bearer).await {
+        Ok(identity) => Some(identity),
+        Err(e) => {
+            eprintln!("warning: login succeeded but could not resolve the logged-in identity: {e}");
+            None
+        }
+    }
+}
+
+/// Print/emit the final login result. With no resolved identity (the
+/// lookup failed), `--json` carries explicit `null`s and human output
+/// falls back to a plain confirmation rather than naming a user or role it
+/// couldn't confirm.
+fn emit_login_result(ctx: &CliContext, base_url: &str, identity: Option<&(String, String)>) {
+    let name = identity.map(|(name, _)| name.as_str());
+    let role = identity.map(|(_, role)| role.as_str());
     if ctx.json {
         print_json(&json!({ "status": "ok", "base_url": base_url, "name": name, "role": role }));
     } else {
-        println!("Logged in to {base_url} as '{name}' ({role}).");
+        match identity {
+            Some((name, role)) => println!("Logged in to {base_url} as '{name}' ({role})."),
+            None => println!("Logged in to {base_url}."),
+        }
     }
 }
 
@@ -199,14 +216,16 @@ fn resolve_requested_name(name: Option<&str>) -> Result<String, Error> {
 /// `POST /v1/invites/requests/{id}/poll` every `poll_interval` until an
 /// admin decides. `poll_interval` is injected (production: 1s) so tests can
 /// drive the loop with a much shorter interval instead of a multi-second
-/// sleep.
+/// sleep. Returns the requested name together with the minted API key, so
+/// the caller can use that exact credential for an immediate follow-up
+/// request instead of re-resolving a bearer from `ctx`.
 async fn perform_invite_login(
     ctx: &CliContext,
     base_url: &str,
     invite_token: &str,
     name: Option<&str>,
     poll_interval: std::time::Duration,
-) -> Result<String, Error> {
+) -> Result<(String, String), Error> {
     let requested_name = resolve_requested_name(name)?;
 
     let client = build_http_client(std::time::Duration::from_secs(30))?;
@@ -229,9 +248,10 @@ async fn perform_invite_login(
             .ok_or_else(|| Error::Internal {
                 message: "redeem response is missing api_key".to_string(),
                 correlation_id: "login_invite_open_response".to_string(),
-            })?;
-        persist_api_key(ctx, base_url, api_key).await?;
-        return Ok(requested_name);
+            })?
+            .to_string();
+        persist_api_key(ctx, base_url, &api_key).await?;
+        return Ok((requested_name, api_key));
     }
 
     if status == reqwest::StatusCode::ACCEPTED {
@@ -268,7 +288,7 @@ async fn perform_invite_login(
         )
         .await?;
         persist_api_key(ctx, base_url, &api_key).await?;
-        return Ok(requested_name);
+        return Ok((requested_name, api_key));
     }
 
     Err(crate::daemon_client::daemon_response_error(status, &body))
@@ -452,14 +472,19 @@ async fn resolve_login_base_url(ctx: &CliContext, url: Option<&str>) -> String {
     }
 }
 
-/// Drive the authorization-code + PKCE flow end to end. `open_browser` is
-/// injected so tests can substitute a fake "browser" (an HTTP client that
-/// submits the consent form) instead of actually launching one; production
-/// code passes `|u| webbrowser::open(u).is_ok()`. `callback_timeout` bounds
-/// how long we wait for the loopback callback (production: 5 minutes for a
-/// human to click through; tests use a much shorter bound so a
-/// never-arriving callback — e.g. a rejected credential — fails fast
-/// instead of stalling the suite).
+/// Drive the authorization-code + PKCE flow end to end, returning the
+/// access token it just obtained (and persisted) so the caller can use
+/// that exact bearer for an immediate follow-up request, such as the
+/// identity lookup in `report_login_success`, instead of re-resolving a
+/// bearer from `ctx`/`credentials.json`, which could pick a different
+/// credential (e.g. an `LOCALDB_API_KEY` left in the environment).
+/// `open_browser` is injected so tests can substitute a fake "browser" (an
+/// HTTP client that submits the consent form) instead of actually
+/// launching one; production code passes `|u| webbrowser::open(u).is_ok()`.
+/// `callback_timeout` bounds how long we wait for the loopback callback
+/// (production: 5 minutes for a human to click through; tests use a much
+/// shorter bound so a never-arriving callback — e.g. a rejected credential
+/// — fails fast instead of stalling the suite).
 async fn perform_login(
     ctx: &CliContext,
     base_url: &str,
@@ -467,7 +492,7 @@ async fn perform_login(
     no_browser: bool,
     open_browser: impl Fn(&str) -> bool,
     callback_timeout: std::time::Duration,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let (verifier, challenge) = localdb_core::auth::generate_pkce_pair();
     let (csrf_state, _) = localdb_core::auth::generate_pkce_pair();
 
@@ -540,7 +565,7 @@ async fn perform_login(
     let credentials_file = crate::credentials::credentials_path(&config_file);
     let entry = CredentialEntry {
         secret: None,
-        access_token: Some(access_token),
+        access_token: Some(access_token.clone()),
         refresh_token,
         access_expires_at: Some(localdb_core::auth::rfc3339_from_now(expires_in)),
     };
@@ -551,7 +576,7 @@ async fn perform_login(
             correlation_id: "login_persist_write".to_string(),
         })?;
 
-    Ok(())
+    Ok(access_token)
 }
 
 fn build_authorize_url(

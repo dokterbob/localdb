@@ -251,7 +251,12 @@ async fn perform_invite_login_open_mode_persists_api_key_and_creates_user() {
         "open-mode invite login should succeed: {:?}",
         result.err()
     );
-    assert_eq!(result.unwrap(), "newbie");
+    let (joined_name, bearer) = result.unwrap();
+    assert_eq!(joined_name, "newbie");
+    assert!(
+        !bearer.is_empty(),
+        "the login's own bearer must be returned"
+    );
 
     let credentials_file = crate::credentials::credentials_path(&dir.path().join("config.yaml"));
     let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)
@@ -549,6 +554,68 @@ async fn fetch_identity_fails_for_an_invalid_bearer() {
     let (_dir, _state, base_url) = spawn_test_daemon().await;
     let result = fetch_identity(&base_url, "ldb_not-a-real-key").await;
     assert!(result.is_err());
+}
+
+/// A login's identity lookup is best-effort: the credential is already
+/// persisted by the time it runs, so a failure (here: an invalid bearer,
+/// standing in for a timeout/error status/malformed body) must surface as
+/// "no identity" rather than an error the caller would have to propagate
+/// into a non-zero exit.
+#[tokio::test]
+async fn identity_lookup_failure_after_persisted_login_yields_no_identity_not_an_error() {
+    let (_dir, _state, base_url) = spawn_test_daemon().await;
+    let identity = resolve_identity_best_effort(&base_url, "ldb_not-a-real-key").await;
+    assert!(
+        identity.is_none(),
+        "a failed identity lookup must not be treated as a fatal error"
+    );
+}
+
+/// The identity reported after login must reflect the bearer the login
+/// flow itself just obtained — never a different credential sitting in
+/// `ctx.api_key` (the CLI's stand-in for `LOCALDB_API_KEY`/`--api-key`).
+/// Logging in as one user while a *different* user's key is set in the
+/// environment must still report the user who just logged in.
+#[tokio::test]
+async fn login_bearer_is_used_for_identity_not_an_unrelated_env_api_key() {
+    let (dir, state, base_url) = spawn_test_daemon().await;
+    let alice = state
+        .auth()
+        .create_user("alice-just-logged-in", Role::Admin)
+        .await
+        .unwrap();
+    let alice_key = state.auth().issue_api_key(&alice.id).await.unwrap().secret;
+
+    let bob = state
+        .auth()
+        .create_user("bob-env-key", Role::Member)
+        .await
+        .unwrap();
+    let bob_key = state.auth().issue_api_key(&bob.id).await.unwrap().secret;
+
+    let mut ctx = ctx_for(&dir);
+    ctx.api_key = Some(bob_key);
+
+    let opener = fake_browser_opener(alice_key);
+    let bearer = perform_login(
+        &ctx,
+        &base_url,
+        None,
+        false,
+        opener,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect("login as alice should succeed even with bob's key set as ctx.api_key");
+
+    let (name, role) = fetch_identity(&base_url, &bearer)
+        .await
+        .expect("the bearer login just obtained must itself resolve an identity");
+    assert_eq!(
+        name, "alice-just-logged-in",
+        "identity must reflect the bearer login just obtained, not ctx.api_key"
+    );
+    assert_eq!(role, "admin");
 }
 
 // -----------------------------------------------------------------
