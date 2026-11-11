@@ -1,11 +1,9 @@
-//! `localdb login --json` stdout-purity regression test (specs/05-surfaces.md
-//! §2 / §3.1: `--json` guarantees stdout is pure JSON, even on failure).
+//! `localdb login` subprocess tests.
 //!
-//! Before this fix, `perform_login`'s no-browser instructions ("Open this
-//! URL...") and paste prompt ("Paste the code shown after authorizing: ")
-//! were written with `println!`/`print!`, landing on stdout ahead of the
-//! final `--json` result and breaking any pipe into `jq` or similar. They
-//! now go to stderr unconditionally.
+//! `--json` guarantees stdout is pure JSON, even on failure
+//! (specs/05-surfaces.md §2 / §3.1): the no-browser instructions ("Open this
+//! URL...") and the paste prompt go to stderr, so a pipe into `jq` or similar
+//! sees only the final result.
 //!
 //! `--url` is passed explicitly so this never needs a real daemon:
 //! `resolve_login_base_url` only probes for one when `--url` is absent.
@@ -21,9 +19,12 @@ fn cmd() -> Command {
     Command::cargo_bin("localdb").expect("localdb binary must exist")
 }
 
+/// A command confined to `dir`: its own config file, and no daemon URL
+/// inherited from the caller's environment.
 fn cmd_with_dir(dir: &TempDir) -> Command {
     let mut c = cmd();
     c.env("LOCALDB_CONFIG", dir.path().join("config.yaml"));
+    c.env_remove("LOCALDB_DAEMON_URL");
     c
 }
 
@@ -67,7 +68,18 @@ fn login_json_no_browser_stdout_is_pure_json_even_on_failure() {
 #[test]
 fn login_fails_on_malformed_credentials_before_probing_for_a_daemon() {
     let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("config.yaml"), "version: 1\n").unwrap();
+    // `paths.data` points daemon discovery at an empty directory inside the
+    // fixture, so no daemon is ever found, whatever runs on this machine.
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        format!(
+            "version: 1\npaths:\n  data: {}\n",
+            data_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
     std::fs::write(dir.path().join("credentials.json"), "not json at all").unwrap();
 
     let assert = cmd_with_dir(&dir)

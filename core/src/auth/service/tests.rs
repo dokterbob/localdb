@@ -37,8 +37,8 @@ async fn issued_token_debug_redacts_the_secret() {
     let user = svc.create_user("redact-token", Role::Member).await.unwrap();
     let issued = svc.issue_api_key(&user.id).await.unwrap();
     let debugged = format!("{issued:?}");
-    assert!(!debugged.contains(&issued.secret), "{debugged}");
-    assert!(debugged.contains("<redacted>"), "{debugged}");
+    assert!(!debugged.contains(&issued.secret));
+    assert!(debugged.contains("<redacted>"));
 }
 
 #[tokio::test]
@@ -46,8 +46,8 @@ async fn issued_invite_debug_redacts_the_secret() {
     let svc = service();
     let issued = make_open_invite(&svc, 1).await;
     let debugged = format!("{issued:?}");
-    assert!(!debugged.contains(&issued.secret), "{debugged}");
-    assert!(debugged.contains("<redacted>"), "{debugged}");
+    assert!(!debugged.contains(&issued.secret));
+    assert!(debugged.contains("<redacted>"));
 }
 
 #[tokio::test]
@@ -66,8 +66,8 @@ async fn issued_auth_code_debug_redacts_the_secret() {
         .await
         .unwrap();
     let debugged = format!("{issued:?}");
-    assert!(!debugged.contains(&issued.secret), "{debugged}");
-    assert!(debugged.contains("<redacted>"), "{debugged}");
+    assert!(!debugged.contains(&issued.secret));
+    assert!(debugged.contains("<redacted>"));
 }
 
 mod bootstrap;
