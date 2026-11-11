@@ -598,14 +598,19 @@ async fn fetch_identity_fails_for_an_invalid_bearer() {
 /// persisted by the time it runs, so a failure (here: an invalid bearer,
 /// standing in for a timeout/error status/malformed body) must surface as
 /// "no identity" rather than an error the caller would have to propagate
-/// into a non-zero exit.
+/// into a non-zero exit. Drives `build_login_result` — the function
+/// `report_login_success` actually calls — rather than the lower-level
+/// `resolve_identity_best_effort`, so this would fail if the result
+/// building ever made a missing identity fatal.
 #[tokio::test]
 async fn identity_lookup_failure_after_persisted_login_yields_no_identity_not_an_error() {
-    let (_dir, _state, base_url) = spawn_test_daemon().await;
-    let identity = resolve_identity_best_effort(&base_url, "ldb_not-a-real-key").await;
+    let (dir, _state, base_url) = spawn_test_daemon().await;
+    let ctx = ctx_for(&dir);
+    let result = build_login_result(&ctx, &base_url, "ldb_not-a-real-key").await;
+    assert_eq!(result.base_url, base_url);
     assert!(
-        identity.is_none(),
-        "a failed identity lookup must not be treated as a fatal error"
+        result.name.is_none() && result.role.is_none(),
+        "a failed identity lookup must not be treated as a fatal error, and must not report a name/role it could not confirm"
     );
 }
 
@@ -613,7 +618,11 @@ async fn identity_lookup_failure_after_persisted_login_yields_no_identity_not_an
 /// flow itself just obtained — never a different credential sitting in
 /// `ctx.api_key` (the CLI's stand-in for `LOCALDB_API_KEY`/`--api-key`).
 /// Logging in as one user while a *different* user's key is set in the
-/// environment must still report the user who just logged in.
+/// environment must still report the user who just logged in. Drives
+/// `build_login_result` directly (the same function the invite login path
+/// also reaches, via `report_login_success`) so this would fail if the
+/// result building ever went back to resolving identity through
+/// `ctx.api_key` instead of the login's own bearer.
 #[tokio::test]
 async fn login_bearer_is_used_for_identity_not_an_unrelated_env_api_key() {
     let (dir, state, base_url) = spawn_test_daemon().await;
@@ -646,14 +655,13 @@ async fn login_bearer_is_used_for_identity_not_an_unrelated_env_api_key() {
     .await
     .expect("login as alice should succeed even with bob's key set as ctx.api_key");
 
-    let (name, role) = fetch_identity(&base_url, &bearer)
-        .await
-        .expect("the bearer login just obtained must itself resolve an identity");
+    let result = build_login_result(&ctx, &base_url, &bearer).await;
     assert_eq!(
-        name, "alice-just-logged-in",
+        result.name.as_deref(),
+        Some("alice-just-logged-in"),
         "identity must reflect the bearer login just obtained, not ctx.api_key"
     );
-    assert_eq!(role, "admin");
+    assert_eq!(result.role.as_deref(), Some("admin"));
 }
 
 // -----------------------------------------------------------------

@@ -114,12 +114,40 @@ pub(crate) async fn run_login_async(
 /// non-zero exit — that would make automation re-run a login whose side
 /// effect (e.g. consuming a single-use invite) already happened.
 async fn report_login_success(ctx: &CliContext, base_url: &str, bearer: &str) {
+    let result = build_login_result(ctx, base_url, bearer).await;
+    print_login_result(ctx, &result);
+}
+
+/// The outcome of a completed login: the same `base_url`/`name`/`role`
+/// fields both the `--json` envelope and the human-readable confirmation
+/// use. Built once by [`build_login_result`] so a test can assert on
+/// `name`/`role` by calling it directly, rather than by capturing stdout
+/// or driving a process exit.
+struct LoginResult {
+    base_url: String,
+    name: Option<String>,
+    role: Option<String>,
+}
+
+/// Resolve the identity behind a completed login and build the result that
+/// gets printed. `bearer` is the credential the login flow that just ran
+/// (OAuth or invite — both call sites in `run_login_async` route through
+/// this one function) obtained directly; it is never re-resolved through
+/// `ctx`/`credentials.json`, which could hold an entirely different
+/// credential (e.g. a `LOCALDB_API_KEY` left over from another session)
+/// and would then report the wrong identity regardless of who just logged
+/// in.
+async fn build_login_result(_ctx: &CliContext, base_url: &str, bearer: &str) -> LoginResult {
     let identity = resolve_identity_best_effort(base_url, bearer).await;
-    emit_login_result(ctx, base_url, identity.as_ref());
+    LoginResult {
+        base_url: base_url.to_string(),
+        name: identity.as_ref().map(|(name, _)| name.clone()),
+        role: identity.as_ref().map(|(_, role)| role.clone()),
+    }
 }
 
 /// Look up the identity behind `bearer`, warning on stderr and returning
-/// `None` instead of propagating an error — see [`report_login_success`]
+/// `None` instead of propagating an error — see [`build_login_result`]
 /// for why a failure here must not be fatal.
 async fn resolve_identity_best_effort(base_url: &str, bearer: &str) -> Option<(String, String)> {
     match fetch_identity(base_url, bearer).await {
@@ -131,19 +159,24 @@ async fn resolve_identity_best_effort(base_url: &str, bearer: &str) -> Option<(S
     }
 }
 
-/// Print/emit the final login result. With no resolved identity (the
+/// Print/emit a completed login's result. With no resolved identity (the
 /// lookup failed), `--json` carries explicit `null`s and human output
 /// falls back to a plain confirmation rather than naming a user or role it
 /// couldn't confirm.
-fn emit_login_result(ctx: &CliContext, base_url: &str, identity: Option<&(String, String)>) {
-    let name = identity.map(|(name, _)| name.as_str());
-    let role = identity.map(|(_, role)| role.as_str());
+fn print_login_result(ctx: &CliContext, result: &LoginResult) {
     if ctx.json {
-        print_json(&json!({ "status": "ok", "base_url": base_url, "name": name, "role": role }));
+        print_json(&json!({
+            "status": "ok",
+            "base_url": result.base_url,
+            "name": result.name,
+            "role": result.role,
+        }));
     } else {
-        match identity {
-            Some((name, role)) => println!("Logged in to {base_url} as '{name}' ({role})."),
-            None => println!("Logged in to {base_url}."),
+        match (&result.name, &result.role) {
+            (Some(name), Some(role)) => {
+                println!("Logged in to {} as '{name}' ({role}).", result.base_url)
+            }
+            _ => println!("Logged in to {}.", result.base_url),
         }
     }
 }

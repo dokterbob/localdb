@@ -126,6 +126,58 @@ fn write_entry_error_names_the_file() {
 }
 
 #[test]
+fn write_entry_parse_error_does_not_leak_secret_from_file_contents() {
+    // A value of the wrong type (a bare string where a `CredentialEntry`
+    // object is expected) makes serde_json quote the offending value in its
+    // own message — exactly the shape a hand-edited file holding a real
+    // secret would take.
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"http://localhost:7700":"ldb_REAL_SECRET"}}"#,
+    );
+
+    let error = write_entry(&path, "http://x", CredentialEntry::default()).unwrap_err();
+
+    assert!(
+        !format!("{error}").contains("ldb_REAL_SECRET"),
+        "Display must not quote the file's secret: {error}"
+    );
+    assert!(
+        !format!("{error:?}").contains("ldb_REAL_SECRET"),
+        "Debug must not quote the file's secret: {error:?}"
+    );
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "error should still name the unparseable file: {error}"
+    );
+}
+
+#[test]
+fn read_path_warning_does_not_leak_secret_from_file_contents() {
+    let dir = TempDir::new().unwrap();
+    let path = write_credentials(
+        &dir,
+        r#"{"version":1,"credentials":{"http://localhost:7700":"ldb_REAL_SECRET"}}"#,
+    );
+
+    // `load_file_for_read` collapses this to a default and prints
+    // `read_path_warning(&error)` on stderr; drive that function directly
+    // with the same failure instead of capturing the process's stderr.
+    let error = load_file_for_write(&path).unwrap_err();
+    let warning = read_path_warning(&error);
+
+    assert!(
+        !warning.contains("ldb_REAL_SECRET"),
+        "the read-path warning must not quote the file's secret: {warning}"
+    );
+    assert!(
+        warning.contains(&path.display().to_string()),
+        "the warning should still name the unparseable file: {warning}"
+    );
+}
+
+#[test]
 fn write_entry_on_unreadable_directory_path_fails_rather_than_overwriting() {
     // A credentials_file path that is itself a directory can't be read as a
     // file; this must surface as an error, not be treated as "missing".

@@ -127,10 +127,30 @@ fn load_file_for_write(credentials_file: &Path) -> std::io::Result<CredentialsFi
     let file: CredentialsFile = serde_json::from_str(&contents).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("cannot parse {}: {error}", credentials_file.display()),
+            describe_parse_error(credentials_file, &error),
         )
     })?;
     Ok(file.canonicalized())
+}
+
+/// Describe a credentials-file parse failure by path, error category and
+/// position only. `serde_json::Error`'s own `Display` quotes the offending
+/// value from the file (e.g. `invalid type: string "ldb_..."`), which would
+/// put a hand-edited secret on stderr or in a `--json` error envelope, so
+/// that message is never formatted here.
+fn describe_parse_error(credentials_file: &Path, error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "io error",
+        serde_json::error::Category::Syntax => "invalid syntax",
+        serde_json::error::Category::Data => "invalid data",
+        serde_json::error::Category::Eof => "unexpected end of input",
+    };
+    format!(
+        "cannot parse {}: {category} at line {} column {}",
+        credentials_file.display(),
+        error.line(),
+        error.column()
+    )
 }
 
 /// Load the credentials file for a read-only lookup: missing, unreadable or
@@ -144,10 +164,17 @@ fn load_file_for_read(credentials_file: &Path) -> CredentialsFile {
     match load_file_for_write(credentials_file) {
         Ok(file) => file,
         Err(error) => {
-            eprintln!("warning: {error}");
+            eprintln!("{}", read_path_warning(&error));
             CredentialsFile::default()
         }
     }
+}
+
+/// The warning text printed for a read-path failure, split out from
+/// [`load_file_for_read`] so a test can assert on it directly rather than
+/// capturing the process's stderr.
+fn read_path_warning(error: &std::io::Error) -> String {
+    format!("warning: {error}")
 }
 
 /// Look up the cached entry for `base_url`, if the file exists, parses, and
