@@ -73,7 +73,9 @@ pub enum DemoteOutcome {
 /// rotated (reuse — the caller must revoke the family) or concurrently
 /// expired (not reuse — no revocation). The split matters because the two
 /// layers must agree on the expiry boundary: a token expiring in the exact
-/// same second as "now" is `Ineligible`, never treated as reuse.
+/// same second as "now" stays eligible, matching `core::auth::is_expired`'s
+/// own boundary (`expires_at < now`); only a strictly earlier `expires_at`
+/// is `Ineligible`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotateOutcome {
     /// The old refresh token was revoked and both replacements inserted.

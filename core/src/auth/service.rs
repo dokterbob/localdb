@@ -442,6 +442,19 @@ impl<S: AuthStore> AuthService<S> {
             });
         }
 
+        // Expiry is checked before revocation: only a refresh token that is
+        // both already rotated away *and* still unexpired is evidence of
+        // reuse. An expired token presented after it has also been rotated
+        // away is just a plain stale credential — no family revocation,
+        // since nothing could still be replaying it.
+        if let Some(expires_at) = &token.expires_at {
+            if is_expired(expires_at) {
+                return Err(Error::Unauthorized {
+                    message: "refresh token has expired".to_string(),
+                });
+            }
+        }
+
         if token.revoked_at.is_some() {
             // Someone presented a refresh token that was already rotated
             // away (or explicitly revoked) — treat as theft and burn the
@@ -454,14 +467,6 @@ impl<S: AuthStore> AuthService<S> {
             return Err(Error::Unauthorized {
                 message: "refresh token reuse detected; session revoked".to_string(),
             });
-        }
-
-        if let Some(expires_at) = &token.expires_at {
-            if is_expired(expires_at) {
-                return Err(Error::Unauthorized {
-                    message: "refresh token has expired".to_string(),
-                });
-            }
         }
 
         let family = token.family_id.clone().unwrap_or_else(new_ulid);

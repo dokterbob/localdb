@@ -112,9 +112,29 @@ pub(super) async fn rotate_tokens(
     access: &AuthTokenRow,
     refresh: &AuthTokenRow,
 ) -> Result<RotateOutcome, Error> {
+    rotate_tokens_at(
+        db,
+        old_id,
+        access,
+        refresh,
+        &localdb_core::auth::rfc3339_from_now(0),
+    )
+    .await
+}
+
+/// `rotate_tokens` with `now` passed in rather than read from the wall
+/// clock, so a test can pin the exact boundary between the row's
+/// `expires_at` and the timestamp this call treats as "now" instead of
+/// racing the clock across two separate `rfc3339_from_now(0)` calls.
+pub(super) async fn rotate_tokens_at(
+    db: &LibsqlDb,
+    old_id: &str,
+    access: &AuthTokenRow,
+    refresh: &AuthTokenRow,
+    now: &str,
+) -> Result<RotateOutcome, Error> {
     let tx = db.write_tx().await?;
     let result = async {
-        let now = localdb_core::auth::rfc3339_from_now(0);
         // `>=`, not `>`: a token expiring in the exact same second as `now`
         // must be eligible here too, matching `core::auth::is_expired`'s
         // own boundary (`expires_at < now`, so `expires_at == now` is NOT
@@ -125,12 +145,12 @@ pub(super) async fn rotate_tokens(
                 "UPDATE auth_tokens SET revoked_at = ? WHERE id = ? \
              AND revoked_at IS NULL AND kind = 'refresh' \
              AND (expires_at IS NULL OR expires_at >= ?)",
-                libsql::params![now.clone(), old_id, now.clone()],
+                libsql::params![now.to_string(), old_id, now.to_string()],
             )
             .await
             .map_err(map_libsql_err)?;
         if changed == 0 {
-            return classify_rotation_failure(&tx, old_id, &now).await;
+            return classify_rotation_failure(&tx, old_id, now).await;
         }
         // A compromised ancestor revokes this whole family before marking
         // it, so the conditional revoke above normally fails first. A
@@ -241,7 +261,11 @@ pub(super) async fn redeem_open_invite(
         for grant in grants {
             grant_store_on(&tx, grant).await?;
         }
-        insert_token_on(&tx, credential).await?;
+        if !insert_token_on(&tx, credential).await? {
+            return Err(Error::Unauthorized {
+                message: "session revoked".to_string(),
+            });
+        }
         Ok(true)
     }
     .await;
@@ -283,7 +307,11 @@ pub(super) async fn collect_access_request(
         if !mark_access_request_collected_on(&tx, id, collected_at).await? {
             return Ok(false);
         }
-        insert_token_on(&tx, credential).await?;
+        if !insert_token_on(&tx, credential).await? {
+            return Err(Error::Unauthorized {
+                message: "session revoked".to_string(),
+            });
+        }
         Ok(true)
     }
     .await;

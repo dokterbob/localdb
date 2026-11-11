@@ -136,40 +136,103 @@ async fn approval_rolls_back_every_write_failure_and_can_retry() {
     }
 }
 
-#[tokio::test]
-async fn invite_reservation_rechecks_revocation_and_expiry() {
-    let (_dir, _backend, store) = make_store().await;
-    let store = Arc::new(store);
-    let svc = AuthService::new(store.clone());
-    let invite = svc
-        .create_invite(InviteMode::Open, &[], 1, None, "admin")
-        .await
-        .unwrap();
-    // Simulates revocation between the service's initial read and
-    // reservation: `redeem_invite` reads the invite, finds it not revoked,
-    // then calls the store, by which point it has been revoked.
-    store.revoke_invite(&invite.row.id).await.unwrap();
-    let err = svc
-        .redeem_invite(&invite.secret, "someone")
-        .await
-        .unwrap_err();
-    assert!(matches!(err, localdb_core::Error::Unauthorized { .. }));
+fn make_invite(id: &str, token_hash: &str, mode: InviteMode) -> InviteRow {
+    InviteRow {
+        id: id.to_string(),
+        token_hash: token_hash.to_string(),
+        mode,
+        store_grants: vec![],
+        max_uses: 1,
+        uses: 0,
+        expires_at: None,
+        revoked_at: None,
+        created_by: "admin".to_string(),
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+    }
+}
 
-    let expired = svc
-        .create_invite(
-            InviteMode::Open,
-            &[],
-            1,
-            Some("2000-01-01T00:00:00Z".into()),
-            "admin",
-        )
+/// `reserve_invite_use_on`'s own predicate (`revoked_at IS NULL AND
+/// (expires_at IS NULL OR expires_at > now)`) runs inside the transaction
+/// that `redeem_open_invite`/`redeem_closed_invite` share. Going through
+/// `AuthService::redeem_invite` never reaches it: the service rejects a
+/// revoked or expired invite from its own initial read before ever calling
+/// the store, so a test that revokes/expires the invite and then calls
+/// `redeem_invite` only exercises the service's check, not the
+/// transaction's. Calling the store methods directly is the only way to
+/// exercise the transaction's own predicate, and also confirms a refused
+/// redemption leaves no partial state (reserved use, minted user/request,
+/// or inserted credential) behind.
+#[tokio::test]
+async fn redeem_open_invite_revoked_or_expired_leaves_no_partial_state() {
+    let (_dir, backend, store) = make_store().await;
+    insert_store_row(&backend, "docs").await;
+    let user = make_user("u1", "alice", Role::Member);
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+
+    let mut revoked = make_invite("i1", "h1", InviteMode::Open);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    assert!(!store
+        .redeem_open_invite("i1", &user, &[], &credential)
         .await
-        .unwrap();
-    let err = svc
-        .redeem_invite(&expired.secret, "someone")
+        .unwrap());
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 0);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store
+        .find_token_by_hash("hash-cred")
         .await
-        .unwrap_err();
-    assert!(matches!(err, localdb_core::Error::Unauthorized { .. }));
+        .unwrap()
+        .is_none());
+
+    let mut expired = make_invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    assert!(!store
+        .redeem_open_invite("i2", &user, &[], &credential)
+        .await
+        .unwrap());
+    assert_eq!(store.find_invite("i2").await.unwrap().unwrap().uses, 0);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn redeem_closed_invite_revoked_or_expired_leaves_no_partial_state() {
+    let (_dir, _backend, store) = make_store().await;
+    let request = AccessRequestRow {
+        id: "ar1".to_string(),
+        invite_id: "i1".to_string(),
+        requested_name: "someone".to_string(),
+        secret_hash: "req-hash".to_string(),
+        state: AccessRequestState::Pending,
+        resulting_user_id: None,
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+        decided_at: None,
+        collected_at: None,
+    };
+
+    let mut revoked = make_invite("i1", "h1", InviteMode::Closed);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    assert!(!store.redeem_closed_invite("i1", &request).await.unwrap());
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 0);
+    assert!(store.find_access_request("ar1").await.unwrap().is_none());
+
+    let mut expired = make_invite("i2", "h2", InviteMode::Closed);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    let request2 = AccessRequestRow {
+        id: "ar2".to_string(),
+        invite_id: "i2".to_string(),
+        ..request
+    };
+    assert!(!store.redeem_closed_invite("i2", &request2).await.unwrap());
+    assert_eq!(store.find_invite("i2").await.unwrap().unwrap().uses, 0);
+    assert!(store.find_access_request("ar2").await.unwrap().is_none());
 }
 
 #[tokio::test]

@@ -277,24 +277,52 @@ async fn rotate_tokens_boundary_expiry_is_still_eligible() {
     // Matches core::auth::is_expired's own boundary (`expires_at < now`, so
     // `expires_at == now` is NOT expired) — a stricter SQL boundary would
     // reject a row the service already treated as still-valid, reading as
-    // reuse (the exact regression this test pins).
+    // reuse (the exact regression this test pins). Uses `rotate_tokens_at`
+    // with a fixed `now` rather than `rotate_tokens`'s own wall-clock read,
+    // so the boundary can't shift between the timestamp this test writes
+    // into `expires_at` and the one the call treats as "now".
     let (_dir, _backend, store) = make_store().await;
     store
         .create_user(&make_user("u1", "alice", Role::Admin))
         .await
         .unwrap();
-    let now = localdb_core::auth::rfc3339_from_now(0);
+    let now = "2026-06-10T12:00:00Z".to_string();
     let mut refresh = make_token("t1", "u1", TokenKind::Refresh, "hash-a");
-    refresh.expires_at = Some(now);
+    refresh.expires_at = Some(now.clone());
     store.insert_token(&refresh).await.unwrap();
 
     let new_access = make_token("t2", "u1", TokenKind::Access, "hash-b");
     let new_refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
-    let outcome = store
-        .rotate_tokens("t1", &new_access, &new_refresh)
+    let outcome =
+        crate::auth::atomic::rotate_tokens_at(&store.conn, "t1", &new_access, &new_refresh, &now)
+            .await
+            .unwrap();
+    assert_eq!(outcome, RotateOutcome::Rotated);
+}
+
+#[tokio::test]
+async fn rotate_tokens_boundary_one_second_earlier_is_ineligible() {
+    // The mirror image of the test above: an `expires_at` one second
+    // *before* "now" must be `Ineligible`, same fixed-timestamp approach so
+    // the boundary can't shift between the two timestamps this test
+    // compares.
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
         .await
         .unwrap();
-    assert_eq!(outcome, RotateOutcome::Rotated);
+    let now = "2026-06-10T12:00:00Z".to_string();
+    let mut refresh = make_token("t1", "u1", TokenKind::Refresh, "hash-a");
+    refresh.expires_at = Some("2026-06-10T11:59:59Z".to_string());
+    store.insert_token(&refresh).await.unwrap();
+
+    let new_access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    let new_refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
+    let outcome =
+        crate::auth::atomic::rotate_tokens_at(&store.conn, "t1", &new_access, &new_refresh, &now)
+            .await
+            .unwrap();
+    assert_eq!(outcome, RotateOutcome::Ineligible);
 }
 
 #[tokio::test]

@@ -420,3 +420,138 @@ async fn grant_store_is_idempotent_per_store_user_pair() {
     let grants = store.list_grants_for_user("u1").await.unwrap();
     assert_eq!(grants.len(), 1, "re-granting must not duplicate the row");
 }
+
+// -----------------------------------------------------------------
+// redeem_open_invite/redeem_closed_invite: revoked/expired invites and
+// credentials minted by a compromised family must be refused with no
+// partial state left behind — mirrors store-libsql's equivalent tests.
+// -----------------------------------------------------------------
+
+fn invite(id: &str, token_hash: &str, mode: InviteMode) -> InviteRow {
+    InviteRow {
+        id: id.to_string(),
+        token_hash: token_hash.to_string(),
+        mode,
+        store_grants: vec![],
+        max_uses: 1,
+        uses: 0,
+        expires_at: None,
+        revoked_at: None,
+        created_by: "admin".to_string(),
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn redeem_open_invite_revoked_or_expired_leaves_no_partial_state() {
+    let store = FakeAuthStore::new();
+    let u = user("u1", "alice");
+    let cred = credential("t1", "u1", "hash-cred");
+
+    let mut revoked = invite("i1", "h1", InviteMode::Open);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    assert!(!store
+        .redeem_open_invite("i1", &u, &[], &cred)
+        .await
+        .unwrap());
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 0);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store.find_token("t1").await.unwrap().is_none());
+
+    let mut expired = invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    assert!(!store
+        .redeem_open_invite("i2", &u, &[], &cred)
+        .await
+        .unwrap());
+    assert_eq!(store.find_invite("i2").await.unwrap().unwrap().uses, 0);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store.find_token("t1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn redeem_closed_invite_revoked_or_expired_leaves_no_partial_state() {
+    let store = FakeAuthStore::new();
+    let request = access_request("ar1", "i1");
+
+    let mut revoked = invite("i1", "h1", InviteMode::Closed);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    assert!(!store.redeem_closed_invite("i1", &request).await.unwrap());
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 0);
+    assert!(store.find_access_request("ar1").await.unwrap().is_none());
+
+    let mut expired = invite("i2", "h2", InviteMode::Closed);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    let request2 = access_request("ar2", "i2");
+    assert!(!store.redeem_closed_invite("i2", &request2).await.unwrap());
+    assert_eq!(store.find_invite("i2").await.unwrap().unwrap().uses, 0);
+    assert!(store.find_access_request("ar2").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn redeem_open_invite_refuses_a_credential_minted_by_a_compromised_family() {
+    let store = FakeAuthStore::new();
+    store.revoke_compromised_family("fam-x").await.unwrap();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let u = user("u1", "alice");
+    let mut cred = credential("t1", "u1", "hash-cred");
+    cred.minted_by_family = Some("fam-x".to_string());
+
+    let err = store
+        .redeem_open_invite("i1", &u, &[], &cred)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+    assert_eq!(
+        store.find_invite("i1").await.unwrap().unwrap().uses,
+        0,
+        "a refused redemption must not reserve a use"
+    );
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store.find_token("t1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn collect_access_request_refuses_a_credential_minted_by_a_compromised_family() {
+    let store = FakeAuthStore::new();
+    store.revoke_compromised_family("fam-x").await.unwrap();
+    store
+        .create_access_request(&access_request("ar1", "i1"))
+        .await
+        .unwrap();
+    store
+        .try_decide_access_request(
+            "ar1",
+            AccessRequestState::Approved,
+            Some("u1"),
+            "2026-06-11T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let mut cred = credential("t1", "u1", "hash-cred");
+    cred.minted_by_family = Some("fam-x".to_string());
+
+    let err = store
+        .collect_access_request("ar1", "2026-06-11T00:00:01Z", &cred)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+    assert!(
+        store
+            .find_access_request("ar1")
+            .await
+            .unwrap()
+            .unwrap()
+            .collected_at
+            .is_none(),
+        "a refused collection must not mark the request collected"
+    );
+    assert!(store.find_token("t1").await.unwrap().is_none());
+}

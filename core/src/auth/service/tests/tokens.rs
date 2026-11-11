@@ -131,6 +131,43 @@ async fn reused_rotated_refresh_token_revokes_family_and_fails() {
 }
 
 #[tokio::test]
+async fn expired_and_revoked_refresh_token_is_plain_401_and_does_not_revoke_the_family() {
+    // Policy: only a refresh token that was already rotated away AND is
+    // still unexpired is reuse evidence. A stale refresh token that is both
+    // already-rotated and expired is a plain 401 — expiry is checked first,
+    // so the family (and its still-live refresh/access tokens) is never
+    // touched.
+    let svc = service();
+    let user = svc.create_user("yara", Role::Admin).await.unwrap();
+    let (live_access, live_refresh) = svc.issue_session(&user.id, None).await.unwrap();
+    let family = live_refresh.row.family_id.clone().unwrap();
+
+    let minted = mint_secret();
+    let stale = AuthTokenRow {
+        id: new_ulid(),
+        user_id: user.id.clone(),
+        kind: TokenKind::Refresh,
+        secret_hash: minted.hash.clone(),
+        expires_at: Some(rfc3339_from_now(-10)),
+        last_used_at: None,
+        revoked_at: Some(rfc3339_from_now(-5)),
+        created_at: now_rfc3339(),
+        family_id: Some(family),
+        rotated_from: None,
+        minted_by_family: None,
+    };
+    svc.store.insert_token(&stale).await.unwrap();
+
+    let err = svc.rotate_refresh_token(&minted.secret).await.unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+
+    // Neither the family's live access token nor its live refresh token was
+    // touched by the stale token's rejection.
+    assert!(svc.authenticate(&live_access.secret).await.is_ok());
+    assert!(svc.rotate_refresh_token(&live_refresh.secret).await.is_ok());
+}
+
+#[tokio::test]
 async fn reuse_revokes_initial_and_rotated_access_tokens() {
     // A login's very first access token (minted by `issue_session`
     // alongside the refresh token) must be revoked on reuse detection, not

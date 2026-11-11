@@ -668,6 +668,17 @@ impl AuthStore for FakeAuthStore {
                 correlation_id: "fake_redeem_open_invite".into(),
             });
         }
+        // Mirrors the real store's conditional insert: a redemption whose
+        // credential inherits a `minted_by_family` that is already
+        // compromised must not mint anything, even though the invite use is
+        // otherwise eligible to reserve.
+        if let Some(parent) = &credential.minted_by_family {
+            if inner.compromised_families.contains(parent) {
+                return Err(Error::Unauthorized {
+                    message: "session revoked".to_string(),
+                });
+            }
+        }
         // Every check above ran before touching any state, so a `false`/`Err`
         // return here never leaves a partial mutation behind — the same
         // all-or-nothing contract a real transaction gives for free.
@@ -775,6 +786,15 @@ impl AuthStore for FakeAuthStore {
                 message: "simulated token insert failure".into(),
                 correlation_id: "fake_collect_access_request".into(),
             });
+        }
+        // Mirrors the real store's conditional insert: see
+        // `redeem_open_invite`'s identical check.
+        if let Some(parent) = &credential.minted_by_family {
+            if inner.compromised_families.contains(parent) {
+                return Err(Error::Unauthorized {
+                    message: "session revoked".to_string(),
+                });
+            }
         }
         inner.access_requests[index].collected_at = Some(collected_at.to_string());
         inner.tokens.push(credential.clone());
