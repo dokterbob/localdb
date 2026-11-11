@@ -58,3 +58,33 @@ fn login_json_no_browser_stdout_is_pure_json_even_on_failure() {
         "the no-browser instructions must still appear, on stderr: {stderr}"
     );
 }
+
+/// `--url` is omitted here specifically so `resolve_login_base_url` takes
+/// its daemon-probing path: against a fresh, empty data dir with no daemon
+/// running, that path fails with `Error::DaemonUnreachable` (exit 5). A
+/// malformed `credentials.json` must still win over that — the credentials
+/// preflight runs before the base URL is ever resolved, so this exits 2.
+#[test]
+fn login_fails_on_malformed_credentials_before_probing_for_a_daemon() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config.yaml"), "version: 1\n").unwrap();
+    std::fs::write(dir.path().join("credentials.json"), "not json at all").unwrap();
+
+    let assert = cmd_with_dir(&dir)
+        .arg("login")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert();
+
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a malformed credentials.json must fail preflight (exit 2) before the daemon is \
+         ever probed, not surface as daemon-unreachable (exit 5): {stderr}"
+    );
+    assert!(
+        stderr.contains("credentials.json"),
+        "the error should name the credentials file: {stderr}"
+    );
+}

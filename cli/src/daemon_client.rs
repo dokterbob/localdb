@@ -261,6 +261,38 @@ pub(crate) async fn try_refresh_and_persist(
     refresh_cached_bearer(ctx, &key, rejected).await
 }
 
+/// Test-only rendezvous between two concurrent callers of
+/// `refresh_cached_bearer`, used to prove the credential lock genuinely
+/// serializes a race rather than the test merely running sequentially.
+/// A no-op unless `LOCALDB_TEST_REFRESH_READY_DIR` is set (it never is
+/// outside `concurrent_processes_share_one_refresh_and_preserve_other_origins`'s
+/// own child processes): writes this process's marker file, named after
+/// `LOCALDB_TEST_REFRESH_WORKER_ID`, then blocks until the sibling worker's
+/// marker also appears, bounded so a stuck sibling fails the test loudly
+/// instead of hanging it.
+#[cfg(test)]
+fn rendezvous_before_credential_lock() {
+    let Ok(dir) = std::env::var("LOCALDB_TEST_REFRESH_READY_DIR") else {
+        return;
+    };
+    let my_id = std::env::var("LOCALDB_TEST_REFRESH_WORKER_ID").unwrap();
+    let sibling_id = if my_id == "0" { "1" } else { "0" };
+    std::fs::write(
+        std::path::Path::new(&dir).join(format!("prelock-{my_id}")),
+        b"",
+    )
+    .unwrap();
+    let sibling_marker = std::path::Path::new(&dir).join(format!("prelock-{sibling_id}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !sibling_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sibling worker did not reach the pre-lock rendezvous in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// One serialized path for reactive HTTP refresh and proactive refresh
 /// alike. `rejected` is the bearer sent by the failed request, not a new
 /// cache lookup. `base_url` is the exact credentials-file key, not a
@@ -296,6 +328,8 @@ pub(crate) async fn refresh_cached_bearer(
         return entry.access_token.or(entry.secret);
     }
     let current = entry.access_token.clone().or_else(|| entry.secret.clone());
+    #[cfg(test)]
+    rendezvous_before_credential_lock();
     let Some(lock) = crate::credentials::CredentialLock::acquire(&path)
         .await
         .ok()

@@ -680,42 +680,25 @@ async fn fresh_bearer_for_url_falls_back_to_stale_token_when_refresh_fails() {
 
 // Invoked in separate OS processes by the test below; ordinary test runs do nothing.
 //
-// Before touching the credential at all, this signals its own readiness (a
-// marker file named after `LOCALDB_TEST_REFRESH_WORKER_ID` in
-// `LOCALDB_TEST_REFRESH_READY_DIR`) and then blocks until its sibling
-// worker's marker also appears. Only once both have arrived does either
-// process call into the refresh path. This is what makes the two
-// processes' *first*, unlocked reads of the stale credential genuinely
-// concurrent: neither can race ahead and finish (acquiring the credential
-// lock, refreshing, and writing the fresh entry) before the other has even
-// started, which is the scenario `CredentialLock` is supposed to serialize
-// correctly. Without this rendezvous, a merely sequential run — the second
-// process starting only after the first has fully finished — would also
-// pass every assertion below, without ever exercising the lock at all.
+// This worker calls straight into the refresh path with no rendezvous of
+// its own. The rendezvous that makes the two processes' *first*, unlocked
+// reads of the stale credential genuinely concurrent lives inside
+// `refresh_cached_bearer` itself (`daemon_client.rs`'s
+// `rendezvous_before_credential_lock`, gated on
+// `LOCALDB_TEST_REFRESH_READY_DIR`): each process writes its own marker and
+// blocks for its sibling's right after reading the stale entry and before
+// acquiring the credential lock. Rendezvousing there, rather than at the
+// top of this function, is what proves `CredentialLock` itself serializes
+// the race — both processes are provably inside the read-then-lock window
+// at once, so one process finishing the whole refresh (lock, redeem,
+// persist) before the other even starts would fail the test, not just
+// happen to pass it.
 #[test]
 fn refresh_process_worker() {
     let Ok(config) = std::env::var("LOCALDB_TEST_REFRESH_CONFIG") else {
         return;
     };
     let base = std::env::var("LOCALDB_TEST_REFRESH_URL").unwrap();
-    let ready_dir = std::env::var("LOCALDB_TEST_REFRESH_READY_DIR").unwrap();
-    let my_id = std::env::var("LOCALDB_TEST_REFRESH_WORKER_ID").unwrap();
-    let sibling_id = if my_id == "0" { "1" } else { "0" };
-
-    std::fs::write(
-        std::path::Path::new(&ready_dir).join(format!("ready-{my_id}")),
-        b"",
-    )
-    .unwrap();
-    let sibling_marker = std::path::Path::new(&ready_dir).join(format!("ready-{sibling_id}"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !sibling_marker.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "sibling worker did not become ready in time"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
 
     let ctx = ctx_with_config(std::path::Path::new(&config));
     tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -738,9 +721,9 @@ fn refresh_process_worker() {
 }
 
 /// Two processes independently discover the same stale refresh token and
-/// call into `refresh_cached_bearer` at genuinely the same time (enforced
-/// by `refresh_process_worker`'s own readiness rendezvous, not by anything
-/// here). What this proves: the credential lock
+/// call into `refresh_cached_bearer` at genuinely the same time (enforced by
+/// that function's own `rendezvous_before_credential_lock` test hook, not by
+/// anything here). What this proves: the credential lock
 /// (`cli/src/daemon_client.rs`'s use of `CredentialLock` around the
 /// re-check + `/token` call + persist) correctly serializes that race —
 /// exactly one process ever redeems the refresh token (`rotations == 1`),

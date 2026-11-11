@@ -388,9 +388,11 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
-    // OAuth2 dynamic client registration (RFC 7591) has no write path: no
-    // `/register` route inserts an `oauth_clients` row. The table ships now
-    // so the auth feature needs only one migration (D13).
+    // OAuth2 dynamic client registration (RFC 7591): `server/src/auth/register.rs`'s
+    // `/register` route calls `AuthService::register_client`, which inserts a
+    // row here via `create_oauth_client`. The table ships in this same
+    // migration as the rest of the auth feature so it needs only one chain
+    // entry (D13) regardless of when the write path landed.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS oauth_clients (
             id            TEXT PRIMARY KEY NOT NULL,

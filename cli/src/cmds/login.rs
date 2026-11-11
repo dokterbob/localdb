@@ -62,6 +62,18 @@ pub(crate) async fn run_login_async(
     invite: Option<&str>,
     name: Option<&str>,
 ) {
+    // Run the credentials-file preflight before resolving the base URL:
+    // `resolve_login_base_url` can itself fail (`Error::DaemonUnreachable`
+    // when no `--url` was given and no daemon is reachable) or have a side
+    // effect (cleaning up stale discovery files), and a malformed
+    // `credentials.json` must win over either of those rather than being
+    // masked by them. `perform_login`/`perform_invite_login` keep their own
+    // preflight call too, since each is also reachable (and tested)
+    // independently of this entry point.
+    if let Err(e) = credentials_file_ready(ctx) {
+        exit_err(&e, ctx.json);
+    }
+
     let base_url = resolve_login_base_url(ctx, url).await;
 
     if let Some(token) = invite {
