@@ -16,6 +16,30 @@ fn admin(id: &str, name: &str) -> UserRow {
     }
 }
 
+#[test]
+fn first_unused_name_returns_base_when_free() {
+    assert_eq!(first_unused_name("admin", |_| false), "admin");
+}
+
+#[test]
+fn first_unused_name_skips_taken_suffixes() {
+    let taken = ["admin", "admin-2", "admin-3"];
+    assert_eq!(
+        first_unused_name("admin", |n| taken.contains(&n)),
+        "admin-4"
+    );
+}
+
+#[tokio::test]
+async fn begin_bootstrap_picks_an_unused_name_when_admin_is_taken() {
+    let store = FakeAuthStore::new();
+    store.create_user(&user("m1", "admin")).await.unwrap();
+
+    let bootstrapped = store.begin_bootstrap(&admin("a1", "admin")).await.unwrap();
+    assert_eq!(bootstrapped.name, "admin-2");
+    assert_eq!(store.get_user("a1").await.unwrap().unwrap().name, "admin-2");
+}
+
 #[tokio::test]
 async fn create_user_rejects_duplicate_name() {
     let store = FakeAuthStore::new();
@@ -129,7 +153,10 @@ async fn try_demote_user_unless_last_admin_refuses_the_sole_admin() {
     let store = FakeAuthStore::new();
     store.create_user(&admin("a1", "only-admin")).await.unwrap();
 
-    assert!(!store.try_demote_user_unless_last_admin("a1").await.unwrap());
+    assert_eq!(
+        store.try_demote_user_unless_last_admin("a1").await.unwrap(),
+        DemoteOutcome::LastAdmin
+    );
     let reloaded = store.get_user("a1").await.unwrap().unwrap();
     assert_eq!(reloaded.role, Role::Admin);
 }
@@ -140,7 +167,10 @@ async fn try_demote_user_unless_last_admin_succeeds_with_another_admin() {
     store.create_user(&admin("a1", "admin1")).await.unwrap();
     store.create_user(&admin("a2", "admin2")).await.unwrap();
 
-    assert!(store.try_demote_user_unless_last_admin("a1").await.unwrap());
+    assert_eq!(
+        store.try_demote_user_unless_last_admin("a1").await.unwrap(),
+        DemoteOutcome::Done
+    );
     let reloaded = store.get_user("a1").await.unwrap().unwrap();
     assert_eq!(reloaded.role, Role::Member);
     // The remaining admin is unaffected.
@@ -149,15 +179,30 @@ async fn try_demote_user_unless_last_admin_succeeds_with_another_admin() {
 }
 
 #[tokio::test]
-async fn try_demote_user_unless_last_admin_is_a_noop_on_a_member() {
+async fn try_demote_user_unless_last_admin_is_a_noop_done_on_a_member() {
     let store = FakeAuthStore::new();
     store.create_user(&admin("a1", "solo-admin")).await.unwrap();
     store.create_user(&user("m1", "some-member")).await.unwrap();
 
-    // `m1` isn't an admin at all — the guard's WHERE clause never
-    // matches, so this reports `false` (nothing to demote), not a
-    // last-admin refusal.
-    assert!(!store.try_demote_user_unless_last_admin("m1").await.unwrap());
+    // `m1` is already a member — the guarded write's "already a member"
+    // branch matches, so this reports `Done` (a no-op success), not a
+    // last-admin refusal and not a second, unguarded write.
+    assert_eq!(
+        store.try_demote_user_unless_last_admin("m1").await.unwrap(),
+        DemoteOutcome::Done
+    );
+}
+
+#[tokio::test]
+async fn try_demote_user_unless_last_admin_reports_not_found_for_unknown_id() {
+    let store = FakeAuthStore::new();
+    assert_eq!(
+        store
+            .try_demote_user_unless_last_admin("nope")
+            .await
+            .unwrap(),
+        DemoteOutcome::NotFound
+    );
 }
 
 #[tokio::test]
@@ -275,8 +320,24 @@ async fn poison_next_decide_makes_try_decide_report_false_once() {
         .unwrap());
 }
 
+fn credential(id: &str, user_id: &str, secret_hash: &str) -> AuthTokenRow {
+    AuthTokenRow {
+        id: id.to_string(),
+        user_id: user_id.to_string(),
+        kind: super::TokenKind::ApiKey,
+        secret_hash: secret_hash.to_string(),
+        expires_at: None,
+        last_used_at: None,
+        revoked_at: None,
+        created_at: "2026-06-11T00:00:00Z".to_string(),
+        family_id: None,
+        rotated_from: None,
+        minted_by_family: None,
+    }
+}
+
 #[tokio::test]
-async fn poison_next_collect_makes_mark_collected_report_false_once() {
+async fn poison_next_collect_makes_collect_access_request_report_false_once() {
     let store = FakeAuthStore::new();
     store
         .create_access_request(&access_request("ar1", "i1"))
@@ -291,20 +352,26 @@ async fn poison_next_collect_makes_mark_collected_report_false_once() {
         )
         .await
         .unwrap();
+    let token = credential("t1", "u1", "hash-1");
 
     store.poison_next_collect("ar1").await;
     assert!(!store
-        .mark_access_request_collected("ar1", "2026-06-11T00:00:01Z")
+        .collect_access_request("ar1", "2026-06-11T00:00:01Z", &token)
         .await
         .unwrap());
     let untouched = store.find_access_request("ar1").await.unwrap().unwrap();
     assert!(untouched.collected_at.is_none());
+    assert!(
+        store.find_token("t1").await.unwrap().is_none(),
+        "a lost collect race must not mint anything"
+    );
 
-    // Single-shot: the next call behaves normally.
+    // Single-shot: the next call behaves normally and mints the token.
     assert!(store
-        .mark_access_request_collected("ar1", "2026-06-11T00:00:02Z")
+        .collect_access_request("ar1", "2026-06-11T00:00:02Z", &token)
         .await
         .unwrap());
+    assert!(store.find_token("t1").await.unwrap().is_some());
 }
 
 #[tokio::test]

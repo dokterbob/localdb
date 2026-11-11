@@ -15,37 +15,57 @@ use crate::Error;
 use super::client;
 use super::principal::{Principal, Role, SessionOrigin, StoreAccess};
 use super::store::{
-    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
-    InviteRow, OAuthClientRow, StoreGrantRow, TokenKind, UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
+    InviteMode, InviteRow, OAuthClientRow, RotateOutcome, StoreGrantRow, TokenKind, UserRow,
 };
 use super::token::{
     hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256, verify_secret,
     ACCESS_TOKEN_TTL_SECS, AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS,
 };
 
+/// Hand-written `Debug` for a type shaped `{ row, secret: String }` that
+/// redacts `secret` — these types carry a show-once plaintext credential,
+/// and a derived `Debug` would print it into logs/panic messages/test
+/// failure output verbatim.
+macro_rules! redact_secret_in_debug {
+    ($ty:ident) => {
+        impl std::fmt::Debug for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($ty))
+                    .field("row", &self.row)
+                    .field("secret", &"<redacted>")
+                    .finish()
+            }
+        }
+    };
+}
+
 /// A newly minted bearer token: the persisted row plus the plaintext secret
 /// (shown to the caller exactly once — never persisted, never logged).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedToken {
     pub row: AuthTokenRow,
     pub secret: String,
 }
+redact_secret_in_debug!(IssuedToken);
 
 /// A newly created invite: the persisted row plus its plaintext secret
 /// (shown once).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedInvite {
     pub row: InviteRow,
     pub secret: String,
 }
+redact_secret_in_debug!(IssuedInvite);
 
 /// A newly minted authorization code: the persisted row plus the plaintext
 /// code (shown once, in the `POST /authorize` redirect's `code` param).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedAuthCode {
     pub row: AuthCodeRow,
     pub secret: String,
 }
+redact_secret_in_debug!(IssuedAuthCode);
 
 /// The auth policy layer. Generic over `AuthStore` so callers (server, cli)
 /// can plug in the libsql-backed implementation; core tests use
@@ -440,18 +460,22 @@ impl<S: AuthStore> AuthService<S> {
             None,
             token.minted_by_family.clone(),
         );
-        if !self
+        match self
             .store
             .rotate_tokens(&token.id, &new_access.row, &new_refresh.row)
             .await?
         {
-            self.store.revoke_compromised_family(&family).await?;
-            return Err(Error::Unauthorized {
-                message: "refresh token reuse detected; session revoked".into(),
-            });
+            RotateOutcome::Rotated => Ok((new_access, new_refresh)),
+            RotateOutcome::AlreadyRotated => {
+                self.store.revoke_compromised_family(&family).await?;
+                Err(Error::Unauthorized {
+                    message: "refresh token reuse detected; session revoked".into(),
+                })
+            }
+            RotateOutcome::Ineligible => Err(Error::Unauthorized {
+                message: "refresh token is not eligible for rotation".into(),
+            }),
         }
-
-        Ok((new_access, new_refresh))
     }
 
     /// Mint a single-use OAuth2 authorization code (RFC 6749 §4.1), bound to
@@ -755,29 +779,27 @@ impl<S: AuthStore> AuthService<S> {
     /// `member` (D7 guard rail — same lockout concern as `delete_user`).
     /// Promoting a member to admin is always allowed.
     ///
-    /// **Concurrency (finding #5 fix):** demotion to `member` is enforced
-    /// atomically at the store layer
-    /// (`AuthStore::try_demote_user_unless_last_admin`), the same
-    /// conditional-write pattern as `delete_user` above — see that method's
-    /// doc comment for the race it closes. If the guarded demotion reports
-    /// `false`, `is_last_admin` disambiguates a genuine last-admin refusal
-    /// from "unknown id" / "already not an admin", falling back to the
-    /// plain unconditional `update_user_role` for those idempotent cases
-    /// (preserving both "not found" errors and a no-op member->member
-    /// "demotion").
+    /// **Concurrency:** demotion to `member` is enforced entirely by the
+    /// single guarded write in `AuthStore::try_demote_user_unless_last_admin`
+    /// — unlike `delete_user`, there is no second, unguarded fallback write
+    /// afterward (that fallback used to let a concurrent promote/demote race
+    /// its own re-check and leave zero admins). The store distinguishes
+    /// "demoted or already a member" from "unknown id" from "is the sole
+    /// admin" directly (`DemoteOutcome`), so this method only has to map
+    /// each to its own result.
     pub async fn set_user_role(&self, id: &str, role: Role) -> Result<(), Error> {
         if role != Role::Member {
             return self.store.update_user_role(id, role).await;
         }
-        if self.store.try_demote_user_unless_last_admin(id).await? {
-            return Ok(());
-        }
-        if self.is_last_admin(id).await? {
-            return Err(Error::InvalidRequest {
+        match self.store.try_demote_user_unless_last_admin(id).await? {
+            DemoteOutcome::Done => Ok(()),
+            DemoteOutcome::LastAdmin => Err(Error::InvalidRequest {
                 message: "cannot demote the last remaining admin account".to_string(),
-            });
+            }),
+            DemoteOutcome::NotFound => Err(Error::InvalidRequest {
+                message: format!("user '{id}' not found"),
+            }),
         }
-        self.store.update_user_role(id, role).await
     }
 
     /// D7 grant evaluation, delegated to the pure logic on `Principal`.

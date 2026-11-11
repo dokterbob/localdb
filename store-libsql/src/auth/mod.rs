@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use localdb_core::auth::{
-    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteRow,
-    OAuthClientRow, Role, StoreGrantRow, UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
+    InviteRow, OAuthClientRow, Role, RotateOutcome, StoreGrantRow, UserRow,
 };
 use localdb_core::Error;
 
@@ -58,7 +58,7 @@ impl AuthStore for LibsqlAuthStore {
         old_id: &str,
         access: &AuthTokenRow,
         refresh: &AuthTokenRow,
-    ) -> Result<bool, Error> {
+    ) -> Result<RotateOutcome, Error> {
         atomic::rotate_tokens(&self.conn, old_id, access, refresh).await
     }
     async fn approve_access_request(
@@ -106,7 +106,7 @@ impl AuthStore for LibsqlAuthStore {
         users::try_delete_user_unless_last_admin(&self.conn, id).await
     }
 
-    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
+    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<DemoteOutcome, Error> {
         users::try_demote_user_unless_last_admin(&self.conn, id).await
     }
 
@@ -202,12 +202,22 @@ impl AuthStore for LibsqlAuthStore {
         invites::revoke_invite(&self.conn, id, &now).await
     }
 
-    async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error> {
-        invites::try_consume_invite_use(&self.conn, id).await
+    async fn redeem_open_invite(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+    ) -> Result<bool, Error> {
+        atomic::redeem_open_invite(&self.conn, invite_id, user, grants, credential).await
     }
 
-    async fn release_invite_use(&self, id: &str) -> Result<(), Error> {
-        invites::release_invite_use(&self.conn, id).await
+    async fn redeem_closed_invite(
+        &self,
+        invite_id: &str,
+        request: &AccessRequestRow,
+    ) -> Result<bool, Error> {
+        atomic::redeem_closed_invite(&self.conn, invite_id, request).await
     }
 
     async fn create_access_request(&self, req: &AccessRequestRow) -> Result<(), Error> {
@@ -240,11 +250,12 @@ impl AuthStore for LibsqlAuthStore {
             .await
     }
 
-    async fn mark_access_request_collected(
+    async fn collect_access_request(
         &self,
         id: &str,
         collected_at: &str,
+        credential: &AuthTokenRow,
     ) -> Result<bool, Error> {
-        invites::mark_access_request_collected(&self.conn, id, collected_at).await
+        atomic::collect_access_request(&self.conn, id, collected_at, credential).await
     }
 }

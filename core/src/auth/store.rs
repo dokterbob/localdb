@@ -21,6 +21,24 @@ pub struct UserRow {
     pub created_at: String,
 }
 
+/// The first of `base`, `base-2`, `base-3`, … for which `is_taken` reports
+/// `false`. Used by `begin_bootstrap` to pick an admin name that doesn't
+/// collide with an existing member — `users.name` is UNIQUE, so bootstrap
+/// must never assume `base` itself is free.
+pub fn first_unused_name(base: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    if !is_taken(base) {
+        return base.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Which kind of bearer secret an `AuthTokenRow` represents.
 ///
 /// All three share one table (D1) — an API key is simply a token with
@@ -32,6 +50,40 @@ pub enum TokenKind {
     Access,
     Refresh,
     ApiKey,
+}
+
+/// Outcome of `AuthStore::try_demote_user_unless_last_admin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemoteOutcome {
+    /// `id` is now (or already was) `Role::Member`.
+    Done,
+    /// `id` is the sole admin — refused to avoid a zero-admin instance.
+    LastAdmin,
+    /// `id` does not name a known user.
+    NotFound,
+}
+
+/// Outcome of `AuthStore::rotate_tokens`.
+///
+/// `AuthService::rotate_refresh_token` already rejects a wrong-kind,
+/// already-revoked (per the row it fetched), or expired token before ever
+/// calling `rotate_tokens` — so in the ordinary path the store only sees a
+/// genuinely eligible row and reports `Rotated`. A non-`Rotated` result
+/// means the row changed between that check and this call: concurrently
+/// rotated (reuse — the caller must revoke the family) or concurrently
+/// expired (not reuse — no revocation). The split matters because the two
+/// layers must agree on the expiry boundary: a token expiring in the exact
+/// same second as "now" is `Ineligible`, never treated as reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotateOutcome {
+    /// The old refresh token was revoked and both replacements inserted.
+    Rotated,
+    /// `old_id` is unknown, not a refresh token, or expired — not evidence
+    /// of reuse; the caller must not revoke anything.
+    Ineligible,
+    /// `old_id` names a refresh token that is not expired but is already
+    /// revoked — reuse; the caller must revoke the whole family.
+    AlreadyRotated,
 }
 
 /// A persisted bearer token/API key.
@@ -165,16 +217,16 @@ pub enum AccessRequestState {
 
 /// A request to redeem a `closed`-mode invite, awaiting admin approval.
 ///
-/// `secret_hash` (T6): the blake3 hash of the request secret minted at
+/// `secret_hash`: the blake3 hash of the request secret minted at
 /// redemption time (`AuthService::redeem_invite`) and shown once to the
-/// requester then. On approval (`AuthService::approve_request`) that same
-/// secret is promoted to the new user's live API key — this is deliberate:
-/// it avoids ever holding a *second* plaintext credential in memory between
-/// approval and the requester's next poll (see `AuthService::approve_request`
-/// doc comment). `collected_at` (T6) guards the "handed out exactly once"
-/// contract: `AuthStore::mark_access_request_collected` is the atomic
-/// consume-once gate `poll_request` uses, mirroring `consume_auth_code`'s
-/// convention for the OAuth2 authorization code.
+/// requester then. That secret never becomes a credential itself — it only
+/// proves the requester's identity on later `poll_request` calls.
+/// `AuthService::poll_request` mints a *fresh* API key for the resulting
+/// user the first time a poll observes the `Approved` state, so approval
+/// alone never hands out a usable credential. `collected_at` guards the
+/// "handed out exactly once" contract: `AuthStore::collect_access_request`
+/// is the atomic consume-once gate `poll_request` uses, mirroring
+/// `consume_auth_code`'s convention for the OAuth2 authorization code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessRequestRow {
     pub id: String,
@@ -220,7 +272,10 @@ pub trait AuthStore: Send + Sync + 'static {
     /// Pending first-admin setup; absence never implies an established admin needs recovery.
     async fn pending_bootstrap_user(&self) -> Result<Option<UserRow>, Error>;
     /// Atomically reuse the pending admin or create the first admin and its recovery marker.
-    /// Reject when an established admin already exists.
+    /// Reject when an established admin already exists. `user.name` is the *desired* name
+    /// (`"admin"`); if a member already holds it, the stored user gets the first unused
+    /// `"admin-2"`, `"admin-3"`, … variant instead (`first_unused_name`) — `users.name` is
+    /// UNIQUE, so insisting on the literal name would make setup unable to complete.
     async fn begin_bootstrap(&self, user: &UserRow) -> Result<UserRow, Error>;
     async fn complete_bootstrap(&self, user_id: &str) -> Result<(), Error>;
     /// Atomically delete `id` unless it is currently the *sole* admin (D7's
@@ -235,12 +290,12 @@ pub trait AuthStore: Send + Sync + 'static {
     /// Atomically demote `id` to `Role::Member` unless it is currently the
     /// sole admin — the demotion counterpart to
     /// `try_delete_user_unless_last_admin`, same conditional-UPDATE
-    /// convention. Returns `true` iff this call performed the demotion;
-    /// `false` covers "unknown id", "already not an admin", and "would have
-    /// left zero admins" — `AuthService::set_user_role` disambiguates via
-    /// `is_last_admin` before falling back to the plain `update_user_role`
-    /// for the idempotent non-admin cases.
-    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<bool, Error>;
+    /// convention, but folding the idempotent "already a member" case into
+    /// the same guarded statement too (`role = 'member' OR (admin count) >
+    /// 1`) so every outcome comes from one write — no second, unguarded
+    /// `update_user_role` call that a concurrent promote/demote could race
+    /// into leaving zero admins. See [`DemoteOutcome`].
+    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<DemoteOutcome, Error>;
 
     // ------------------------------------------------------------------
     // Tokens
@@ -254,14 +309,16 @@ pub trait AuthStore: Send + Sync + 'static {
     /// concurrently with a reuse-detected revocation racing the same insert.
     /// A `None` `minted_by_family` is never refused.
     async fn insert_token(&self, token: &AuthTokenRow) -> Result<(), Error>;
-    /// Consume the old refresh token and insert both replacements atomically.
-    /// False means the token is no longer eligible; errors leave all three rows unchanged.
+    /// Consume the old refresh token and insert both replacements atomically;
+    /// errors leave all three rows unchanged. See [`RotateOutcome`] for what
+    /// each non-`Rotated` outcome means and which one calls for revoking the
+    /// family.
     async fn rotate_tokens(
         &self,
         old_id: &str,
         access: &AuthTokenRow,
         refresh: &AuthTokenRow,
-    ) -> Result<bool, Error>;
+    ) -> Result<RotateOutcome, Error>;
     async fn find_token_by_hash(&self, secret_hash: &str) -> Result<Option<AuthTokenRow>, Error>;
     /// Look up a token by its own ID (not its secret hash) — used by
     /// `DELETE /v1/keys/{id}` to resolve the owning user before checking
@@ -323,23 +380,30 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn find_invite(&self, id: &str) -> Result<Option<InviteRow>, Error>;
     async fn list_invites(&self) -> Result<Vec<InviteRow>, Error>;
     async fn revoke_invite(&self, id: &str) -> Result<bool, Error>;
-    /// Atomically reserve one use against `max_uses` (T6, D9): the
-    /// conditional update `UPDATE invites SET uses = uses + 1 WHERE id = ?
-    /// AND uses < max_uses AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)`. Returns `true` iff this call reserved a slot
-    /// (mirrors `consume_auth_code`'s "consume iff eligible" convention);
-    /// `false` means the invite is no longer eligible.
-    ///
-    /// `AuthService::redeem_invite` calls this to RESERVE a use *before*
-    /// attempting the mint (user-create / access-request-file) — the atomic
-    /// gate that caps concurrent redemptions at `max_uses` even when they
-    /// race under distinct requested names. If the mint then fails, the
-    /// caller must call `release_invite_use` to give the reserved slot back
-    /// so a failed redemption never permanently burns a use.
-    async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error>;
-    /// Release a use previously reserved by `try_consume_invite_use` when
-    /// the subsequent mint failed. Restores `uses` by one (never below
-    /// zero).
-    async fn release_invite_use(&self, id: &str) -> Result<(), Error>;
+    /// Atomically reserve one use against `max_uses` (D9) and commit an
+    /// `open`-mode redemption's entire mint — creating `user`, applying its
+    /// `grants`, and inserting the freshly minted API-key `credential` — as
+    /// one transaction, modelled on `approve_access_request`. Returns
+    /// `false` if the invite is no longer eligible (exhausted, revoked, or
+    /// expired as of this call); any other failure (most commonly `user`'s
+    /// name colliding with `create_user`'s UNIQUE constraint) rolls the
+    /// whole transaction back, so a redemption that doesn't commit never
+    /// burns a use either way — there is nothing to release.
+    async fn redeem_open_invite(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+    ) -> Result<bool, Error>;
+    /// The `closed`-mode counterpart to `redeem_open_invite`: atomically
+    /// reserves a use and files `request` together. Returns `false` under
+    /// the same eligibility conditions.
+    async fn redeem_closed_invite(
+        &self,
+        invite_id: &str,
+        request: &AccessRequestRow,
+    ) -> Result<bool, Error>;
 
     /// Create the user, apply grants, and approve a still-pending request in one transaction.
     async fn approve_access_request(
@@ -363,12 +427,11 @@ pub trait AuthStore: Send + Sync + 'static {
     /// decision (`Approved` or `Denied`), iff it is currently `Pending`: a
     /// single conditional `UPDATE ... WHERE id = ? AND state = 'pending'`
     /// (same single-condition-in-the-WHERE-clause convention as
-    /// `try_consume_invite_use`/`mark_access_request_collected`). Returns
-    /// `true` iff this call performed the transition; `false` means the
-    /// request was unknown or already decided (by a concurrent
-    /// approve/deny), in which case the caller must not treat its own
-    /// decision as having taken effect — see `AuthService::approve_request`
-    /// and `AuthService::deny_request`.
+    /// `collect_access_request`). Returns `true` iff this call performed the
+    /// transition; `false` means the request was unknown or already decided
+    /// (by a concurrent approve/deny), in which case the caller must not
+    /// treat its own decision as having taken effect — see
+    /// `AuthService::approve_request` and `AuthService::deny_request`.
     async fn try_decide_access_request(
         &self,
         id: &str,
@@ -377,18 +440,21 @@ pub trait AuthStore: Send + Sync + 'static {
         decided_at: &str,
     ) -> Result<bool, Error>;
     /// Atomically mark an `Approved` access request's credential as
-    /// collected, iff it hasn't been already (T6's "handed out exactly
-    /// once" contract — mirrors `consume_auth_code`'s single-use guard).
-    /// Returns `true` only if this call performed the transition; `false`
-    /// if the request is unknown, not yet approved, or already collected —
-    /// `AuthService::poll_request` treats every `false` outcome as
-    /// `PollOutcome::AlreadyCollected` rather than distinguishing further,
-    /// since by the time this is called the caller has already proven
-    /// knowledge of the request secret.
-    async fn mark_access_request_collected(
+    /// collected, iff it hasn't been already (the "handed out exactly once"
+    /// contract — mirrors `consume_auth_code`'s single-use guard), and
+    /// insert the freshly minted `credential` together as one transaction —
+    /// modelled on `approve_access_request`. Returns `true` only if this
+    /// call performed the transition and the insert; `false` if the request
+    /// is unknown, not yet approved, or already collected, in which case
+    /// `credential` was never persisted — `AuthService::poll_request` treats
+    /// every `false` outcome as `PollOutcome::AlreadyCollected` rather than
+    /// distinguishing further, since by the time this is called the caller
+    /// has already proven knowledge of the request secret.
+    async fn collect_access_request(
         &self,
         id: &str,
         collected_at: &str,
+        credential: &AuthTokenRow,
     ) -> Result<bool, Error>;
 }
 

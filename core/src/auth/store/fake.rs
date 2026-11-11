@@ -18,7 +18,7 @@ struct FakeAuthStoreInner {
     /// report "lost the race" (`false`) without touching `state`.
     poisoned_decides: std::collections::HashSet<String>,
     /// Test-only hook (see `FakeAuthStore::poison_next_collect`): access
-    /// request IDs whose *next* `mark_access_request_collected` call should
+    /// request IDs whose *next* `collect_access_request` call should
     /// report "lost the race" (`false`) without touching `collected_at`.
     poisoned_collects: std::collections::HashSet<String>,
     /// Test-only hook (see `FakeAuthStore::poison_next_insert_token`): when
@@ -68,10 +68,10 @@ impl FakeAuthStore {
     }
 
     /// Deterministically simulate losing the atomic collect race in
-    /// `AuthService::poll_request`: the *next*
-    /// `mark_access_request_collected(id, ..)` call will return `false` (as
-    /// if a concurrent poll had already collected first) without touching
-    /// `collected_at`.
+    /// `AuthService::poll_request`: the *next* `collect_access_request(id,
+    /// ..)` call will return `false` (as if a concurrent poll had already
+    /// collected first) without touching `collected_at` or minting
+    /// anything.
     pub async fn poison_next_collect(&self, id: &str) {
         self.inner
             .write()
@@ -110,6 +110,25 @@ impl Default for FakeAuthStore {
 /// so both report the same cascaded state to callers relying on it (e.g. the
 /// compensating deletes in `AuthService::approve_request`/
 /// `mint_open_invite_redemption`).
+/// Whether any user already holds `name` — the UNIQUE-name check shared by
+/// every mutation that creates or renames a user (`begin_bootstrap`,
+/// `create_user`, `approve_access_request`, `redeem_open_invite`).
+fn name_taken(users: &[UserRow], name: &str) -> bool {
+    users.iter().any(|u| u.name == name)
+}
+
+/// The index of `invite_id` in `invites`, iff it still has a use to spend
+/// (not exhausted, revoked, or expired) — the eligibility check
+/// `redeem_open_invite`/`redeem_closed_invite` run before reserving a use.
+fn invite_use_index_if_eligible(invites: &[InviteRow], invite_id: &str) -> Option<usize> {
+    invites.iter().position(|i| {
+        i.id == invite_id
+            && i.uses < i.max_uses
+            && i.revoked_at.is_none()
+            && !i.expires_at.as_deref().is_some_and(crate::auth::is_expired)
+    })
+}
+
 fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
     let before = inner.users.len();
     inner.users.retain(|u| u.id != id);
@@ -153,14 +172,14 @@ impl AuthStore for FakeAuthStore {
                 message: "setup is already complete".into(),
             });
         }
-        if inner.users.iter().any(|u| u.name == user.name) {
-            return Err(Error::InvalidRequest {
-                message: format!("user '{}' already exists", user.name),
-            });
-        }
+        let name = crate::auth::first_unused_name(&user.name, |n| name_taken(&inner.users, n));
+        let user = UserRow {
+            name,
+            ..user.clone()
+        };
         inner.users.push(user.clone());
         inner.pending_bootstrap = Some(user.id.clone());
-        Ok(user.clone())
+        Ok(user)
     }
     async fn complete_bootstrap(&self, user_id: &str) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
@@ -174,19 +193,27 @@ impl AuthStore for FakeAuthStore {
         old_id: &str,
         access: &AuthTokenRow,
         refresh: &AuthTokenRow,
-    ) -> Result<bool, Error> {
+    ) -> Result<RotateOutcome, Error> {
         let mut inner = self.inner.write().await;
         if inner.poisoned_revokes.remove(old_id) {
-            return Ok(false);
+            // Simulates a concurrent caller having already rotated this
+            // token away — reuse, not mere ineligibility.
+            return Ok(RotateOutcome::AlreadyRotated);
         }
-        let Some(index) = inner.tokens.iter().position(|t| {
-            t.id == old_id
-                && t.kind == TokenKind::Refresh
-                && t.revoked_at.is_none()
-                && !t.expires_at.as_deref().is_some_and(crate::auth::is_expired)
-        }) else {
-            return Ok(false);
+        let Some(found) = inner.tokens.iter().position(|t| t.id == old_id) else {
+            return Ok(RotateOutcome::Ineligible);
         };
+        let row = &inner.tokens[found];
+        let expired = row
+            .expires_at
+            .as_deref()
+            .is_some_and(crate::auth::is_expired);
+        if row.kind != TokenKind::Refresh || expired {
+            return Ok(RotateOutcome::Ineligible);
+        }
+        if row.revoked_at.is_some() {
+            return Ok(RotateOutcome::AlreadyRotated);
+        }
         if inner.poison_next_insert_token {
             inner.poison_next_insert_token = false;
             return Err(Error::Internal {
@@ -197,15 +224,17 @@ impl AuthStore for FakeAuthStore {
         // Mirrors the real store's conditional insert: a rotation whose new
         // rows inherit a `minted_by_family` that was compromised in the
         // meantime must not mint anything, even though the old refresh row
-        // above is already (tentatively) revoked.
+        // above is eligible to revoke.
         if let Some(parent) = &refresh.minted_by_family {
             if inner.compromised_families.contains(parent) {
-                return Ok(false);
+                return Err(Error::Unauthorized {
+                    message: "session revoked".to_string(),
+                });
             }
         }
-        inner.tokens[index].revoked_at = Some(crate::auth::rfc3339_from_now(0));
+        inner.tokens[found].revoked_at = Some(crate::auth::rfc3339_from_now(0));
         inner.tokens.extend([refresh.clone(), access.clone()]);
-        Ok(true)
+        Ok(RotateOutcome::Rotated)
     }
     async fn approve_access_request(
         &self,
@@ -224,7 +253,7 @@ impl AuthStore for FakeAuthStore {
         else {
             return Ok(false);
         };
-        if inner.users.iter().any(|u| u.name == user.name) {
+        if name_taken(&inner.users, &user.name) {
             return Err(Error::InvalidRequest {
                 message: format!("user '{}' already exists", user.name),
             });
@@ -240,7 +269,7 @@ impl AuthStore for FakeAuthStore {
 
     async fn create_user(&self, user: &UserRow) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
-        if inner.users.iter().any(|u| u.name == user.name) {
+        if name_taken(&inner.users, &user.name) {
             return Err(Error::InvalidRequest {
                 message: format!("user '{}' already exists", user.name),
             });
@@ -326,15 +355,17 @@ impl AuthStore for FakeAuthStore {
         Ok(delete_user_and_cascade(&mut inner, id))
     }
 
-    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
+    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<DemoteOutcome, Error> {
         let mut inner = self.inner.write().await;
         let admin_count = inner.users.iter().filter(|u| u.role == Role::Admin).count();
         match inner.users.iter_mut().find(|u| u.id == id) {
-            Some(u) if u.role == Role::Admin && admin_count > 1 => {
+            None => Ok(DemoteOutcome::NotFound),
+            Some(u) if u.role == Role::Member => Ok(DemoteOutcome::Done),
+            Some(u) if admin_count > 1 => {
                 u.role = Role::Member;
-                Ok(true)
+                Ok(DemoteOutcome::Done)
             }
-            _ => Ok(false),
+            Some(_) => Ok(DemoteOutcome::LastAdmin),
         }
     }
 
@@ -598,27 +629,51 @@ impl AuthStore for FakeAuthStore {
         }
     }
 
-    async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error> {
+    async fn redeem_open_invite(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+    ) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
-        match inner.invites.iter_mut().find(|i| i.id == id) {
-            Some(i)
-                if i.uses < i.max_uses
-                    && i.revoked_at.is_none()
-                    && !i.expires_at.as_deref().is_some_and(crate::auth::is_expired) =>
-            {
-                i.uses += 1;
-                Ok(true)
-            }
-            _ => Ok(false),
+        let Some(index) = invite_use_index_if_eligible(&inner.invites, invite_id) else {
+            return Ok(false);
+        };
+        if name_taken(&inner.users, &user.name) {
+            return Err(Error::InvalidRequest {
+                message: format!("user '{}' already exists", user.name),
+            });
         }
+        if inner.poison_next_insert_token {
+            inner.poison_next_insert_token = false;
+            return Err(Error::Internal {
+                message: "simulated token insert failure".into(),
+                correlation_id: "fake_redeem_open_invite".into(),
+            });
+        }
+        // Every check above ran before touching any state, so a `false`/`Err`
+        // return here never leaves a partial mutation behind — the same
+        // all-or-nothing contract a real transaction gives for free.
+        inner.invites[index].uses += 1;
+        inner.users.push(user.clone());
+        inner.grants.extend_from_slice(grants);
+        inner.tokens.push(credential.clone());
+        Ok(true)
     }
 
-    async fn release_invite_use(&self, id: &str) -> Result<(), Error> {
+    async fn redeem_closed_invite(
+        &self,
+        invite_id: &str,
+        request: &AccessRequestRow,
+    ) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
-        if let Some(i) = inner.invites.iter_mut().find(|i| i.id == id) {
-            i.uses = i.uses.saturating_sub(1);
-        }
-        Ok(())
+        let Some(index) = invite_use_index_if_eligible(&inner.invites, invite_id) else {
+            return Ok(false);
+        };
+        inner.invites[index].uses += 1;
+        inner.access_requests.push(request.clone());
+        Ok(true)
     }
 
     async fn create_access_request(&self, req: &AccessRequestRow) -> Result<(), Error> {
@@ -679,22 +734,34 @@ impl AuthStore for FakeAuthStore {
         }
     }
 
-    async fn mark_access_request_collected(
+    async fn collect_access_request(
         &self,
         id: &str,
         collected_at: &str,
+        credential: &AuthTokenRow,
     ) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
         if inner.poisoned_collects.remove(id) {
-            // See `FakeAuthStore::poison_next_collect`.
+            // See `FakeAuthStore::poison_next_collect`. Nothing is minted
+            // for a losing racer — matching the real store's "collect and
+            // insert commit together" transaction, there is no freshly
+            // minted credential left over to clean up.
             return Ok(false);
         }
-        match inner.access_requests.iter_mut().find(|r| r.id == id) {
-            Some(r) if r.state == AccessRequestState::Approved && r.collected_at.is_none() => {
-                r.collected_at = Some(collected_at.to_string());
-                Ok(true)
-            }
-            _ => Ok(false),
+        let Some(index) = inner.access_requests.iter().position(|r| {
+            r.id == id && r.state == AccessRequestState::Approved && r.collected_at.is_none()
+        }) else {
+            return Ok(false);
+        };
+        if inner.poison_next_insert_token {
+            inner.poison_next_insert_token = false;
+            return Err(Error::Internal {
+                message: "simulated token insert failure".into(),
+                correlation_id: "fake_collect_access_request".into(),
+            });
         }
+        inner.access_requests[index].collected_at = Some(collected_at.to_string());
+        inner.tokens.push(credential.clone());
+        Ok(true)
     }
 }

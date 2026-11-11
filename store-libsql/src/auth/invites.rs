@@ -101,36 +101,29 @@ pub(crate) async fn revoke_invite(
     Ok(n > 0)
 }
 
-/// Atomic "reserve a use iff eligible and one remains" (mirrors `mark_access_request_collected`'s
-/// and `consume_auth_code`'s single-condition-in-the-WHERE-clause convention):
-/// a single UPDATE with the eligibility check baked into the WHERE clause, so
-/// concurrent callers racing the same invite can never together push `uses`
-/// past `max_uses`.
-pub(crate) async fn try_consume_invite_use(db: &LibsqlDb, id: &str) -> Result<bool, Error> {
-    let conn = db.writer().await;
+/// Atomic "reserve a use iff eligible and one remains" (mirrors
+/// `collect_access_request`'s and `consume_auth_code`'s
+/// single-condition-in-the-WHERE-clause convention): a single UPDATE with
+/// the eligibility check baked into the WHERE clause, so concurrent callers
+/// racing the same invite can never together push `uses` past `max_uses`.
+/// Shared by `redeem_open_invite`/`redeem_closed_invite` (`atomic.rs`), which
+/// run it as the first statement of their own transaction — a failure later
+/// in that transaction rolls this reservation back too, so there is no
+/// separate "release" step.
+pub(super) async fn reserve_invite_use_on(
+    conn: &libsql::Connection,
+    invite_id: &str,
+    now: &str,
+) -> Result<bool, Error> {
     let n = conn
         .execute(
-            "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
-            libsql::params![id.to_string(), localdb_core::auth::rfc3339_from_now(0)],
+            "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses \
+             AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+            libsql::params![invite_id.to_string(), now.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
     Ok(n > 0)
-}
-
-/// Release a use previously reserved by `try_consume_invite_use` when the
-/// subsequent mint (user-create / access-request-file) failed. The `uses > 0`
-/// guard is defensive — it keeps a double-release from ever driving the
-/// counter negative.
-pub(crate) async fn release_invite_use(db: &LibsqlDb, id: &str) -> Result<(), Error> {
-    let conn = db.writer().await;
-    conn.execute(
-        "UPDATE invites SET uses = uses - 1 WHERE id = ? AND uses > 0",
-        libsql::params![id.to_string()],
-    )
-    .await
-    .map_err(map_libsql_err)?;
-    Ok(())
 }
 
 const ACCESS_REQUEST_COLUMNS: &str = "id, invite_id, requested_name, secret_hash, state, \
@@ -141,6 +134,13 @@ pub(crate) async fn create_access_request(
     req: &AccessRequestRow,
 ) -> Result<(), Error> {
     let conn = db.writer().await;
+    create_access_request_on(&conn, req).await
+}
+
+pub(super) async fn create_access_request_on(
+    conn: &libsql::Connection,
+    req: &AccessRequestRow,
+) -> Result<(), Error> {
     conn.execute(
         &format!(
             "INSERT INTO access_requests ({ACCESS_REQUEST_COLUMNS}) \
@@ -204,7 +204,7 @@ pub(crate) async fn list_access_requests_for_invite(
 }
 
 pub(crate) async fn list_access_requests(db: &LibsqlDb) -> Result<Vec<AccessRequestRow>, Error> {
-    let conn = db.writer().await;
+    let conn = db.reader();
     let mut rows = conn
         .query(
             &format!("SELECT {ACCESS_REQUEST_COLUMNS} FROM access_requests ORDER BY created_at"),
@@ -222,13 +222,13 @@ pub(crate) async fn list_access_requests(db: &LibsqlDb) -> Result<Vec<AccessRequ
 /// Atomic "mark collected iff currently `approved` and not yet collected"
 /// (mirrors `consume_auth_code`'s single-use guard): a single UPDATE with
 /// both conditions in the WHERE clause, so two concurrent callers can never
-/// both observe success.
-pub(crate) async fn mark_access_request_collected(
-    db: &LibsqlDb,
+/// both observe success. Shared by `collect_access_request` (`atomic.rs`),
+/// which runs it alongside the credential insert in one transaction.
+pub(super) async fn mark_access_request_collected_on(
+    conn: &libsql::Connection,
     id: &str,
     collected_at: &str,
 ) -> Result<bool, Error> {
-    let conn = db.writer().await;
     let n = conn
         .execute(
             "UPDATE access_requests SET collected_at = ? \
@@ -240,13 +240,13 @@ pub(crate) async fn mark_access_request_collected(
     Ok(n > 0)
 }
 
-/// Atomic "decide iff currently pending" (finding #4): the transition to a
-/// terminal `state` (`approved`/`denied`) is conditioned on `state =
-/// 'pending'` in the same UPDATE, mirroring `mark_access_request_collected`'s
-/// and `try_consume_invite_use`'s single-condition-in-the-WHERE-clause
-/// convention — so two concurrent approve/deny calls on the same request can
-/// never both take effect (last-writer-wins overwrite is impossible; the
-/// second racer's UPDATE simply affects zero rows).
+/// Atomic "decide iff currently pending": the transition to a terminal
+/// `state` (`approved`/`denied`) is conditioned on `state = 'pending'` in
+/// the same UPDATE, the same single-condition-in-the-WHERE-clause
+/// convention as `mark_access_request_collected_on`/`reserve_invite_use_on`
+/// — so two concurrent approve/deny calls on the same request can never
+/// both take effect (last-writer-wins overwrite is impossible; the second
+/// racer's UPDATE simply affects zero rows).
 pub(crate) async fn try_decide_access_request(
     db: &LibsqlDb,
     id: &str,

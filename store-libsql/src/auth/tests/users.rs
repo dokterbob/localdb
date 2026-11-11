@@ -157,7 +157,10 @@ async fn try_demote_user_unless_last_admin_refuses_the_sole_admin() {
         .await
         .unwrap();
 
-    assert!(!store.try_demote_user_unless_last_admin("u1").await.unwrap());
+    assert_eq!(
+        store.try_demote_user_unless_last_admin("u1").await.unwrap(),
+        DemoteOutcome::LastAdmin
+    );
     let found = store.get_user("u1").await.unwrap().unwrap();
     assert_eq!(found.role, Role::Admin);
 }
@@ -174,7 +177,10 @@ async fn try_demote_user_unless_last_admin_succeeds_with_another_admin() {
         .await
         .unwrap();
 
-    assert!(store.try_demote_user_unless_last_admin("u1").await.unwrap());
+    assert_eq!(
+        store.try_demote_user_unless_last_admin("u1").await.unwrap(),
+        DemoteOutcome::Done
+    );
     let found = store.get_user("u1").await.unwrap().unwrap();
     assert_eq!(found.role, Role::Member);
     let other = store.get_user("u2").await.unwrap().unwrap();
@@ -182,7 +188,7 @@ async fn try_demote_user_unless_last_admin_succeeds_with_another_admin() {
 }
 
 #[tokio::test]
-async fn try_demote_user_unless_last_admin_is_a_noop_on_a_member() {
+async fn try_demote_user_unless_last_admin_is_a_noop_done_on_a_member() {
     let (_dir, _backend, store) = make_store().await;
     store
         .create_user(&make_user("u1", "solo-admin", Role::Admin))
@@ -193,5 +199,24 @@ async fn try_demote_user_unless_last_admin_is_a_noop_on_a_member() {
         .await
         .unwrap();
 
-    assert!(!store.try_demote_user_unless_last_admin("u2").await.unwrap());
+    // Already a member: this must succeed (no second, unguarded write
+    // needed) even though it is the only existing admin that would refuse.
+    assert_eq!(
+        store.try_demote_user_unless_last_admin("u2").await.unwrap(),
+        DemoteOutcome::Done
+    );
+    let other = store.get_user("u1").await.unwrap().unwrap();
+    assert_eq!(other.role, Role::Admin, "the sole admin is untouched");
+}
+
+#[tokio::test]
+async fn try_demote_user_unless_last_admin_reports_not_found_for_unknown_id() {
+    let (_dir, _backend, store) = make_store().await;
+    assert_eq!(
+        store
+            .try_demote_user_unless_last_admin("nope")
+            .await
+            .unwrap(),
+        DemoteOutcome::NotFound
+    );
 }

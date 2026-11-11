@@ -172,13 +172,12 @@ async fn redeem_open_invite_failed_mint_does_not_burn_use_and_retry_succeeds() {
 }
 
 #[tokio::test]
-async fn redeem_open_invite_mint_failure_after_create_user_cleans_up_orphan() {
-    // Pins finding #6: if a post-create step (`issue_api_key` here,
-    // simulated via the `poison_next_insert_token` hook) fails after
-    // `create_user` already succeeded, the user must not be left
-    // behind — otherwise a retry with the same name would fail forever
-    // with "user already exists", and an uncredentialed member would
-    // linger with no way to reach it.
+async fn redeem_open_invite_mint_failure_rolls_back_the_whole_transaction() {
+    // The reservation, user-create, grants, and token-insert all commit as
+    // one transaction (`AuthStore::redeem_open_invite`): a failure at the
+    // token-insert step (simulated via `poison_next_insert_token`) must
+    // roll back the user too — no orphaned, uncredentialed member left
+    // behind, and no burned invite use.
     let svc = service();
     let issued = make_open_invite(&svc, 1).await;
 
@@ -198,8 +197,6 @@ async fn redeem_open_invite_mint_failure_after_create_user_cleans_up_orphan() {
         .unwrap()
         .is_none());
 
-    // The invite use was released (composes with the existing
-    // reserve/release behavior), not permanently burned.
     let invite = svc
         .store
         .find_invite(&issued.row.id)
@@ -211,8 +208,8 @@ async fn redeem_open_invite_mint_failure_after_create_user_cleans_up_orphan() {
         "a failed mint must not burn the reserved invite use"
     );
 
-    // Retrying with the SAME name now succeeds — proof the orphaned
-    // user was actually removed, not just that the invite use reset.
+    // Retrying with the SAME name now succeeds — proof the aborted
+    // transaction left nothing behind, not even a partial user.
     let outcome = svc.redeem_invite(&issued.secret, "newbie").await.unwrap();
     let RedeemOutcome::Open {
         user, credential, ..
@@ -418,12 +415,12 @@ async fn poll_request_mint_failure_does_not_permanently_brick_collection() {
 }
 
 #[tokio::test]
-async fn poll_request_lost_collect_race_revokes_its_own_freshly_minted_key() {
-    // Pins finding #7's other half: a poll that mints successfully but
-    // then loses the atomic `mark_access_request_collected` race (a
-    // concurrent poll collected first — simulated via
-    // `poison_next_collect`) must not leave its own freshly minted key
-    // live: exactly one *usable* credential must exist afterward.
+async fn poll_request_lost_collect_race_mints_nothing() {
+    // Marking the request collected and inserting the freshly minted key
+    // commit together as one transaction (`AuthStore::collect_access_request`):
+    // a poll that loses that race (a concurrent poll collected first —
+    // simulated via `poison_next_collect`) must have nothing minted for it
+    // at all, not a live-then-revoked key.
     let svc = service();
     let issued = make_closed_invite(&svc, 1).await;
     let RedeemOutcome::Closed {
@@ -445,13 +442,13 @@ async fn poll_request_lost_collect_race_revokes_its_own_freshly_minted_key() {
         .unwrap();
     assert_eq!(outcome, PollOutcome::AlreadyCollected);
 
-    // The key minted during the losing attempt must be revoked, not
-    // left live and unclaimed.
-    let tokens = svc.store.list_tokens_for_user(&user.id).await.unwrap();
-    assert_eq!(tokens.len(), 1);
     assert!(
-        tokens[0].revoked_at.is_some(),
-        "a lost collect race must revoke its own freshly minted key"
+        svc.store
+            .list_tokens_for_user(&user.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a lost collect race must not mint anything"
     );
 }
 

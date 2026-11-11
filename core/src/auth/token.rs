@@ -5,8 +5,7 @@
 //! blake3 hash of the secret is ever persisted (`AuthStore`) — the
 //! plaintext never touches storage.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
+use chrono::{Duration, SecondsFormat, Utc};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -114,47 +113,18 @@ fn base64url_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Current time as Unix epoch seconds.
+/// An RFC 3339 UTC timestamp `delta_secs` from now
+/// (`YYYY-MM-DDTHH:MM:SSZ`, no sub-second precision — `is_expired`/
+/// `expires_within` and the SQL boundaries in `store-libsql` depend on this
+/// exact, lexicographically-ordered shape). Negative deltas produce a
+/// timestamp in the past — used to mint already-expired tokens in tests.
 ///
 /// Deliberately *real* wall-clock time, even under `cfg(test)` — unlike
 /// `crate::ingestion::now_rfc3339`, which freezes to a fixed string
 /// crate-wide under test. Token expiry tests need small positive/negative
 /// offsets from "now", not a single frozen instant.
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
-/// Format a Unix epoch-seconds value as an RFC 3339 UTC timestamp
-/// (`YYYY-MM-DDTHH:MM:SSZ`, no sub-second precision).
-fn format_unix(secs: i64) -> String {
-    let secs = secs.max(0) as u64;
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-
-    // Civil-from-days (Howard Hinnant's algorithm): days-since-epoch -> y/m/d.
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-/// An RFC 3339 UTC timestamp `delta_secs` from now. Negative deltas produce
-/// a timestamp in the past — used to mint already-expired tokens in tests.
 pub fn rfc3339_from_now(delta_secs: i64) -> String {
-    format_unix(now_unix() + delta_secs)
+    (Utc::now() + Duration::seconds(delta_secs)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Is the given RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) in the past

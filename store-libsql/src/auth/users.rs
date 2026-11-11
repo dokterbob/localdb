@@ -1,4 +1,4 @@
-use localdb_core::auth::{Role, UserRow};
+use localdb_core::auth::{DemoteOutcome, Role, UserRow};
 use localdb_core::Error;
 
 use super::sql::{role_to_sql, row_to_user};
@@ -138,23 +138,43 @@ pub(crate) async fn try_delete_user_unless_last_admin(
 
 /// Atomic "demote to member iff this wouldn't drop admins to zero" — the
 /// demotion counterpart to `try_delete_user_unless_last_admin`, same
-/// correlated-subquery-in-the-WHERE-clause convention. Returns `true` iff
-/// this call performed the demotion; `false` covers "unknown id", "already
-/// not an admin", and "would have left zero admins".
+/// correlated-subquery-in-the-WHERE-clause convention, but folding the
+/// idempotent "already a member" case into the same guarded `UPDATE` too
+/// (`role = 'member' OR (admin count) > 1`), so every outcome — demoted,
+/// already-a-member no-op, or refused — comes from this one write. There is
+/// no second, unguarded write for a concurrent promote/demote to race.
 pub(crate) async fn try_demote_user_unless_last_admin(
     db: &LibsqlDb,
     id: &str,
-) -> Result<bool, Error> {
+) -> Result<DemoteOutcome, Error> {
     let conn = db.writer().await;
     let n = conn
         .execute(
-            "UPDATE users SET role = 'member' WHERE id = ? AND role = 'admin' \
-             AND (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1",
+            "UPDATE users SET role = 'member' WHERE id = ? \
+             AND (role = 'member' OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1)",
             libsql::params![id.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
-    Ok(n > 0)
+    if n > 0 {
+        return Ok(DemoteOutcome::Done);
+    }
+    // The guarded write affected nothing: `id` is either unknown or it is
+    // the sole admin. This lookup is read-only — it never writes, so it
+    // cannot reintroduce the race the guarded UPDATE above closes.
+    let conn = db.reader();
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM users WHERE id = ?",
+            libsql::params![id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(if rows.next().await.map_err(map_libsql_err)?.is_some() {
+        DemoteOutcome::LastAdmin
+    } else {
+        DemoteOutcome::NotFound
+    })
 }
 
 pub(crate) async fn count_users(db: &LibsqlDb) -> Result<u64, Error> {

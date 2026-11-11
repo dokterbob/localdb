@@ -165,6 +165,32 @@ async fn set_user_role_allows_demoting_a_non_last_admin() {
 }
 
 #[tokio::test]
+async fn set_user_role_demoting_an_existing_member_is_a_noop_success() {
+    // The guarded store write now covers the "already a member" case too —
+    // there is no unguarded fallback write left to exercise this through.
+    let svc = service();
+    svc.create_user("solo-admin3", Role::Admin).await.unwrap();
+    let member = svc
+        .create_user("already-member", Role::Member)
+        .await
+        .unwrap();
+
+    svc.set_user_role(&member.id, Role::Member).await.unwrap();
+    let reloaded = svc.store.get_user(&member.id).await.unwrap().unwrap();
+    assert_eq!(reloaded.role, Role::Member);
+}
+
+#[tokio::test]
+async fn set_user_role_demote_unknown_user_errors() {
+    let svc = service();
+    let err = svc
+        .set_user_role("unknown-id", Role::Member)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest { .. }));
+}
+
+#[tokio::test]
 async fn set_user_role_allows_promoting_a_member_to_admin() {
     let svc = service();
     svc.create_user("solo-admin2", Role::Admin).await.unwrap();

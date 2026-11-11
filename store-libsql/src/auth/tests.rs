@@ -3,8 +3,8 @@
 //! gate: data-modifying paths >= 90%, specs/01-architecture.md §7).
 
 use localdb_core::auth::{
-    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
-    InviteRow, Role, StoreGrantRow, TokenKind, UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
+    InviteMode, InviteRow, Role, RotateOutcome, StoreGrantRow, TokenKind, UserRow,
 };
 use localdb_core::types::StoreVisibility;
 use localdb_core::{Error, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};

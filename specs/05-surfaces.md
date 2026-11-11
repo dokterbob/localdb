@@ -606,7 +606,10 @@ browser/native clients own presentation.
 **Token model:** opaque 32-byte secrets minted from `OsRng`, `ldb_`-prefixed, shown once at issuance
 and stored at rest only as a blake3 hash — never a password anywhere. A login session mints an
 access token (1h) and a refresh token (30d) sharing one rotation family; refresh tokens rotate on
-every use with reuse detection — presenting an already-rotated refresh token revokes the entire
+every use with reuse detection, strictly — a refresh token presented after it has already been
+rotated away revokes the family, with no grace window. An _expired_, wrong-kind, or unknown refresh
+token is a plain `401 unauthorized` instead: not evidence of theft, so it never triggers a
+revocation. Presenting an already-rotated (and still unexpired) refresh token revokes the entire
 _compromise closure_ of its family: the family itself (every access token issued alongside it, the
 initial one and every rotated replacement), any API key minted while authenticated by that session
 or by a key already tainted by one (`minted_by_family`), and — transitively — any _other_ session
@@ -696,14 +699,15 @@ for the same reason. It is still trivially `curl`-able:
 — the explicit header matters: `curl -d` alone sends `application/x-www-form-urlencoded`, which this
 JSON-only route rejects. An unknown `id` and a wrong `secret` against a real one are **deliberately
 indistinguishable** (`401 unauthorized`, identical body) — no existence oracle. A **freshly minted**
-API key is handed back **exactly once**, on the poll that first observes the `approved` transition
-(`AccessRequest.collected_at`, an atomic single-use guard mirroring `consume_auth_code`) — every
-later poll answers `collected` instead of re-issuing a credential. `request_secret` itself never
-becomes a credential: it is poll-only, scoped to proving knowledge of this one request, and is
-deliberately never accepted by `AuthService::authenticate` — minting a fresh key at collection time
-(rather than promoting the request secret, which is sent on every poll and so is unfit to serve as a
-long-lived credential) is what closes that hole. See `AuthService::poll_request`'s doc comment for
-the full reasoning.
+API key is handed back **exactly once**, on the poll that first observes the `approved` transition:
+marking `AccessRequest.collected_at` and inserting that key commit together, as one transaction
+(`AuthStore::collect_access_request`, an atomic single-use guard mirroring `consume_auth_code`) —
+every later poll answers `collected` instead of re-issuing a credential, and a poll that loses the
+race has nothing minted for it at all. `request_secret` itself never becomes a credential: it is
+poll-only, scoped to proving knowledge of this one request, and is deliberately never accepted by
+`AuthService::authenticate` — minting a fresh key at collection time (rather than promoting the
+request secret, which is sent on every poll and so is unfit to serve as a long-lived credential) is
+what closes that hole. See `AuthService::poll_request`'s doc comment for the full reasoning.
 
 **Admin decision routes:** `GET /v1/invites/requests` (admin) lists every access request across
 every invite (pending, approved, and denied alike; no pagination — this is a small admin-facing
@@ -713,14 +717,15 @@ grants, and the decision commit atomically; failure leaves the request pending.
 `POST /v1/invites/requests/{id}/deny` (admin) marks it denied; the requester's next poll observes
 `denied`.
 
-**Concurrency (documented choice):** `redeem_invite` atomically _reserves_ a use
-(`AuthStore::try_consume_invite_use`, a conditional update checking remaining uses, revocation, and
-expiry) before creating the user / filing the access request, and _releases_ the reservation
-(`AuthStore::release_invite_use`) if that mint then fails. This closes both hazards: concurrent
-redemptions — even under distinct requested names — can never together push `uses` past `max_uses`
-(the atomic reservation is the gate, not the `users.name` UNIQUE constraint), and a redemption that
-reserves a use but then fails (most commonly a duplicate `requested_name` racing `create_user`'s
-UNIQUE constraint) never permanently burns that use — a caller can retry with a different name
+**Concurrency (documented choice):** `redeem_invite`'s mint — reserving a use (a conditional update
+checking remaining uses, revocation, and expiry) and either creating the user and applying grants
+(`open` mode) or filing the access request (`closed` mode) — commits as a single transaction
+(`AuthStore::redeem_open_invite`/`redeem_closed_invite`, modelled on `approve_access_request`). This
+closes both hazards: concurrent redemptions — even under distinct requested names — can never
+together push `uses` past `max_uses` (the atomic reservation is the gate, not the `users.name`
+UNIQUE constraint), and a redemption that fails partway through (most commonly a duplicate
+`requested_name` racing `create_user`'s UNIQUE constraint) never permanently burns that use — the
+whole transaction, reservation included, rolls back, so a caller can retry with a different name
 against the same `max_uses = 1` invite. See `AuthService::redeem_invite`'s doc comment for the full
 reasoning.
 

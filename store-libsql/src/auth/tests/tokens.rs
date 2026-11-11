@@ -268,6 +268,106 @@ async fn mark_token_used_sets_last_used_at() {
     assert_eq!(found.last_used_at.as_deref(), Some("2026-06-11T00:00:00Z"));
 }
 
+// ---------------------------------------------------------------------
+// rotate_tokens outcomes
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn rotate_tokens_boundary_expiry_is_still_eligible() {
+    // Matches core::auth::is_expired's own boundary (`expires_at < now`, so
+    // `expires_at == now` is NOT expired) — a stricter SQL boundary would
+    // reject a row the service already treated as still-valid, reading as
+    // reuse (the exact regression this test pins).
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
+        .await
+        .unwrap();
+    let now = localdb_core::auth::rfc3339_from_now(0);
+    let mut refresh = make_token("t1", "u1", TokenKind::Refresh, "hash-a");
+    refresh.expires_at = Some(now);
+    store.insert_token(&refresh).await.unwrap();
+
+    let new_access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    let new_refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
+    let outcome = store
+        .rotate_tokens("t1", &new_access, &new_refresh)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::Rotated);
+}
+
+#[tokio::test]
+async fn rotate_tokens_unknown_id_is_ineligible_not_reuse() {
+    let (_dir, _backend, store) = make_store().await;
+    let access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    let refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
+    let outcome = store
+        .rotate_tokens("nope", &access, &refresh)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::Ineligible);
+}
+
+#[tokio::test]
+async fn rotate_tokens_expired_token_is_ineligible_not_reuse() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
+        .await
+        .unwrap();
+    let mut refresh = make_token("t1", "u1", TokenKind::Refresh, "hash-a");
+    refresh.expires_at = Some(localdb_core::auth::rfc3339_from_now(-10));
+    store.insert_token(&refresh).await.unwrap();
+
+    let access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    let new_refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
+    let outcome = store
+        .rotate_tokens("t1", &access, &new_refresh)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::Ineligible);
+}
+
+#[tokio::test]
+async fn rotate_tokens_wrong_kind_is_ineligible_not_reuse() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
+        .await
+        .unwrap();
+    let not_a_refresh = make_token("t1", "u1", TokenKind::Access, "hash-a");
+    store.insert_token(&not_a_refresh).await.unwrap();
+
+    let access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    let new_refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
+    let outcome = store
+        .rotate_tokens("t1", &access, &new_refresh)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::Ineligible);
+}
+
+#[tokio::test]
+async fn rotate_tokens_already_revoked_refresh_token_is_already_rotated() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "alice", Role::Admin))
+        .await
+        .unwrap();
+    let mut refresh = make_token("t1", "u1", TokenKind::Refresh, "hash-a");
+    refresh.revoked_at = Some(localdb_core::auth::rfc3339_from_now(0));
+    store.insert_token(&refresh).await.unwrap();
+
+    let access = make_token("t2", "u1", TokenKind::Access, "hash-b");
+    let new_refresh = make_token("t3", "u1", TokenKind::Refresh, "hash-c");
+    let outcome = store
+        .rotate_tokens("t1", &access, &new_refresh)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::AlreadyRotated);
+}
+
 #[tokio::test]
 async fn list_tokens_for_user_filters_correctly() {
     let (_dir, _backend, store) = make_store().await;

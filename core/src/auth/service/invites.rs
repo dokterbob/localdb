@@ -83,14 +83,7 @@ impl<S: AuthStore> AuthService<S> {
             .collect()
     }
 
-    async fn apply_invite_grants(&self, invite: &InviteRow, user_id: &str) -> Result<(), Error> {
-        for grant in Self::invite_grants(invite, user_id) {
-            self.store.grant_store(&grant).await?;
-        }
-        Ok(())
-    }
-
-    /// Redeem an invite token (T6, D9): resolves the presented secret to an
+    /// Redeem an invite token (D9): resolves the presented secret to an
     /// `InviteRow`, validates it, and either creates a user immediately
     /// (`open` mode) or files a pending `AccessRequestRow` (`closed` mode).
     ///
@@ -102,26 +95,24 @@ impl<S: AuthStore> AuthService<S> {
     /// 3. not expired,
     /// 4. `uses < max_uses`.
     ///
-    /// **Concurrency (documented choice):** a use is *reserved* atomically
-    /// (`AuthStore::try_consume_invite_use`, an `UPDATE ... WHERE uses <
-    /// max_uses` conditional update) before the mint (user-create /
-    /// access-request-file) is attempted, and *released*
-    /// (`AuthStore::release_invite_use`) if that mint then fails. This
-    /// reserve-then-release ordering satisfies both invariants at once:
+    /// **Concurrency (documented choice):** reserving a use and committing
+    /// the mint (user-create-and-grant, or access-request-file) are one
+    /// transaction (`AuthStore::redeem_open_invite`/`redeem_closed_invite`),
+    /// not two separate store calls. This satisfies both invariants at
+    /// once:
     ///
-    /// 1. **Never over-redeem:** because the reservation is an atomic
-    ///    conditional update, concurrent redemptions — even under distinct
-    ///    `requested_name`s, which the `users.name` UNIQUE constraint alone
-    ///    cannot help with — can never together push `uses` past
-    ///    `max_uses`. A racer that arrives after the invite is exhausted
-    ///    gets `Unauthorized` "invite has no remaining uses" immediately,
-    ///    before attempting any mint.
+    /// 1. **Never over-redeem:** the reservation is part of the same atomic
+    ///    conditional update either way, so concurrent redemptions — even
+    ///    under distinct `requested_name`s, which the `users.name` UNIQUE
+    ///    constraint alone cannot help with — can never together push
+    ///    `uses` past `max_uses`. A racer that arrives after the invite is
+    ///    exhausted gets `Unauthorized` "invite has no remaining uses".
     /// 2. **Never burn a use on a failed redemption:** if the reservation
-    ///    succeeds but the subsequent mint fails (most commonly a duplicate
-    ///    `requested_name` racing `create_user`'s UNIQUE constraint), the
-    ///    reserved slot is released before the error is returned — so a
-    ///    caller can retry with a different name against the same
-    ///    `max_uses = 1` invite without it reading as exhausted.
+    ///    succeeds but the rest of the transaction fails (most commonly a
+    ///    duplicate `requested_name` racing `create_user`'s UNIQUE
+    ///    constraint), the whole transaction — reservation included — rolls
+    ///    back, so a caller can retry with a different name against the
+    ///    same `max_uses = 1` invite without it reading as exhausted.
     pub async fn redeem_invite(
         &self,
         token_secret: &str,
@@ -154,17 +145,7 @@ impl<S: AuthStore> AuthService<S> {
             }
         }
 
-        // Reserve a use atomically before attempting the mint — see the doc
-        // comment above for why this ordering (rather than incrementing
-        // after a successful mint, or before any check at all) is what
-        // makes both concurrency invariants hold simultaneously.
-        if !self.store.try_consume_invite_use(&invite.id).await? {
-            return Err(Error::Unauthorized {
-                message: "invite has no remaining uses".to_string(),
-            });
-        }
-
-        let outcome = match invite.mode {
+        match invite.mode {
             InviteMode::Open => {
                 self.mint_open_invite_redemption(&invite, requested_name)
                     .await
@@ -173,54 +154,38 @@ impl<S: AuthStore> AuthService<S> {
                 self.mint_closed_invite_redemption(&invite, requested_name)
                     .await
             }
-        };
-
-        if outcome.is_err() {
-            // The mint failed after we reserved a use — release it so this
-            // failed redemption doesn't permanently consume a slot. Best
-            // effort: if the release itself errors, we still surface the
-            // original mint error (e.g. "user already exists") rather than
-            // masking it with an unrelated store error.
-            let _ = self.store.release_invite_use(&invite.id).await;
         }
-
-        outcome
     }
 
-    /// `open`-mode mint half of `redeem_invite`: create the user, apply the
-    /// invite's store grants, and issue a show-once API-key credential.
-    ///
-    /// **Orphan cleanup (finding #6 fix):** `AuthStore` has no multi-call
-    /// transaction seam, so a failure in either post-create step
-    /// (`apply_invite_grants` — e.g. a store deleted after the invite was
-    /// created — or `issue_api_key`) would otherwise leave a real, if
-    /// uncredentialed, user row behind: `redeem_invite` releases the
-    /// reserved invite use on any error here, but that alone doesn't remove
-    /// the user, so a retry with the same `requested_name` would then fail
-    /// "user already exists" forever. Instead, once `create_user` has
-    /// succeeded, any later failure triggers a best-effort compensating
-    /// `delete_user` (the plain, unconditional store method — this is a
-    /// fresh `Role::Member` row, never subject to the last-admin guard)
-    /// before the original error is surfaced, so the caller's next attempt
-    /// starts from a clean slate.
+    /// `open`-mode mint half of `redeem_invite`: reserve a use, create the
+    /// user, apply the invite's store grants, and issue a show-once
+    /// API-key credential, all as one transaction
+    /// (`AuthStore::redeem_open_invite`) — a failure anywhere in that mint
+    /// (most commonly a duplicate `requested_name`) rolls everything back,
+    /// so no partial user or burned use is ever left behind.
     async fn mint_open_invite_redemption(
         &self,
         invite: &InviteRow,
         requested_name: &str,
     ) -> Result<RedeemOutcome, Error> {
-        let user = self.create_user(requested_name, Role::Member).await?;
-
-        if let Err(err) = self.apply_invite_grants(invite, &user.id).await {
-            let _ = self.store.delete_user(&user.id).await;
-            return Err(err);
-        }
-        let credential = match self.issue_api_key(&user.id).await {
-            Ok(credential) => credential,
-            Err(err) => {
-                let _ = self.store.delete_user(&user.id).await;
-                return Err(err);
-            }
+        let user = UserRow {
+            id: new_ulid(),
+            name: requested_name.to_string(),
+            role: Role::Member,
+            created_at: now_rfc3339(),
         };
+        let grants = Self::invite_grants(invite, &user.id);
+        let credential = Self::prepare_token(&user.id, TokenKind::ApiKey, None, None, None, None);
+
+        if !self
+            .store
+            .redeem_open_invite(&invite.id, &user, &grants, &credential.row)
+            .await?
+        {
+            return Err(Error::Unauthorized {
+                message: "invite has no remaining uses".to_string(),
+            });
+        }
 
         Ok(RedeemOutcome::Open {
             user,
@@ -229,8 +194,9 @@ impl<S: AuthStore> AuthService<S> {
         })
     }
 
-    /// `closed`-mode mint half of `redeem_invite`: file a pending
-    /// `AccessRequestRow` awaiting admin approval.
+    /// `closed`-mode mint half of `redeem_invite`: reserve a use and file a
+    /// pending `AccessRequestRow` awaiting admin approval, together as one
+    /// transaction (`AuthStore::redeem_closed_invite`).
     async fn mint_closed_invite_redemption(
         &self,
         invite: &InviteRow,
@@ -248,14 +214,41 @@ impl<S: AuthStore> AuthService<S> {
             decided_at: None,
             collected_at: None,
         };
-        self.store.create_access_request(&request).await?;
+        if !self
+            .store
+            .redeem_closed_invite(&invite.id, &request)
+            .await?
+        {
+            return Err(Error::Unauthorized {
+                message: "invite has no remaining uses".to_string(),
+            });
+        }
         Ok(RedeemOutcome::Closed {
             request_id: request.id,
             request_secret: minted.secret,
         })
     }
 
-    /// Approve a pending closed-mode access request (T6): creates the user
+    /// Look up `request_id` and confirm it is still `Pending` — the shared
+    /// preamble of `approve_request` and `deny_request`, which otherwise
+    /// differ only in which decision they apply.
+    async fn find_pending_request(&self, request_id: &str) -> Result<AccessRequestRow, Error> {
+        let request = self
+            .store
+            .find_access_request(request_id)
+            .await?
+            .ok_or_else(|| Error::InvalidRequest {
+                message: format!("access request '{request_id}' not found"),
+            })?;
+        if request.state != AccessRequestState::Pending {
+            return Err(Error::InvalidRequest {
+                message: format!("access request '{request_id}' is no longer pending"),
+            });
+        }
+        Ok(request)
+    }
+
+    /// Approve a pending closed-mode access request: creates the user
     /// and applies the invite's store grants. No API-key token row is
     /// created here.
     ///
@@ -270,18 +263,7 @@ impl<S: AuthStore> AuthService<S> {
     /// User creation, grants, and the conditional decision commit together.
     /// A failed grant or a concurrent decision leaves no partial user behind.
     pub async fn approve_request(&self, request_id: &str) -> Result<UserRow, Error> {
-        let request = self
-            .store
-            .find_access_request(request_id)
-            .await?
-            .ok_or_else(|| Error::InvalidRequest {
-                message: format!("access request '{request_id}' not found"),
-            })?;
-        if request.state != AccessRequestState::Pending {
-            return Err(Error::InvalidRequest {
-                message: format!("access request '{request_id}' is no longer pending"),
-            });
-        }
+        let request = self.find_pending_request(request_id).await?;
         let invite = self
             .store
             .find_invite(&request.invite_id)
@@ -315,27 +297,15 @@ impl<S: AuthStore> AuthService<S> {
         Ok(user)
     }
 
-    /// Deny a pending closed-mode access request (T6). No user is created;
+    /// Deny a pending closed-mode access request. No user is created;
     /// the requester's next `poll_request` observes `PollOutcome::Denied`.
     ///
-    /// **Concurrency (finding #4 fix):** same atomic guard as
-    /// `approve_request` — see that method's doc comment. A denial that
-    /// loses the race to a concurrent decision reports the same "no longer
-    /// pending" conflict rather than silently overwriting whatever the
-    /// winner decided.
+    /// **Concurrency:** same atomic guard as `approve_request` — see that
+    /// method's doc comment. A denial that loses the race to a concurrent
+    /// decision reports the same "no longer pending" conflict rather than
+    /// silently overwriting whatever the winner decided.
     pub async fn deny_request(&self, request_id: &str) -> Result<(), Error> {
-        let request = self
-            .store
-            .find_access_request(request_id)
-            .await?
-            .ok_or_else(|| Error::InvalidRequest {
-                message: format!("access request '{request_id}' not found"),
-            })?;
-        if request.state != AccessRequestState::Pending {
-            return Err(Error::InvalidRequest {
-                message: format!("access request '{request_id}' is no longer pending"),
-            });
-        }
+        self.find_pending_request(request_id).await?;
         let decided = self
             .store
             .try_decide_access_request(request_id, AccessRequestState::Denied, None, &now_rfc3339())
@@ -348,7 +318,7 @@ impl<S: AuthStore> AuthService<S> {
         Ok(())
     }
 
-    /// Poll a closed-mode access request's status (T6, device-authorization
+    /// Poll a closed-mode access request's status (device-authorization
     /// -grant pattern, RFC 8628). `presented_secret` must match the
     /// request's own `secret_hash` — an unknown `request_id` and a wrong
     /// secret are deliberately indistinguishable (`Unauthorized`, same
@@ -363,28 +333,15 @@ impl<S: AuthStore> AuthService<S> {
     /// every poll either way, so it still isn't fit to serve as a
     /// long-lived credential. Instead, on the transition into `Approved`, a
     /// *fresh* API key is minted for the request's resulting user and
-    /// handed back exactly once:
-    /// `AuthStore::mark_access_request_collected` is an atomic consume-once
-    /// gate (mirroring `consume_auth_code`), so a second successful poll (or
-    /// two concurrent ones racing the first) observes
-    /// `PollOutcome::AlreadyCollected` instead of a credential.
-    ///
-    /// **Mint-then-mark ordering (finding #7 fix):** the API key is minted
-    /// *before* the collection is marked, not after. Marking collected
-    /// first (the original ordering) meant a subsequent `issue_api_key`
-    /// failure — the user deleted between approval and poll, or a
-    /// transient store error — left `collected_at` set with no credential
-    /// ever having been handed out, permanently bricking collection (every
-    /// later poll would see `AlreadyCollected` forever). With minting
-    /// first: if the mint fails, `collected_at` is never touched, so the
-    /// request remains collectible and a later poll can retry. If the mint
-    /// succeeds but this poll then loses the atomic collect race to a
-    /// concurrent one, the freshly minted key is best-effort revoked before
-    /// reporting `AlreadyCollected`, so a losing racer never leaves a live,
-    /// never-handed-out credential behind — the exactly-once delivery
-    /// invariant (at most one *usable* key reaches a caller) holds
-    /// alongside the new liveness invariant (a mint failure doesn't
-    /// permanently brick collection).
+    /// handed back exactly once: marking the request collected and
+    /// inserting that key commit together, as one transaction
+    /// (`AuthStore::collect_access_request`, mirroring
+    /// `consume_auth_code`'s single-use guard), so a second successful poll
+    /// (or two concurrent ones racing the first) observes
+    /// `PollOutcome::AlreadyCollected` instead of a credential — and a
+    /// losing racer never has anything minted for it in the first place,
+    /// since its conditional update affects nothing and the whole
+    /// transaction rolls back.
     pub async fn poll_request(
         &self,
         request_id: &str,
@@ -422,24 +379,17 @@ impl<S: AuthStore> AuthService<S> {
                             correlation_id: "poll_request_missing_resulting_user".to_string(),
                         })?;
 
-                // Mint first (see doc comment): a failure here leaves
-                // `collected_at` untouched, so this request stays
-                // collectible for a retry.
-                let issued = self.issue_api_key(user_id).await?;
-
+                let credential =
+                    Self::prepare_token(user_id, TokenKind::ApiKey, None, None, None, None);
                 let collected = self
                     .store
-                    .mark_access_request_collected(request_id, &now_rfc3339())
+                    .collect_access_request(request_id, &now_rfc3339(), &credential.row)
                     .await?;
                 if collected {
                     Ok(PollOutcome::Approved {
-                        credential: issued.secret,
+                        credential: credential.secret,
                     })
                 } else {
-                    // Lost the race to a concurrent poll that collected
-                    // first — don't leave the key we just minted live and
-                    // unclaimed.
-                    let _ = self.store.revoke_token(&issued.row.id).await;
                     Ok(PollOutcome::AlreadyCollected)
                 }
             }

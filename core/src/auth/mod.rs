@@ -30,8 +30,9 @@ pub use service::{
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeAuthStore;
 pub use store::{
-    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
-    InviteRow, OAuthClientRow, StoreGrantRow, TokenKind, UserRow,
+    first_unused_name, AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow,
+    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RotateOutcome, StoreGrantRow, TokenKind,
+    UserRow,
 };
 pub use token::{
     expires_within, generate_pkce_pair, hash_secret, is_expired, mint_secret, rfc3339_from_now,

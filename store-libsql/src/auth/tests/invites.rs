@@ -64,57 +64,167 @@ async fn revoke_invite_sets_revoked_at_once() {
 }
 
 #[tokio::test]
-async fn try_consume_invite_use_increments_up_to_max_uses_then_fails() {
-    let (_dir, _backend, store) = make_store().await;
+async fn redeem_open_invite_commits_reservation_user_grants_and_credential_together() {
+    let (_dir, backend, store) = make_store().await;
+    insert_store_row(&backend, "docs").await;
     let mut invite = make_invite("i1", "h1", InviteMode::Open);
     invite.max_uses = 2;
     store.create_invite(&invite).await.unwrap();
 
-    assert!(store.try_consume_invite_use("i1").await.unwrap());
-    assert!(store.try_consume_invite_use("i1").await.unwrap());
-    // Third call: already at max_uses == uses, must not increment further.
-    assert!(!store.try_consume_invite_use("i1").await.unwrap());
-    // A tight loop of extra attempts never overshoots max_uses either.
-    for _ in 0..5 {
-        assert!(!store.try_consume_invite_use("i1").await.unwrap());
+    let user = make_user("u1", "alice", Role::Member);
+    let grant = StoreGrantRow {
+        store_name: "docs".to_string(),
+        user_id: "u1".to_string(),
+        granted_by: "admin-1".to_string(),
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+    };
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+
+    assert!(store
+        .redeem_open_invite("i1", &user, &[grant], &credential)
+        .await
+        .unwrap());
+
+    assert!(store.get_user("u1").await.unwrap().is_some());
+    assert_eq!(store.list_grants_for_user("u1").await.unwrap().len(), 1);
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_some());
+    let found_invite = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(found_invite.uses, 1, "exactly one use reserved, no more");
+}
+
+#[tokio::test]
+async fn redeem_open_invite_refuses_once_exhausted_and_never_overshoots() {
+    let (_dir, _backend, store) = make_store().await;
+    let mut invite = make_invite("i1", "h1", InviteMode::Open);
+    invite.max_uses = 1;
+    store.create_invite(&invite).await.unwrap();
+    let user = make_user("u1", "alice", Role::Member);
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    assert!(store
+        .redeem_open_invite("i1", &user, &[], &credential)
+        .await
+        .unwrap());
+
+    // A tight loop of extra attempts never overshoots max_uses.
+    for n in 0..5 {
+        let extra_id = format!("extra-u{n}");
+        let other = make_user(&extra_id, &format!("bob{n}"), Role::Member);
+        let other_credential = make_token(
+            &format!("extra-t{n}"),
+            &extra_id,
+            TokenKind::ApiKey,
+            &format!("extra-hash{n}"),
+        );
+        assert!(!store
+            .redeem_open_invite("i1", &other, &[], &other_credential)
+            .await
+            .unwrap());
+        assert!(store.get_user(&extra_id).await.unwrap().is_none());
     }
-
-    let found = store.find_invite("i1").await.unwrap().unwrap();
-    assert_eq!(found.uses, 2, "uses must never exceed max_uses");
+    let found_invite = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(
+        found_invite.uses, 1,
+        "a refused redemption must not increment uses"
+    );
 }
 
 #[tokio::test]
-async fn release_invite_use_decrements_a_reserved_use() {
+async fn redeem_open_invite_duplicate_name_rolls_back_the_whole_transaction() {
+    let (_dir, _backend, store) = make_store().await;
+    let mut invite = make_invite("i1", "h1", InviteMode::Open);
+    invite.max_uses = 1;
+    store.create_invite(&invite).await.unwrap();
+    store
+        .create_user(&make_user("existing", "taken", Role::Member))
+        .await
+        .unwrap();
+
+    let user = make_user("u1", "taken", Role::Member);
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    let err = store
+        .redeem_open_invite("i1", &user, &[], &credential)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidRequest { .. }));
+
+    let found_invite = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(
+        found_invite.uses, 0,
+        "a failed mint must roll back the reservation too, not just the user create"
+    );
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Retrying with a fresh name against the same max_uses=1 invite succeeds.
+    let retry_user = make_user("u2", "fresh-name", Role::Member);
+    let retry_credential = make_token("t2", "u2", TokenKind::ApiKey, "hash-cred-2");
+    assert!(store
+        .redeem_open_invite("i1", &retry_user, &[], &retry_credential)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn redeem_open_invite_revoked_or_expired_is_refused() {
     let (_dir, _backend, store) = make_store().await;
     store
         .create_invite(&make_invite("i1", "h1", InviteMode::Open))
         .await
         .unwrap();
+    store.revoke_invite("i1").await.unwrap();
+    let user = make_user("u1", "alice", Role::Member);
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    assert!(!store
+        .redeem_open_invite("i1", &user, &[], &credential)
+        .await
+        .unwrap());
 
-    assert!(store.try_consume_invite_use("i1").await.unwrap());
-    let found = store.find_invite("i1").await.unwrap().unwrap();
-    assert_eq!(found.uses, 1);
-
-    store.release_invite_use("i1").await.unwrap();
-    let found = store.find_invite("i1").await.unwrap().unwrap();
-    assert_eq!(found.uses, 0, "release must give the reserved slot back");
-
-    // The released slot can be reserved again.
-    assert!(store.try_consume_invite_use("i1").await.unwrap());
+    let mut expired = make_invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    assert!(!store
+        .redeem_open_invite("i2", &user, &[], &credential)
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
-async fn release_invite_use_never_goes_negative() {
+async fn redeem_closed_invite_commits_reservation_and_request_together() {
     let (_dir, _backend, store) = make_store().await;
-    store
-        .create_invite(&make_invite("i1", "h1", InviteMode::Open))
-        .await
-        .unwrap();
+    let mut invite = make_invite("i1", "h1", InviteMode::Closed);
+    invite.max_uses = 1;
+    store.create_invite(&invite).await.unwrap();
 
-    // Releasing with nothing reserved must not drive uses below zero.
-    store.release_invite_use("i1").await.unwrap();
-    let found = store.find_invite("i1").await.unwrap().unwrap();
-    assert_eq!(found.uses, 0);
+    let request = AccessRequestRow {
+        id: "ar1".to_string(),
+        invite_id: "i1".to_string(),
+        requested_name: "carol".to_string(),
+        secret_hash: "req-hash".to_string(),
+        state: AccessRequestState::Pending,
+        resulting_user_id: None,
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+        decided_at: None,
+        collected_at: None,
+    };
+    assert!(store.redeem_closed_invite("i1", &request).await.unwrap());
+    assert!(store.find_access_request("ar1").await.unwrap().is_some());
+    let found_invite = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(found_invite.uses, 1);
+
+    // Now exhausted: a second request against the same invite is refused.
+    let second = AccessRequestRow {
+        id: "ar2".to_string(),
+        ..request
+    };
+    assert!(!store.redeem_closed_invite("i1", &second).await.unwrap());
+    assert!(store.find_access_request("ar2").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -339,7 +449,7 @@ async fn list_access_requests_returns_every_request_across_invites() {
 }
 
 #[tokio::test]
-async fn mark_access_request_collected_succeeds_once_then_fails() {
+async fn collect_access_request_marks_collected_and_mints_the_credential_together() {
     let (_dir, _backend, store) = make_store().await;
     store
         .create_invite(&make_invite("i1", "h1", InviteMode::Closed))
@@ -363,15 +473,21 @@ async fn mark_access_request_collected_succeeds_once_then_fails() {
         })
         .await
         .unwrap();
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
 
-    // Not yet approved: collecting must fail.
+    // Not yet approved: collecting must fail and mint nothing.
     assert!(
         !store
-            .mark_access_request_collected("ar1", "2026-06-11T00:00:00Z")
+            .collect_access_request("ar1", "2026-06-11T00:00:00Z", &credential)
             .await
             .unwrap(),
         "a pending request's credential cannot be collected"
     );
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_none());
 
     store
         .try_decide_access_request(
@@ -385,21 +501,34 @@ async fn mark_access_request_collected_succeeds_once_then_fails() {
 
     assert!(
         store
-            .mark_access_request_collected("ar1", "2026-06-11T00:00:01Z")
+            .collect_access_request("ar1", "2026-06-11T00:00:01Z", &credential)
             .await
             .unwrap(),
         "the first collection attempt after approval must succeed"
     );
     let found = store.find_access_request("ar1").await.unwrap().unwrap();
     assert_eq!(found.collected_at.as_deref(), Some("2026-06-11T00:00:01Z"));
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_some());
 
+    // A second collection attempt must fail (single-use guard) and mint
+    // nothing more.
+    let second_credential = make_token("t2", "u1", TokenKind::ApiKey, "hash-cred-2");
     assert!(
         !store
-            .mark_access_request_collected("ar1", "2026-06-11T00:00:02Z")
+            .collect_access_request("ar1", "2026-06-11T00:00:02Z", &second_credential)
             .await
             .unwrap(),
         "a second collection attempt must fail (single-use guard)"
     );
+    assert!(store
+        .find_token_by_hash("hash-cred-2")
+        .await
+        .unwrap()
+        .is_none());
     // The timestamp from the first, successful collection is untouched.
     let found_again = store.find_access_request("ar1").await.unwrap().unwrap();
     assert_eq!(
@@ -409,10 +538,11 @@ async fn mark_access_request_collected_succeeds_once_then_fails() {
 }
 
 #[tokio::test]
-async fn mark_access_request_collected_unknown_id_returns_false() {
+async fn collect_access_request_unknown_id_returns_false() {
     let (_dir, _backend, store) = make_store().await;
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
     assert!(!store
-        .mark_access_request_collected("nonexistent", "2026-06-11T00:00:00Z")
+        .collect_access_request("nonexistent", "2026-06-11T00:00:00Z", &credential)
         .await
         .unwrap());
 }

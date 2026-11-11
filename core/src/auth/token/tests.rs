@@ -60,6 +60,27 @@ fn pkce_s256_rejects_wrong_verifier() {
 }
 
 #[test]
+fn rfc3339_from_now_matches_fixed_width_zero_padded_shape() {
+    // `is_expired`/`expires_within` and the SQL boundaries in `store-libsql`
+    // rely on lexicographic string ordering matching chronological ordering
+    // for this exact `YYYY-MM-DDTHH:MM:SSZ` shape.
+    let ts = rfc3339_from_now(0);
+    assert_eq!(ts.len(), 20, "{ts}");
+    assert!(ts.ends_with('Z'), "{ts}");
+    assert_eq!(&ts[4..5], "-");
+    assert_eq!(&ts[7..8], "-");
+    assert_eq!(&ts[10..11], "T");
+    assert_eq!(&ts[13..14], ":");
+    assert_eq!(&ts[16..17], ":");
+    assert!(
+        ts[..19]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == 'T' || c == ':'),
+        "{ts}"
+    );
+}
+
+#[test]
 fn is_expired_true_for_past_timestamp() {
     assert!(is_expired(&rfc3339_from_now(-10)));
 }
