@@ -152,7 +152,7 @@ fn make_invite(id: &str, token_hash: &str, mode: InviteMode) -> InviteRow {
 }
 
 /// `reserve_invite_use_on`'s own predicate (`revoked_at IS NULL AND
-/// (expires_at IS NULL OR expires_at > now)`) runs inside the transaction
+/// (expires_at IS NULL OR expires_at >= now)`) runs inside the transaction
 /// that `redeem_open_invite`/`redeem_closed_invite` share. Going through
 /// `AuthService::redeem_invite` never reaches it: the service rejects a
 /// revoked or expired invite from its own initial read before ever calling
@@ -233,6 +233,112 @@ async fn redeem_closed_invite_revoked_or_expired_leaves_no_partial_state() {
     assert!(!store.redeem_closed_invite("i2", &request2).await.unwrap());
     assert_eq!(store.find_invite("i2").await.unwrap().unwrap().uses, 0);
     assert!(store.find_access_request("ar2").await.unwrap().is_none());
+}
+
+/// Finding #6/#7-class guard, direct-store coverage: a redemption whose
+/// credential inherits a `minted_by_family` already recorded in
+/// `auth_compromised_families` must be refused, not minted, even though the
+/// invite use is otherwise eligible to reserve. Mirrors
+/// `core::auth::store::tests::redeem_open_invite_refuses_a_credential_minted_by_a_compromised_family`
+/// (the fake store's equivalent) — this is the real libsql transaction's own
+/// `insert_token_on` check (`atomic.rs`'s `redeem_open_invite`), which that
+/// fake-store test alone never exercises. Removing the `if
+/// !insert_token_on(&tx, credential).await?` guard in
+/// `redeem_open_invite` turns this test's `unwrap_err()` into a panic.
+#[tokio::test]
+async fn redeem_open_invite_refuses_a_credential_minted_by_a_compromised_family() {
+    let (_dir, backend, store) = make_store().await;
+    insert_store_row(&backend, "docs").await;
+    store.revoke_compromised_family("fam-x").await.unwrap();
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let user = make_user("u1", "alice", Role::Member);
+    let mut credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    credential.minted_by_family = Some("fam-x".to_string());
+
+    let err = store
+        .redeem_open_invite("i1", &user, &[], &credential)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+    assert_eq!(
+        store.find_invite("i1").await.unwrap().unwrap().uses,
+        0,
+        "a refused redemption must not reserve a use"
+    );
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Direct-store counterpart of `collect_access_request_refuses_a_credential_minted_by_a_compromised_family`
+/// (the fake store's version, `core::auth::store::tests`) — exercises the
+/// real libsql transaction's `insert_token_on` guard in
+/// `atomic.rs`'s `collect_access_request`. Removing that guard turns this
+/// test's `unwrap_err()` into a panic.
+#[tokio::test]
+async fn collect_access_request_refuses_a_credential_minted_by_a_compromised_family() {
+    let (_dir, _backend, store) = make_store().await;
+    store.revoke_compromised_family("fam-x").await.unwrap();
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Closed))
+        .await
+        .unwrap();
+    store
+        .create_user(&make_user("u1", "carol", Role::Member))
+        .await
+        .unwrap();
+    store
+        .create_access_request(&AccessRequestRow {
+            id: "ar1".to_string(),
+            invite_id: "i1".to_string(),
+            requested_name: "carol".to_string(),
+            secret_hash: "req-hash".to_string(),
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            decided_at: None,
+            collected_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .try_decide_access_request(
+            "ar1",
+            AccessRequestState::Approved,
+            Some("u1"),
+            "2026-06-11T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let mut credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    credential.minted_by_family = Some("fam-x".to_string());
+
+    let err = store
+        .collect_access_request("ar1", "2026-06-11T00:00:01Z", &credential)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+    assert!(
+        store
+            .find_access_request("ar1")
+            .await
+            .unwrap()
+            .unwrap()
+            .collected_at
+            .is_none(),
+        "a refused collection must not mark the request collected"
+    );
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

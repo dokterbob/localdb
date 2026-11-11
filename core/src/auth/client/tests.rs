@@ -160,6 +160,9 @@ fn validate_registration_request_accepts_a_normal_request() {
         validate_registration_request(
             &["https://app.example.com/cb".to_string()],
             Some("A Normal Client"),
+            None,
+            None,
+            None,
         ),
         Ok(())
     );
@@ -168,7 +171,7 @@ fn validate_registration_request_accepts_a_normal_request() {
 #[test]
 fn validate_registration_request_rejects_empty_redirect_uris() {
     assert_eq!(
-        validate_registration_request(&[], None),
+        validate_registration_request(&[], None, None, None, None),
         Err(RegistrationError::EmptyRedirectUris)
     );
 }
@@ -179,7 +182,7 @@ fn validate_registration_request_rejects_too_many_redirect_uris() {
         .map(|i| format!("https://app.example.com/cb{i}"))
         .collect();
     assert_eq!(
-        validate_registration_request(&redirect_uris, None),
+        validate_registration_request(&redirect_uris, None, None, None, None),
         Err(RegistrationError::TooManyOrOverlongRedirectUris)
     );
 }
@@ -191,7 +194,7 @@ fn validate_registration_request_rejects_an_overlong_redirect_uri() {
         "a".repeat(MAX_REGISTRATION_REDIRECT_URI_LEN)
     );
     assert_eq!(
-        validate_registration_request(&[long_uri], None),
+        validate_registration_request(&[long_uri], None, None, None, None),
         Err(RegistrationError::TooManyOrOverlongRedirectUris)
     );
 }
@@ -203,6 +206,9 @@ fn validate_registration_request_rejects_an_overlong_client_name() {
         validate_registration_request(
             &["https://app.example.com/cb".to_string()],
             Some(&long_name),
+            None,
+            None,
+            None,
         ),
         Err(RegistrationError::ClientNameTooLong)
     );
@@ -211,7 +217,13 @@ fn validate_registration_request_rejects_an_overlong_client_name() {
 #[test]
 fn validate_registration_request_rejects_an_invalid_redirect_uri_shape() {
     assert_eq!(
-        validate_registration_request(&["http://evil.example.com/cb".to_string()], None),
+        validate_registration_request(
+            &["http://evil.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+        ),
         Err(RegistrationError::InvalidRedirectUri(
             "http://evil.example.com/cb".to_string()
         ))
@@ -221,15 +233,121 @@ fn validate_registration_request_rejects_an_invalid_redirect_uri_shape() {
 #[test]
 fn validate_registration_request_checks_bounds_before_per_uri_validity() {
     // A request that violates both the count cap and per-URI shape still
-    // reports the bounds violation — `register_client`'s own validator
-    // checks bounds before looping over shapes (mirrors the order the old
-    // handler-side checks used).
+    // reports the bounds violation — the validator checks bounds before
+    // looping over shapes.
     let mut redirect_uris: Vec<String> = (0..MAX_REGISTRATION_REDIRECT_URIS + 1)
         .map(|i| format!("https://app.example.com/cb{i}"))
         .collect();
     redirect_uris.push("http://evil.example.com/cb".to_string());
     assert_eq!(
-        validate_registration_request(&redirect_uris, None),
+        validate_registration_request(&redirect_uris, None, None, None, None),
         Err(RegistrationError::TooManyOrOverlongRedirectUris)
+    );
+}
+
+// -----------------------------------------------------------------
+// `validate_registration_request`'s full precedence order: an
+// `token_endpoint_auth_method`/`grant_types`/`response_types` violation
+// must never outrank a `redirect_uris` violation — a request that violates
+// both must report the `redirect_uris` problem, matching the order this
+// server enforced before `token_endpoint_auth_method`/`grant_types`/
+// `response_types` moved from `server::auth::register::post_register`'s own
+// handler-side checks into this single validator.
+// -----------------------------------------------------------------
+
+#[test]
+fn validate_registration_request_rejects_an_unsupported_auth_method() {
+    assert_eq!(
+        validate_registration_request(
+            &["https://app.example.com/cb".to_string()],
+            None,
+            Some("client_secret_basic"),
+            None,
+            None,
+        ),
+        Err(RegistrationError::UnsupportedAuthMethod(
+            "client_secret_basic".to_string()
+        ))
+    );
+}
+
+#[test]
+fn validate_registration_request_accepts_auth_method_none() {
+    assert_eq!(
+        validate_registration_request(
+            &["https://app.example.com/cb".to_string()],
+            None,
+            Some("none"),
+            None,
+            None,
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn validate_registration_request_auth_method_outranks_redirect_uri_problems() {
+    // An unsupported auth method on an otherwise-invalid request still
+    // reports the auth-method violation — it is the first check.
+    assert_eq!(
+        validate_registration_request(&[], None, Some("client_secret_basic"), None, None,),
+        Err(RegistrationError::UnsupportedAuthMethod(
+            "client_secret_basic".to_string()
+        ))
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_an_unsupported_grant_type() {
+    assert_eq!(
+        validate_registration_request(
+            &["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            Some(&["client_credentials".to_string()]),
+            None,
+        ),
+        Err(RegistrationError::UnsupportedGrantType(
+            "client_credentials".to_string()
+        ))
+    );
+}
+
+#[test]
+fn validate_registration_request_rejects_an_unsupported_response_type() {
+    assert_eq!(
+        validate_registration_request(
+            &["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            Some(&["token".to_string()]),
+        ),
+        Err(RegistrationError::UnsupportedResponseType(
+            "token".to_string()
+        ))
+    );
+}
+
+/// The regression this fixes: `redirect_uris` validation must outrank
+/// `grant_types`/`response_types` validation — a request with both an
+/// invalid `redirect_uris` entry and an unsupported `grant_types` entry
+/// must report `InvalidRedirectUri`, matching this server's behavior before
+/// the two checks' relative order drifted (grant_types/response_types were
+/// briefly checked in the handler *before* `register_client`'s own
+/// redirect_uris validation ran).
+#[test]
+fn validate_registration_request_redirect_uri_outranks_grant_type_problems() {
+    assert_eq!(
+        validate_registration_request(
+            &["http://evil.example.com/cb".to_string()],
+            None,
+            None,
+            Some(&["client_credentials".to_string()]),
+            None,
+        ),
+        Err(RegistrationError::InvalidRedirectUri(
+            "http://evil.example.com/cb".to_string()
+        ))
     );
 }

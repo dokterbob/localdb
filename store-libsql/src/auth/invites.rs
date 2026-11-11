@@ -110,6 +110,13 @@ pub(crate) async fn revoke_invite(
 /// run it as the first statement of their own transaction — a failure later
 /// in that transaction rolls this reservation back too, so there is no
 /// separate "release" step.
+///
+/// `>=`, not `>`: an invite expiring in the exact same second as `now` must
+/// still be eligible, matching `core::auth::is_expired`'s own boundary
+/// (`expires_at < now`, so `expires_at == now` is NOT expired) — the fake
+/// store's `invite_use_index_if_eligible` applies the same `is_expired`
+/// call, so a stricter SQL boundary here would refuse an invite the fake
+/// store (and the service layer) still treat as live.
 pub(super) async fn reserve_invite_use_on(
     conn: &libsql::Connection,
     invite_id: &str,
@@ -118,7 +125,7 @@ pub(super) async fn reserve_invite_use_on(
     let n = conn
         .execute(
             "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses \
-             AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+             AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at >= ?)",
             libsql::params![invite_id.to_string(), now.to_string()],
         )
         .await

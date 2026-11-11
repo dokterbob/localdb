@@ -476,6 +476,30 @@ async fn register_rejects_unsupported_response_type() {
     assert!(body.get("code").is_none());
 }
 
+/// Regression: `redirect_uris` validation must outrank `grant_types`/
+/// `response_types` validation — a request violating both must report
+/// `invalid_redirect_uri`, the same precedence this server enforced before
+/// `token_endpoint_auth_method`/`grant_types`/`response_types` briefly
+/// moved into handler-side checks that ran *before* `register_client`'s own
+/// `redirect_uris` validation.
+#[tokio::test]
+async fn register_redirect_uri_violation_outranks_unsupported_grant_type() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({
+            "redirect_uris": ["not-a-uri"],
+            "grant_types": ["client_credentials"],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_redirect_uri");
+    assert!(body.get("code").is_none());
+}
+
 #[tokio::test]
 async fn register_accepts_explicit_supported_grant_and_response_types() {
     let (_dir, _state, app) = make_enforced_app().await;

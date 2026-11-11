@@ -462,6 +462,66 @@ async fn scoped_many_rejects_a_document_outside_the_allowed_set() {
     );
 }
 
+/// P1 regression: a document ambiguous only among stores *outside* the
+/// allowed set must read as a plain 404, not the cross-store ambiguity
+/// error — the old implementation ran one global, unscoped `find_document`
+/// first and only checked allowed-set membership afterward, so an id
+/// shared by two stores the caller cannot see produced `InvalidRequest`
+/// (and its message) even though neither matching store is visible to the
+/// caller.
+#[tokio::test]
+async fn scoped_many_hidden_ambiguity_in_unallowed_stores_is_not_found() {
+    let backend = FakeBackend::new()
+        .with_document(make_document_info("doc-shared", "store-c", "file:///c.md"))
+        .with_document(make_document_info("doc-shared", "store-d", "file:///d.md"));
+
+    let err = get_document_detail_scoped(
+        &backend,
+        "doc-shared",
+        &["store-a".to_string(), "store-b".to_string()],
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        Error::ResourceNotFound {
+            id: "doc-shared".to_string()
+        },
+        "ambiguity confined to stores outside the allowed set must never surface as the \
+         cross-store ambiguity error"
+    );
+}
+
+/// P1 regression: text/chunks must never be fetched for a match outside the
+/// allowed set. `FakeBackend::retrieval_store` errors with `StoreNotFound`
+/// for `store-c` (no `with_store` call below) — if the lookup fetched text
+/// before resolving which allowed store (if any) holds the document, that
+/// error would surface instead of the expected `ResourceNotFound`.
+#[tokio::test]
+async fn scoped_many_does_not_fetch_text_for_a_match_outside_the_allowed_set() {
+    let backend =
+        FakeBackend::new().with_document(make_document_info("doc-1", "store-c", "file:///c.md"));
+
+    let err = get_document_detail_scoped(
+        &backend,
+        "doc-1",
+        &["store-a".to_string(), "store-b".to_string()],
+        true,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        Error::ResourceNotFound {
+            id: "doc-1".to_string()
+        },
+        "text must only be fetched after a document resolves to an allowed store"
+    );
+}
+
 #[tokio::test]
 async fn scoped_not_found_propagates_for_every_arity() {
     let backend = FakeBackend::new();

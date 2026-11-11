@@ -597,6 +597,9 @@ async fn is_known_client_recognizes_builtin_and_registered() {
         .register_client(
             vec!["http://127.0.0.1:4000/cb".to_string()],
             Some("Test Client".to_string()),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -606,7 +609,10 @@ async fn is_known_client_recognizes_builtin_and_registered() {
 #[tokio::test]
 async fn register_client_rejects_empty_redirect_uris() {
     let svc = service();
-    let err = svc.register_client(vec![], None).await.unwrap_err();
+    let err = svc
+        .register_client(vec![], None, None, None, None)
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         RegisterClientError::Validation(RegistrationError::EmptyRedirectUris)
@@ -617,7 +623,13 @@ async fn register_client_rejects_empty_redirect_uris() {
 async fn register_client_rejects_invalid_redirect_uri() {
     let svc = service();
     let err = svc
-        .register_client(vec!["http://evil.com/cb".to_string()], None)
+        .register_client(
+            vec!["http://evil.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -636,6 +648,9 @@ async fn register_client_accepts_https_and_loopback() {
                 "http://127.0.0.1:9999/cb".to_string(),
             ],
             Some("Multi Redirect Client".to_string()),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -647,7 +662,13 @@ async fn register_client_accepts_https_and_loopback() {
 async fn validate_client_redirect_uri_registered_client_exact_match_only() {
     let svc = service();
     let row = svc
-        .register_client(vec!["https://app.example.com/cb".to_string()], None)
+        .register_client(
+            vec!["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 

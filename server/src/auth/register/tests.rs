@@ -13,42 +13,11 @@ fn default_grant_and_response_types_match_rfc7591_defaults() {
 }
 
 // -----------------------------------------------------------------
-// Finding #3: unsupported grant_types/response_types entries.
-// -----------------------------------------------------------------
-
-#[test]
-fn unsupported_entry_flags_a_disallowed_grant_type() {
-    let requested = vec!["client_credentials".to_string()];
-    assert_eq!(
-        unsupported_entry(&requested, localdb_core::auth::SUPPORTED_GRANT_TYPES),
-        Some("client_credentials")
-    );
-}
-
-#[test]
-fn unsupported_entry_allows_every_supported_grant_type() {
-    let requested = vec![
-        "authorization_code".to_string(),
-        "refresh_token".to_string(),
-    ];
-    assert_eq!(
-        unsupported_entry(&requested, localdb_core::auth::SUPPORTED_GRANT_TYPES),
-        None
-    );
-}
-
-#[test]
-fn unsupported_entry_flags_a_disallowed_response_type() {
-    let requested = vec!["token".to_string()];
-    assert_eq!(
-        unsupported_entry(&requested, localdb_core::auth::SUPPORTED_RESPONSE_TYPES),
-        Some("token")
-    );
-}
-
-// -----------------------------------------------------------------
 // `registration_error_code`: the one place this handler maps a
-// `RegistrationError` onto its RFC 7591 §3.2.2 code.
+// `RegistrationError` onto its RFC 7591 §3.2.2 code. Unsupported
+// grant_types/response_types entries, and every other validation rule, are
+// `core::auth::client::validate_registration_request`'s own job — see that
+// module's tests for coverage of the check order and each individual rule.
 // -----------------------------------------------------------------
 
 #[test]
@@ -62,9 +31,12 @@ fn registration_error_code_maps_invalid_redirect_uri() {
 #[test]
 fn registration_error_code_maps_every_other_violation_to_invalid_client_metadata() {
     for err in [
+        RegistrationError::UnsupportedAuthMethod("client_secret_basic".to_string()),
         RegistrationError::EmptyRedirectUris,
         RegistrationError::TooManyOrOverlongRedirectUris,
         RegistrationError::ClientNameTooLong,
+        RegistrationError::UnsupportedGrantType("client_credentials".to_string()),
+        RegistrationError::UnsupportedResponseType("token".to_string()),
     ] {
         assert_eq!(registration_error_code(&err), "invalid_client_metadata");
     }

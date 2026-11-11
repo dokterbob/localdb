@@ -343,7 +343,13 @@ async fn validate_authorize_params_rejects_unknown_client() {
 async fn validate_authorize_params_accepts_registered_client_exact_redirect() {
     let auth = fake_auth();
     let row = auth
-        .register_client(vec!["https://app.example.com/cb".to_string()], None)
+        .register_client(
+            vec!["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let params = validate_authorize_params(
@@ -364,7 +370,13 @@ async fn validate_authorize_params_accepts_registered_client_exact_redirect() {
 async fn validate_authorize_params_rejects_registered_client_mismatched_redirect() {
     let auth = fake_auth();
     let row = auth
-        .register_client(vec!["https://app.example.com/cb".to_string()], None)
+        .register_client(
+            vec!["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     // A different port/path than what was registered must be rejected —

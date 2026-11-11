@@ -143,8 +143,16 @@ pub fn registration_client_name_within_bounds(client_name: Option<&str>) -> bool
 /// variant onto its RFC 7591 §3.2.2 error code (`invalid_redirect_uri` for
 /// [`Self::InvalidRedirectUri`], `invalid_client_metadata` for everything
 /// else).
+///
+/// Variant order matches [`validate_registration_request`]'s check order —
+/// the precedence a client observes when a request violates more than one
+/// rule at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationError {
+    /// `token_endpoint_auth_method` was present and not `"none"` — this
+    /// server only ever registers public clients (there is nowhere to store
+    /// or verify a `client_secret`).
+    UnsupportedAuthMethod(String),
     /// `redirect_uris` was empty.
     EmptyRedirectUris,
     /// `redirect_uris` has more than [`MAX_REGISTRATION_REDIRECT_URIS`]
@@ -157,11 +165,22 @@ pub enum RegistrationError {
     /// [`validate_registration_redirect_uri`]'s doc comment for which shapes
     /// are allowed and why.
     InvalidRedirectUri(String),
+    /// A `grant_types` entry this authorization server doesn't support (see
+    /// [`SUPPORTED_GRANT_TYPES`]).
+    UnsupportedGrantType(String),
+    /// A `response_types` entry this authorization server doesn't support
+    /// (see [`SUPPORTED_RESPONSE_TYPES`]).
+    UnsupportedResponseType(String),
 }
 
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedAuthMethod(method) => write!(
+                f,
+                "token_endpoint_auth_method '{method}' is not supported; this server only \
+                 registers public clients (token_endpoint_auth_method: 'none')"
+            ),
             Self::EmptyRedirectUris => {
                 write!(f, "redirect_uris is required and must not be empty")
             }
@@ -179,25 +198,44 @@ impl std::fmt::Display for RegistrationError {
                 "redirect_uri '{uri}' is not allowed: must be an https:// URL or a loopback \
                  http://127.0.0.1[:port]/... or http://localhost[:port]/... URL"
             ),
+            Self::UnsupportedGrantType(entry) => write!(
+                f,
+                "grant_types entry '{entry}' is not supported; this server supports \
+                 {SUPPORTED_GRANT_TYPES:?}"
+            ),
+            Self::UnsupportedResponseType(entry) => write!(
+                f,
+                "response_types entry '{entry}' is not supported; this server supports \
+                 {SUPPORTED_RESPONSE_TYPES:?}"
+            ),
         }
     }
 }
 
 /// Validate a `POST /register` request against this server's DCR policy
-/// (RFC 7591): non-empty `redirect_uris`, within the count/length caps
-/// ([`registration_redirect_uris_within_bounds`]), each entry an allowed
-/// shape ([`validate_registration_redirect_uri`]), and `client_name` (if
+/// (RFC 7591), in order: `token_endpoint_auth_method` (if present, must be
+/// `"none"`), non-empty `redirect_uris`, within the count/length caps
+/// ([`registration_redirect_uris_within_bounds`]), `client_name` (if
 /// present) within its length cap
-/// ([`registration_client_name_within_bounds`]). The single validator
-/// `AuthService::register_client` enforces, replacing the two partial,
-/// independently-drifting copies that used to live in `register_client`
-/// (emptiness and per-URI validity only) and `server::auth::register::
-/// post_register` (the same two plus the bounds `register_client` never
-/// checked).
+/// ([`registration_client_name_within_bounds`]), each `redirect_uris` entry
+/// an allowed shape ([`validate_registration_redirect_uri`]), then (if
+/// present) every `grant_types`/`response_types` entry against
+/// [`SUPPORTED_GRANT_TYPES`]/[`SUPPORTED_RESPONSE_TYPES`]. The single
+/// validator `AuthService::register_client` enforces — `server::auth::
+/// register::post_register` performs no validation of its own, only mapping
+/// the returned [`RegistrationError`] onto its RFC 7591 §3.2.2 code.
 pub fn validate_registration_request(
     redirect_uris: &[String],
     client_name: Option<&str>,
+    token_endpoint_auth_method: Option<&str>,
+    grant_types: Option<&[String]>,
+    response_types: Option<&[String]>,
 ) -> Result<(), RegistrationError> {
+    if let Some(method) = token_endpoint_auth_method {
+        if method != "none" {
+            return Err(RegistrationError::UnsupportedAuthMethod(method.to_string()));
+        }
+    }
     if redirect_uris.is_empty() {
         return Err(RegistrationError::EmptyRedirectUris);
     }
@@ -212,7 +250,31 @@ pub fn validate_registration_request(
             return Err(RegistrationError::InvalidRedirectUri(uri.clone()));
         }
     }
+    if let Some(grant_types) = grant_types {
+        if let Some(bad) = unsupported_entry(grant_types, SUPPORTED_GRANT_TYPES) {
+            return Err(RegistrationError::UnsupportedGrantType(bad.to_string()));
+        }
+    }
+    if let Some(response_types) = response_types {
+        if let Some(bad) = unsupported_entry(response_types, SUPPORTED_RESPONSE_TYPES) {
+            return Err(RegistrationError::UnsupportedResponseType(bad.to_string()));
+        }
+    }
     Ok(())
+}
+
+/// The first entry in `requested` that `supported` doesn't list — `None`
+/// when every entry is supported. Shared by `grant_types`/`response_types`
+/// validation in [`validate_registration_request`]: a registrant asking for
+/// a flow this server doesn't actually support (e.g. `client_credentials`,
+/// `token`) must be rejected rather than echoed back in the `201`, which
+/// would otherwise be the only place a client learns which flows are
+/// supported.
+fn unsupported_entry<'a>(requested: &'a [String], supported: &[&str]) -> Option<&'a str> {
+    requested
+        .iter()
+        .find(|entry| !supported.contains(&entry.as_str()))
+        .map(|s| s.as_str())
 }
 
 /// `http://127.0.0.1:<port>/<anything>` or `http://localhost:<port>/<anything>`,

@@ -599,6 +599,12 @@ impl<S: AuthStore> AuthService<S> {
     /// `client_name`. Mints a ULID `client_id`; there is no client secret
     /// (public clients only, mirroring `localdb-cli`'s own policy).
     ///
+    /// `token_endpoint_auth_method`/`grant_types`/`response_types` are
+    /// validated (via [`client::validate_registration_request`]) but never
+    /// persisted — `OAuthClientRow` has no columns for them; a `201`
+    /// response re-derives them from the request (or this server's
+    /// defaults) rather than reading them back from storage.
+    ///
     /// Enforces [`client::validate_registration_request`] — the one DCR
     /// validator — before persisting anything; `server::auth::register::
     /// post_register` performs no validation of its own, only mapping each
@@ -608,9 +614,18 @@ impl<S: AuthStore> AuthService<S> {
         &self,
         redirect_uris: Vec<String>,
         client_name: Option<String>,
+        token_endpoint_auth_method: Option<&str>,
+        grant_types: Option<&[String]>,
+        response_types: Option<&[String]>,
     ) -> Result<OAuthClientRow, RegisterClientError> {
-        client::validate_registration_request(&redirect_uris, client_name.as_deref())
-            .map_err(RegisterClientError::Validation)?;
+        client::validate_registration_request(
+            &redirect_uris,
+            client_name.as_deref(),
+            token_endpoint_auth_method,
+            grant_types,
+            response_types,
+        )
+        .map_err(RegisterClientError::Validation)?;
         let row = OAuthClientRow {
             id: new_ulid(),
             client_name,

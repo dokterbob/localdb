@@ -195,6 +195,40 @@ async fn redeem_open_invite_revoked_or_expired_is_refused() {
         .unwrap());
 }
 
+/// `reserve_invite_use_on`'s SQL boundary must match
+/// `core::auth::is_expired`'s strict-earlier rule exactly: an invite
+/// expiring in the same second as `now` is still eligible, one second
+/// earlier is not. Calls `reserve_invite_use_on` directly with fixed
+/// timestamps (mirroring `rotate_tokens_at`'s own pinned-boundary tests in
+/// `tests/tokens.rs`) so the assertion never races the wall clock.
+#[tokio::test]
+async fn reserve_invite_use_on_boundary_matches_is_expired() {
+    let (_dir, _backend, store) = make_store().await;
+    let now = "2026-06-10T12:00:00Z";
+
+    let mut at_now = make_invite("i1", "h1", InviteMode::Open);
+    at_now.expires_at = Some(now.to_string());
+    store.create_invite(&at_now).await.unwrap();
+
+    let mut one_second_earlier = make_invite("i2", "h2", InviteMode::Open);
+    one_second_earlier.expires_at = Some("2026-06-10T11:59:59Z".to_string());
+    store.create_invite(&one_second_earlier).await.unwrap();
+
+    let conn = store.conn.writer().await;
+    assert!(
+        crate::auth::invites::reserve_invite_use_on(&conn, "i1", now)
+            .await
+            .unwrap(),
+        "an invite expiring in the exact same second as `now` must still be eligible"
+    );
+    assert!(
+        !crate::auth::invites::reserve_invite_use_on(&conn, "i2", now)
+            .await
+            .unwrap(),
+        "an invite that expired one second before `now` must be refused"
+    );
+}
+
 #[tokio::test]
 async fn redeem_closed_invite_commits_reservation_and_request_together() {
     let (_dir, _backend, store) = make_store().await;

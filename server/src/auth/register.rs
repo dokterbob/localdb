@@ -1,13 +1,12 @@
 //! `POST /register` — OAuth2 Dynamic Client Registration (RFC 7591, T7,
 //! specs/05-surfaces.md §3.1).
 //!
-//! HTTP shape only (specs/01-architecture.md §1): the one DCR validator
-//! (`redirect_uris`/`client_name` bounds and shape) lives in
+//! HTTP shape only (specs/01-architecture.md §1): every validation rule —
+//! `redirect_uris`/`client_name` bounds and shape, `token_endpoint_auth_method`,
+//! `grant_types`/`response_types` — lives in the single
 //! `core::auth::validate_registration_request`, enforced by
-//! `AuthService::register_client`. This module only parses/renders JSON,
-//! checks the two fields `register_client` doesn't validate
-//! (`token_endpoint_auth_method`, `grant_types`/`response_types`), and maps
-//! `RegisterClientError` onto the matching RFC 7591 §3.2.2 error code.
+//! `AuthService::register_client`. This module only parses/renders JSON and
+//! maps `RegisterClientError` onto the matching RFC 7591 §3.2.2 error code.
 //! Public client registration only — no `client_secret` is ever minted
 //! (mirrors the built-in `localdb-cli` client's own policy);
 //! `token_endpoint_auth_method` is always `"none"` in the response and, if
@@ -114,105 +113,51 @@ fn default_response_types() -> Vec<String> {
         .collect()
 }
 
-/// Finding #3: a `grant_types`/`response_types` entry this AS doesn't
-/// actually support (e.g. `client_credentials`, `token`) must not be echoed
-/// back in a `201` — that would advertise a flow `/token`/`/authorize` can't
-/// service. `supported` is [`SUPPORTED_GRANT_TYPES`] or
-/// [`SUPPORTED_RESPONSE_TYPES`] — the same list `discovery::
-/// oauth_authorization_server` advertises as `grant_types_supported`/
-/// `response_types_supported`, so DCR and discovery can never disagree.
-fn unsupported_entry<'a>(requested: &'a [String], supported: &[&str]) -> Option<&'a str> {
-    requested
-        .iter()
-        .find(|entry| !supported.contains(&entry.as_str()))
-        .map(|s| s.as_str())
-}
-
 /// RFC 7591 §3.2.2 error code for a [`RegistrationError`] — `invalid_redirect_uri`
 /// for a bad `redirect_uris` entry, `invalid_client_metadata` for every other
-/// violation (emptiness, bounds, client_name length).
+/// violation (unsupported auth method, emptiness, bounds, client_name
+/// length, an unsupported `grant_types`/`response_types` entry).
 fn registration_error_code(err: &RegistrationError) -> &'static str {
     match err {
         RegistrationError::InvalidRedirectUri(_) => "invalid_redirect_uri",
-        RegistrationError::EmptyRedirectUris
+        RegistrationError::UnsupportedAuthMethod(_)
+        | RegistrationError::EmptyRedirectUris
         | RegistrationError::TooManyOrOverlongRedirectUris
-        | RegistrationError::ClientNameTooLong => "invalid_client_metadata",
+        | RegistrationError::ClientNameTooLong
+        | RegistrationError::UnsupportedGrantType(_)
+        | RegistrationError::UnsupportedResponseType(_) => "invalid_client_metadata",
     }
 }
 
 /// `POST /register` (public, RFC 7591): register a new public OAuth2 client.
 ///
-/// Rejects an explicit `token_endpoint_auth_method` other than `"none"`
-/// (this server only ever registers public clients — there is nowhere to
-/// store or verify a `client_secret`) and an unsupported `grant_types`/
-/// `response_types` entry (checked here, against
-/// `SUPPORTED_GRANT_TYPES`/`SUPPORTED_RESPONSE_TYPES`, since neither is
-/// persisted or known to `AuthService::register_client`). Every other
-/// check — `redirect_uris` non-empty and within the DCR size bounds, each
-/// entry an allowed shape, `client_name` within its length bound — is
-/// `AuthService::register_client`'s own `validate_registration_request`;
-/// this handler only maps its [`RegistrationError`] onto the matching RFC
-/// 7591 §3.2.2 code (`registration_error_code`) rather than re-validating.
-/// Every rejection is RFC 7591 §3.2.2-shaped (`register_error`) rather than
-/// the shared `{"code":...,"message":...}` `ApiError` envelope used
-/// elsewhere.
+/// Performs no validation of its own: every check — `token_endpoint_auth_method`
+/// must be `"none"` if present, `redirect_uris` non-empty and within the DCR
+/// size bounds, each entry an allowed shape, `client_name` within its
+/// length bound, and (if present) every `grant_types`/`response_types`
+/// entry supported — is `AuthService::register_client`'s own
+/// `validate_registration_request`, enforced in that exact precedence
+/// order; this handler only maps its [`RegistrationError`] onto the
+/// matching RFC 7591 §3.2.2 code (`registration_error_code`). Every
+/// rejection is RFC 7591 §3.2.2-shaped (`register_error`) rather than the
+/// shared `{"code":...,"message":...}` `ApiError` envelope used elsewhere.
 pub async fn post_register(
     State(state): State<AppState>,
     Json(req): Json<RegisterClientRequest>,
 ) -> Response {
-    if let Some(method) = req.token_endpoint_auth_method.as_deref() {
-        if method != "none" {
-            return register_error(
-                "invalid_client_metadata",
-                format!(
-                    "token_endpoint_auth_method '{method}' is not supported; this server only \
-                     registers public clients (token_endpoint_auth_method: 'none')"
-                ),
-            );
-        }
-    }
-
-    // A registrant asking for a `grant_types`/`response_types` entry this AS
-    // doesn't actually support (e.g. `client_credentials`, `token`) must be
-    // rejected rather than echoed back in the `201` — that response is
-    // otherwise the only place a client learns which flows are supported,
-    // and an unsupported entry there is a lie `/token`/`/authorize` can't
-    // back up. `SUPPORTED_GRANT_TYPES`/`SUPPORTED_RESPONSE_TYPES` are the
-    // same lists `discovery::oauth_authorization_server` advertises as
-    // `grant_types_supported`/`response_types_supported` (single source of
-    // truth in `core::auth::client`). Absent fields keep the current
-    // defaults, applied below.
-    if let Some(grant_types) = &req.grant_types {
-        if let Some(bad) = unsupported_entry(grant_types, SUPPORTED_GRANT_TYPES) {
-            return register_error(
-                "invalid_client_metadata",
-                format!(
-                    "grant_types entry '{bad}' is not supported; this server supports \
-                     {SUPPORTED_GRANT_TYPES:?}"
-                ),
-            );
-        }
-    }
-    if let Some(response_types) = &req.response_types {
-        if let Some(bad) = unsupported_entry(response_types, SUPPORTED_RESPONSE_TYPES) {
-            return register_error(
-                "invalid_client_metadata",
-                format!(
-                    "response_types entry '{bad}' is not supported; this server supports \
-                     {SUPPORTED_RESPONSE_TYPES:?}"
-                ),
-            );
-        }
-    }
-
-    // TODO(#8 follow-up): `AuthService::register_client`'s bounds are
-    // per-request payload-size caps, not a rate limiter — a global
-    // registration-count cap / throttle on POST /register (this route is
-    // public/unauthenticated) is a separate, out-of-scope concern. Track it
-    // if T7's DCR endpoint sees abuse.
+    // `AuthService::register_client`'s bounds are per-request payload-size
+    // caps, not a rate limiter — a global registration-count cap / throttle
+    // on POST /register (this route is public/unauthenticated) is a
+    // separate, out-of-scope concern.
     let row = match state
         .auth()
-        .register_client(req.redirect_uris, req.client_name)
+        .register_client(
+            req.redirect_uris,
+            req.client_name,
+            req.token_endpoint_auth_method.as_deref(),
+            req.grant_types.as_deref(),
+            req.response_types.as_deref(),
+        )
         .await
     {
         Ok(row) => row,
