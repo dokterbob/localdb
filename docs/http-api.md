@@ -685,6 +685,10 @@ Returns `403 forbidden` for a non-admin bearer, `401 unauthorized` for a missing
 
 ---
 
+> None of the request-body structs documented in this reference reject unknown fields (no
+> `#[serde(deny_unknown_fields)]` on any of them) — an unrecognized field in a JSON request body is
+> silently ignored everywhere below, not an error.
+
 ### `POST /v1/users`
 
 Admin-only. Creates a user account. There are no passwords (identity is proven solely by bearer
@@ -823,7 +827,7 @@ Returns `201`:
 ```json
 {
   "id": "01ARZ3NDEKTSV4RRFFQ69G5KEY",
-  "secret": "ldb_7XqN2vLp9KbMjT3hYsFcW1oGdZaRie4ntJ8uBxDkQyA"
+  "secret": "ldb_QUFBQTExMTFCQkJCMjIyMkNDQ0MzMzMzRERERDQ0NAA"
 }
 ```
 
@@ -834,9 +838,12 @@ minting a new one. This route takes no request body — only the `{id}` path seg
 `invalid_request`, 400, for an unknown `id` (same 400-not-404 shape as above). `403 forbidden` if
 the caller is neither an admin nor minting a key for themselves.
 
-If the caller is authenticated by an OAuth login session (rather than an existing API key), the
-minted key inherits that session's family: reuse-detected revocation of the session also revokes any
-key minted under it, including one an admin mints for another user from that session.
+The minted key inherits the caller's own session ancestry, whatever credential authenticated the
+caller: an access token's own `family_id`, or an API key's `minted_by_family` if that key was itself
+minted under a session (or under another key already tainted by one). That ancestry becomes the new
+key's `minted_by_family`, so reuse-detected revocation of the originating session revokes every key
+descended from it, transitively — including one an admin mints for another user from a stolen
+session, or from a key already tainted by one.
 
 ---
 
@@ -910,6 +917,11 @@ Returns `201`:
 }
 ```
 
+`user` is resolved by name first, falling back to id only if no user has that exact name: a client
+that always passes stored user IDs still works, unless some other user happens to be named
+identically to that ID string (vanishingly unlikely given ULIDs' alphabet, but the name match wins
+if it ever happens).
+
 Granting the same user the same store again updates the existing row (`granted_by`/`created_at`
 refreshed) rather than erroring or duplicating it. `store_not_found`, 404, for an unknown store
 name. `forbidden`, 403, if the named store is `private` — only `shared` stores are grantable (this
@@ -921,7 +933,8 @@ neither an existing user name nor id. Same malformed-body caveat as
 
 ### `DELETE /v1/stores/{name}/grants/{user}`
 
-Admin-only. Revokes `user`'s (name or id) grant on `store_name`.
+Admin-only. Revokes `user`'s (name or id) grant on `store_name` — `user` is resolved the same way as
+[`POST .../grants`](#post-v1storesnamegrants)'s `user` field: by name first, falling back to id.
 
 ```
 curl -s -X DELETE http://127.0.0.1:7700/v1/stores/docs/grants/alice \
@@ -979,8 +992,8 @@ is used from a browser.
 | ------------ | -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `mode`       | string   | yes      | `"open"` (redemption creates the user immediately) or `"closed"` (redemption files a pending request that an admin must approve) |
 | `stores`     | string[] | no       | Store names granted to the resulting user on redemption; default `[]`. Any named store that is `private` is rejected             |
-| `max_uses`   | int      | no       | Default `1`; `0` is rejected                                                                                                     |
-| `expires_at` | string   | no       | RFC 3339 expiry; default `null` (never expires)                                                                                  |
+| `max_uses`   | integer  | no       | `u32`; range 1-4294967295, default `1`; `0` is rejected                                                                          |
+| `expires_at` | string   | no       | RFC 3339 timestamp, or `null`/omitted for no expiry; normalized to UTC on acceptance                                             |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/invites \
@@ -998,8 +1011,8 @@ Returns `201`:
   "max_uses": 1,
   "expires_at": null,
   "created_at": "2026-06-10T12:00:00Z",
-  "token": "ldb_9WzK4mYtB2cRpL7vJhN8qFgE3xSoVnTdAk6uXiM1fPw",
-  "consent_url": "http://127.0.0.1:7700/join?invite=ldb_9WzK4mYtB2cRpL7vJhN8qFgE3xSoVnTdAk6uXiM1fPw"
+  "token": "ldb_S0VZMWFhYWFCQkJCY2NjY0RERERlZWVlRkZGRmdnZwA",
+  "consent_url": "http://127.0.0.1:7700/join?invite=ldb_S0VZMWFhYWFCQkJCY2NjY0RERERlZWVlRkZGRmdnZwA"
 }
 ```
 
@@ -1008,19 +1021,29 @@ rest; not recoverable afterward). `consent_url` is a ready-made link to the stan
 `GET /join?invite=<token>` join page for a browser invitee with no CLI and no OAuth client, built
 from `server.public_url` if configured, else the request's own `Host` header.
 
-`invalid_request`, 400, for an unrecognized `mode` or `max_uses: 0`. `store_not_found`, 404, for an
-unknown store name in `stores`. `forbidden`, 403, if any named store in `stores` is `private` — only
-`shared` stores can be granted via invite (a different 403 than the one a non-admin bearer gets).
-`invalid_request`, 400, if `server.public_url` is not configured and the request's `Host` header is
-missing or malformed — there is then no base URL to build `consent_url` from, so the invite is never
-created. Same malformed-body caveat as [`POST /v1/users`](#post-v1users).
+`invalid_request`, 400, for an unrecognized `mode` or `max_uses: 0`. `invalid_request`, 400, for an
+`expires_at` that isn't a valid RFC 3339 timestamp, with the message
+`expires_at must be an RFC 3339 timestamp`; an accepted value is normalized to UTC before being
+stored, regardless of the offset it was submitted with. A `max_uses` that is negative, fractional,
+or exceeds `4294967295` never reaches that `0` check at all — it fails to deserialize into this
+route's plain `Json<CreateInviteRequest>` body, so it gets the same plain-text
+`422 Unprocessable Entity` as any other wrong-typed field (see the malformed-body caveat below), not
+the `invalid_request` envelope. `store_not_found`, 404, for an unknown store name in `stores`.
+`forbidden`, 403, if any named store in `stores` is `private` — only `shared` stores can be granted
+via invite (a different 403 than the one a non-admin bearer gets). `invalid_request`, 400, if
+`server.public_url` is not configured and the request's `Host` header is missing or malformed —
+there is then no base URL to build `consent_url` from, so the invite is never created. Same
+malformed-body caveat as [`POST /v1/users`](#post-v1users).
 
 ---
 
 ### `DELETE /v1/invites/{id}`
 
 Admin-only. Revokes an invite — a revoked invite can no longer be redeemed, but this does not affect
-users already created by earlier redemptions.
+users already created by earlier redemptions, nor any access request already filed against it: a
+pending request can still be [approved](#post-v1invitesrequestsidapprove) after its invite is
+revoked (approval never re-checks the invite's state) — to refuse it, the request must be
+[denied](#post-v1invitesrequestsiddeny) explicitly.
 
 ```
 curl -s -X DELETE http://127.0.0.1:7700/v1/invites/01ARZ3NDEKTSV4RRFFQ69G5NVT \
@@ -1048,7 +1071,7 @@ invite-redemption flow — see [Trust model and authentication](#trust-model-and
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/invites/redeem \
   -H 'Content-Type: application/json' \
-  -d '{"token":"ldb_9WzK4mYtB2cRpL7vJhN8qFgE3xSoVnTdAk6uXiM1fPw","requested_name":"alice"}'
+  -d '{"token":"ldb_S0VZMWFhYWFCQkJCY2NjY0RERERlZWVlRkZGRmdnZwA","requested_name":"alice"}'
 ```
 
 `open`-mode invite → `201`, the user, its granted stores, and a show-once API key, all created
@@ -1058,7 +1081,7 @@ immediately:
 {
   "user": { "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "name": "alice", "role": "member" },
   "granted_stores": ["docs"],
-  "api_key": "ldb_7XqN2vLp9KbMjT3hYsFcW1oGdZaRie4ntJ8uBxDkQyA"
+  "api_key": "ldb_QUFBQTExMTFCQkJCMjIyMkNDQ0MzMzMzRERERDQ0NAA"
 }
 ```
 
@@ -1067,7 +1090,7 @@ immediately:
 ```json
 {
   "request_id": "01ARZ3NDEKTSV4RRFFQ69G5REQ",
-  "request_secret": "ldb_2LqD5mTbC8vRpN3yJhW1qSgA4xZoKnTeAl6uViM9fOj",
+  "request_secret": "ldb_UkRNMmZmZmZHR0dHaGhoaElJSUlqampqS0tLS2xsbAA",
   "poll": "/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/poll"
 }
 ```
@@ -1075,12 +1098,27 @@ immediately:
 `api_key` and `request_secret` are both **shown exactly once**, in this response, and are never
 retrievable again afterward — a lost `request_secret` means the request can never be polled (there
 is no way to recover or re-request it short of redeeming the invite again, which consumes another
-use if `max_uses` allows it). An empty `token` or `requested_name` is `invalid_request`, 400. A
-`requested_name` that collides with an existing user name is the same `invalid_request`/400
-duplicate-name shape [`POST /v1/users`](#post-v1users) gets. An unknown, revoked, expired, **or
-exhausted** (`max_uses` already reached) invite is `unauthorized`, 401 — deliberately
-indistinguishable from each other, so a caller cannot use the response to probe which condition
-failed.
+use if `max_uses` allows it).
+
+Both `token` and `requested_name` are required. A body that isn't a JSON object at all — malformed
+JSON, a wrong `Content-Type`, or (since neither field has a default) one of them missing entirely —
+is `invalid_request`, 400, with the fixed message `request body must be a JSON object`; the body is
+never echoed back. A well-formed body with an empty `token` or `requested_name` is also
+`invalid_request`, 400, but with the message `token and requested_name are both required`.
+
+An unknown, revoked, expired, or exhausted (`max_uses` already reached) invite is `unauthorized`,
+401, in every case, but the message differs: `invalid or unknown invite token`,
+`invite has been revoked`, `invite has expired`, and `invite has no remaining uses` respectively —
+same status and code, different message.
+
+A `requested_name` that collides with an existing user name is rejected at redemption with the same
+`invalid_request`/400 duplicate-name shape [`POST /v1/users`](#post-v1users) gets — **but only for
+an `open`-mode invite**. A `closed`-mode invite does not check the name at all: redemption accepts
+it, consumes a use, and returns `202` as normal; the collision only surfaces later, when an admin
+tries to [approve the resulting request](#post-v1invitesrequestsidapprove), which then fails with
+`invalid_request`/400 (`user '<name>' already exists`) and leaves the request `pending`. Since the
+name never changes between attempts, retrying the approval fails the same way every time — the only
+way to clear a request stuck like this is to [deny](#post-v1invitesrequestsiddeny) it.
 
 ---
 
@@ -1130,9 +1168,20 @@ curl -s -X POST http://127.0.0.1:7700/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G
 ```
 
 User creation, the invite's store grants, and the approval decision all commit atomically — a
-failure anywhere leaves the request pending rather than partially applied. `invalid_request`, 400,
-for an unknown `id` (not `404`) or a request that is no longer `pending` (already approved or
-denied). `403 forbidden` for a non-admin bearer.
+failure anywhere leaves the request pending rather than partially applied. The most common failure
+is a `requested_name` that now collides with an existing user name — this can only happen for a
+`closed`-mode invite, since an `open`-mode one already checked uniqueness at redemption (see
+[`POST /v1/invites/redeem`](#post-v1invitesredeem)) — which returns `invalid_request`, 400
+(`user '<name>' already exists`), and leaves the request `pending`; since the name doesn't change
+between attempts, retrying the approval fails the same way every time, so a request stuck like this
+can only be cleared by [denying](#post-v1invitesrequestsiddeny) it.
+
+Approval does not re-check the invite's own state: a pending request can still be approved after its
+invite has been [revoked](#delete-v1invitesid) or has expired. If access should be refused once an
+invite is revoked or expired, every request still pending against it must be denied explicitly.
+
+`invalid_request`, 400, for an unknown `id` (not `404`) or a request that is no longer `pending`
+(already approved or denied). `403 forbidden` for a non-admin bearer.
 
 ---
 
@@ -1170,10 +1219,15 @@ poll first and collect the one-time API key ahead of the real requester (the sam
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/poll \
   -H 'Content-Type: application/json' \
-  -d '{"secret":"ldb_2LqD5mTbC8vRpN3yJhW1qSgA4xZoKnTeAl6uViM9fOj"}'
+  -d '{"secret":"ldb_UkRNMmZmZmZHR0dHaGhoaElJSUlqampqS0tLS2xsbAA"}'
 ```
 
-Returns `200` in every case; the body's `state` tells the caller what to do next:
+Malformed JSON, a wrong field type, or a missing/wrong `Content-Type` is `invalid_request`, 400,
+with the fixed message `request body must be a JSON object` (the `SecretJson` extractor collapses
+every such rejection to this, never echoing the body back) — distinct from a well-formed body with a
+missing, `null`, or empty `secret`, which is `unauthorized`, 401, as described below.
+
+Otherwise returns `200`; the body's `state` tells the caller what to do next:
 
 ```json
 { "state": "pending" }
@@ -1184,7 +1238,7 @@ Returns `200` in every case; the body's `state` tells the caller what to do next
 ```
 
 ```json
-{ "state": "approved", "api_key": "ldb_7XqN2vLp9KbMjT3hYsFcW1oGdZaRie4ntJ8uBxDkQyA" }
+{ "state": "approved", "api_key": "ldb_QUFBQTExMTFCQkJCMjIyMkNDQ0MzMzMzRERERDQ0NAA" }
 ```
 
 ```json
