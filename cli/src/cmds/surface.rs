@@ -7,8 +7,38 @@ use crate::{
         reject_store_flag, resolve_store_scope, StoreScopePolicy, SERVE_REJECT_MESSAGE,
     },
     daemon_client::{probe_daemon, CliContext, DaemonState},
-    normalize::{exit_err, print_json, visibility_to_string},
+    normalize::{exit_err, print_json},
 };
+
+/// A `mcp::proxy::BearerSource` backed by the CLI's own credentials file and
+/// refresh-token flow, so the daemon-proxy MCP transport picks up a token
+/// refreshed by another `localdb` process mid-session instead of carrying
+/// the one bearer it connected with for the lifetime of the stdio process.
+///
+/// Each call re-reads `credentials.json` through the same `CredentialLock`
+/// serialization every other CLI credential access goes through
+/// (`daemon_client::fresh_bearer_for_url`/`try_refresh_and_persist`), so it
+/// never races a concurrent `localdb login`/refresh in another process, and
+/// resolves the credentials-file key fresh each call via the same
+/// longest-path-segment-prefix match every other daemon-bound request
+/// applies to its URL — `base_url` itself need not be the exact string
+/// `localdb login` stored a credential under.
+struct CliBearerSource {
+    ctx: CliContext,
+    base_url: String,
+}
+
+#[async_trait::async_trait]
+impl mcp::proxy::BearerSource for CliBearerSource {
+    async fn current(&self) -> Option<String> {
+        crate::daemon_client::fresh_bearer_for_url(&self.ctx, &self.base_url).await
+    }
+
+    async fn refresh(&self, rejected: &str) -> Option<String> {
+        crate::daemon_client::try_refresh_and_persist(&self.ctx, &self.base_url, Some(rejected))
+            .await
+    }
+}
 
 /// `localdb serve` — start the HTTP daemon (specs/05-surfaces.md §3).
 pub fn run_serve(ctx: &CliContext) {
@@ -63,12 +93,25 @@ pub(crate) async fn run_serve_async(ctx: &CliContext) {
             // Announce the bound address before blocking on the server future
             // so callers (and tests) can discover an OS-assigned port.
             if ctx.json {
-                print_json(&json!({
+                let mut announced = json!({
                     "status": "listening",
                     "url": format!("http://{}", handle.addr),
-                }));
+                });
+                if let Some(code) = &handle.setup_code {
+                    announced["setup_code"] = json!(code);
+                }
+                print_json(&announced);
             } else {
                 println!("daemon listening on http://{}", handle.addr);
+                if let Some(code) = &handle.setup_code {
+                    println!();
+                    println!("One-time setup code: {code}");
+                    println!(
+                        "Run: localdb login --url http://{} --setup-code {code}",
+                        handle.addr
+                    );
+                    println!("This code works once and changes on restart.");
+                }
             }
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
@@ -89,7 +132,7 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     use mcp::{
         proxy::{ProxyConnectError, ProxyHandler},
-        AvailableStore, McpHandler, StoreDescriptor,
+        McpHandler,
     };
 
     // specs/05-surfaces.md §4: v1 registers no mutating tool on any
@@ -152,27 +195,46 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
             }
         }
 
-        let handler = match ProxyHandler::connect(&base_url, &ctx.stores).await {
-            Ok(handler) => handler,
-            Err(ProxyConnectError::StoreNotFound(name)) => {
-                exit_err(&Error::StoreNotFound { id: name }, ctx.json);
-            }
-            Err(ProxyConnectError::Unreachable(e)) => {
-                // The underlying transport/handshake error (`e`) is otherwise
-                // discarded — `exit_err` below only ever prints the generic
-                // "daemon is unreachable" message, giving no clue *why* the
-                // proxy hop failed (issue #147: the daemon/MCP connection
-                // path gives no diagnostic signal on rejection). `warn!` so
-                // it surfaces under the default `warn,pdf_oxide=off` filter
-                // (`localdb/src/main.rs`) without needing `RUST_LOG=debug`.
-                tracing::warn!(
-                    daemon_url = %base_url,
-                    error = %e,
-                    "mcp proxy: failed to connect to daemon"
-                );
-                exit_err(&Error::DaemonUnreachable, ctx.json);
-            }
-        };
+        // `CliBearerSource` resolves and refreshes the credential itself on
+        // every call the upstream transport makes — no prefetch here — so a
+        // token refreshed by another `localdb` process mid-session, or one
+        // that expires partway through this one, is picked up without this
+        // stdio process ever reconnecting.
+        let source: std::sync::Arc<dyn mcp::proxy::BearerSource> =
+            std::sync::Arc::new(CliBearerSource {
+                ctx: ctx.clone(),
+                base_url: base_url.clone(),
+            });
+        let handler =
+            match ProxyHandler::connect_with_auth(&base_url, &ctx.stores, Some(source)).await {
+                Ok(handler) => handler,
+                Err(ProxyConnectError::StoreNotFound(name)) => {
+                    exit_err(&Error::StoreNotFound { id: name }, ctx.json);
+                }
+                Err(ProxyConnectError::Unauthorized) => {
+                    exit_err(
+                        &Error::Unauthorized {
+                            message: "not authenticated; run `localdb login` or set \
+                                      LOCALDB_API_KEY"
+                                .to_string(),
+                        },
+                        ctx.json,
+                    );
+                }
+                Err(ProxyConnectError::Unreachable(e)) => {
+                    // The underlying transport/handshake error (`e`) is otherwise
+                    // discarded — `exit_err` below only ever prints the generic
+                    // "daemon is unreachable" message, giving no clue *why* the
+                    // proxy hop failed. `warn!` so it surfaces under the default `warn,pdf_oxide=off` filter
+                    // (`localdb/src/main.rs`) without needing `RUST_LOG=debug`.
+                    tracing::warn!(
+                        daemon_url = %base_url,
+                        error = %e,
+                        "mcp proxy: failed to connect to daemon"
+                    );
+                    exit_err(&Error::DaemonUnreachable, ctx.json);
+                }
+            };
         if let Err(e) = mcp::serve_proxied_stdio(handler).await {
             exit_err(
                 &Error::Internal {
@@ -196,7 +258,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     // must still *start* — an MCP server that exits non-zero at startup reads
     // to its client as broken, not as empty.
     let db = open_app_db_or_exit(ctx, &config_loader).await;
-    let scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
+    let _scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
 
     let embed_policy = &config_loader.config.defaults.indexing.embedding;
     let models_dir = config_loader.paths.models_dir.clone();
@@ -210,25 +272,17 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         Err(e) => exit_err(&Error::from(e), ctx.json),
     };
 
-    let mut available: Vec<AvailableStore> = Vec::new();
-    for store_row in &scoped_stores {
-        let descriptor = StoreDescriptor {
-            id: store_row.id.clone(),
-            name: store_row.name.clone(),
-            visibility: visibility_to_string(&store_row.visibility).to_string(),
-        };
-        let handle = match db.backend().retrieval_store(&store_row.id).await {
-            Ok(handle) => handle,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        available.push(AvailableStore::from_arc(descriptor, handle));
-    }
-
+    let db = std::sync::Arc::new(db);
+    let provider = std::sync::Arc::new(crate::app_db::AppDbStoreProvider::new(
+        db.clone(),
+        ctx.stores.clone(),
+    ));
     let handler = McpHandler::new(
-        available,
+        provider,
         db.backend_arc(),
         std::sync::Arc::from(embedder),
         allow_write,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
 
     if let Err(e) = mcp::serve_embedded_stdio(handler).await {
@@ -241,3 +295,6 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

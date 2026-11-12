@@ -1,0 +1,756 @@
+//! OAuth2 authorization-code + PKCE HTTP surface (specs/05-surfaces.md
+//! §3.1): `GET/POST /authorize`, `POST /token`, `POST /revoke` (RFC 7009).
+//!
+//! HTTP shape only (specs/01-architecture.md §1) — the auth-code state
+//! machine, client recognition, and redirect-uri policy all live in
+//! `localdb_core::auth` (`AuthService::issue_auth_code`/`redeem_auth_code`,
+//! `is_known_client`, `validate_redirect_uri`); persistence is
+//! `store-libsql`'s `auth_codes` table. This module only: parses/renders
+//! HTTP, escapes untrusted values into HTML, and maps `core::Error` onto
+//! RFC 6749 §5.2 JSON error bodies.
+//!
+//! These three routes are deliberately **public** (no bearer token) — they
+//! *are* the auth flow (specs/05-surfaces.md §3.1's route table). See
+//! `daemon::build_router` for how they're kept outside the `require_auth`
+//! layer.
+
+use axum::{
+    extract::{Form, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Redirect, Response},
+    Json,
+};
+use serde::{Deserialize, Serialize};
+
+use localdb_core::auth::{self, RedeemOutcome};
+use localdb_core::Error as CoreError;
+
+use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// Shared param validation (GET and POST /authorize)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeQuery {
+    pub response_type: Option<String>,
+    pub client_id: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub state: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
+    /// Pre-fills the consent form's credential field (D3b bootstrap UX) —
+    /// the form still requires an explicit submit.
+    pub setup_code: Option<String>,
+    /// An invite token (`/authorize?invite=<token>`, the URL `POST
+    /// /v1/invites` hands back) — switches the rendered form to the invite
+    /// -redemption variant (a "your name" field instead of a
+    /// setup-code/API-key credential field), see `render_consent_page`.
+    pub invite: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeForm {
+    pub response_type: Option<String>,
+    pub client_id: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub state: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
+    /// Either the one-time setup code (bootstrap) or an existing API key —
+    /// see `resolve_credential`. Mutually exclusive with `invite` (below);
+    /// which branch runs is decided by whether `invite` is present, in
+    /// `post_authorize`.
+    pub credential: Option<String>,
+    /// An invite token, round-tripped from the hidden field
+    /// `render_consent_page`'s invite variant renders. Present iff this
+    /// submission is an invite redemption rather than a setup-code/API-key
+    /// login.
+    pub invite: Option<String>,
+    /// The requester's chosen user name, required alongside `invite`.
+    pub requested_name: Option<String>,
+}
+
+/// The subset of `/authorize` params needed once validated: known-good
+/// `client_id`/`redirect_uri`/`code_challenge`, plus the round-tripped
+/// (untouched) CSRF `state`.
+#[derive(Debug)]
+struct ValidParams {
+    client_id: String,
+    redirect_uri: String,
+    state: String,
+    code_challenge: String,
+}
+
+#[derive(Debug)]
+struct OAuthError {
+    status: StatusCode,
+    code: &'static str,
+    description: String,
+}
+
+impl OAuthError {
+    fn new(code: &'static str, description: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            description: description.into(),
+        }
+    }
+
+    /// A store-layer (internal-class) failure behind a client/redirect-uri
+    /// lookup, not genuine client input (see `super::is_internal_class_error`):
+    /// a fixed, detail-free description, so no storage error ever reaches
+    /// this public route — mirrors `oauth.rs`'s own `internal_token_error`
+    /// and `register.rs`'s `internal_register_error`.
+    fn server_error() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "server_error",
+            description: "internal error".to_string(),
+        }
+    }
+}
+
+/// Validates the structural + client/redirect-uri shape of an `/authorize`
+/// request. Generic over `AuthStore` (rather than tied to `AppState`/
+/// `ServerAuthService`) so unit tests below can exercise it against a
+/// `FakeAuthStore`-backed `AuthService` with no real database — the same
+/// pattern `core::auth::service`'s own tests use.
+///
+/// `client_id` recognition and `redirect_uri` validation go through
+/// `AuthService::is_known_client`/`validate_client_redirect_uri`, which
+/// extend the built-in `localdb-cli` pure check with a store-backed lookup
+/// for `POST /register`-created clients (specs/05-surfaces.md §3.1). An
+/// internal-class store failure (see `super::is_internal_class_error`) is a
+/// server fault, not client input, so it short-circuits to
+/// `OAuthError::server_error()` (500) rather than being folded into
+/// `unauthorized_client`/`invalid_request` (400) — the two must not be
+/// conflated, or a transient store error gets reported and retried as if the
+/// client itself were bad.
+async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
+    auth: &localdb_core::auth::AuthService<S>,
+    response_type: Option<&str>,
+    client_id: Option<&str>,
+    redirect_uri: Option<&str>,
+    state: Option<&str>,
+    code_challenge: Option<&str>,
+    code_challenge_method: Option<&str>,
+) -> Result<ValidParams, OAuthError> {
+    if response_type.unwrap_or_default() != "code" {
+        return Err(OAuthError::new(
+            "unsupported_response_type",
+            "response_type must be 'code'",
+        ));
+    }
+    let client_id = client_id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| OAuthError::new("invalid_request", "client_id is required"))?;
+    let known = known_or_server_error(auth.is_known_client(client_id).await)?;
+    if !known {
+        return Err(OAuthError::new("unauthorized_client", "unknown client_id"));
+    }
+    let redirect_uri = redirect_uri
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| OAuthError::new("invalid_request", "redirect_uri is required"))?;
+    let redirect_ok = known_or_server_error(
+        auth.validate_client_redirect_uri(client_id, redirect_uri)
+            .await,
+    )?;
+    if !redirect_ok {
+        return Err(OAuthError::new(
+            "invalid_request",
+            "redirect_uri is not allowed for this client",
+        ));
+    }
+    if code_challenge_method.unwrap_or_default() != "S256" {
+        return Err(OAuthError::new(
+            "invalid_request",
+            "code_challenge_method must be 'S256' (plain is rejected)",
+        ));
+    }
+    let code_challenge = code_challenge
+        .filter(|s| auth::valid_pkce_challenge(s))
+        .ok_or_else(|| {
+            OAuthError::new(
+                "invalid_request",
+                "code_challenge must be a base64url S256 digest",
+            )
+        })?;
+
+    Ok(ValidParams {
+        client_id: client_id.to_string(),
+        redirect_uri: redirect_uri.to_string(),
+        state: state.unwrap_or_default().to_string(),
+        code_challenge: code_challenge.to_string(),
+    })
+}
+
+/// Shared by `validate_authorize_params`'s `is_known_client`/
+/// `validate_client_redirect_uri` checks: an internal-class store failure
+/// (see `super::is_internal_class_error`) is a server fault, so it becomes
+/// `OAuthError::server_error()` rather than being folded into "unknown
+/// client"/"bad redirect_uri" — a transient store error must never be
+/// reported (and retried) as if the client itself were bad. Any other `Err`
+/// (there is no other case today, but none is assumed unreachable) is
+/// treated as "not found", matching the check's own `Ok(false)` outcome.
+fn known_or_server_error(result: Result<bool, CoreError>) -> Result<bool, OAuthError> {
+    match result {
+        Ok(known) => Ok(known),
+        Err(e) if super::is_internal_class_error(&e) => Err(OAuthError::server_error()),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Escape a value for safe interpolation into the consent page HTML (XSS
+/// hardening for `client_id`/`redirect_uri`/`state`, which are fully
+/// attacker-controlled query/form params). Shared with the standalone join
+/// page (`super::join`), which renders its own HTML for the same invite
+/// -redemption data.
+pub(super) fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// A minimal, dependency-free (inline CSS only) consent page. Every
+/// interpolated value is HTML-escaped. The hidden fields round-trip the
+/// full set of OAuth params the POST handler re-validates.
+///
+/// `invite_token`, when present (`/authorize?invite=<token>`), switches
+/// the credential field for an invite-redemption variant: a hidden `invite`
+/// field carrying the token plus a "your name" text input, rather than the
+/// setup-code/API-key password field — an invite token IS the credential
+/// here, there is nothing else to type.
+fn render_consent_page(
+    params: &ValidParams,
+    credential_prefill: &str,
+    invite_token: Option<&str>,
+    error: Option<&str>,
+) -> Html<String> {
+    let client_id = escape_html(&params.client_id);
+    let redirect_uri = escape_html(&params.redirect_uri);
+    let state = escape_html(&params.state);
+    let code_challenge = escape_html(&params.code_challenge);
+    let error_html = match error {
+        Some(e) => format!("<p class=\"error\">{}</p>", escape_html(e)),
+        None => String::new(),
+    };
+    let credential_field = match invite_token {
+        Some(token) => {
+            let token_escaped = escape_html(token);
+            format!(
+                r#"<input type="hidden" name="invite" value="{token_escaped}">
+<label>Your name
+<input type="text" name="requested_name" autofocus></label>
+<p class="hint">You were invited to join this localdb instance. Choose a name to continue.</p>"#
+            )
+        }
+        None => {
+            let credential_prefill = escape_html(credential_prefill);
+            format!(
+                r#"<label>One-time setup code (first run) or existing API key
+<input type="password" name="credential" value="{credential_prefill}" autofocus></label>
+<p class="hint">New installs: paste the setup code printed by <code>localdb serve</code>. Otherwise, use an API key from <code>localdb key create</code>.</p>"#
+            )
+        }
+    };
+
+    super::page_shell(
+        "Authorize localdb",
+        &format!(
+            r#"<h1>Authorize &ldquo;{client_id}&rdquo;</h1>
+<p>This application is requesting access to your localdb data.</p>
+{error_html}
+<form method="post" action="">
+<input type="hidden" name="response_type" value="code">
+<input type="hidden" name="client_id" value="{client_id}">
+<input type="hidden" name="redirect_uri" value="{redirect_uri}">
+<input type="hidden" name="state" value="{state}">
+<input type="hidden" name="code_challenge" value="{code_challenge}">
+<input type="hidden" name="code_challenge_method" value="S256">
+{credential_field}
+<button type="submit">Authorize</button>
+</form>"#
+        ),
+    )
+}
+
+/// The browser uses the same collection endpoint as CLI login, then resumes
+/// the original authorization with the new credential (no second invite
+/// redemption). `data-poll-url` is a relative path, built from this route's
+/// own prefix rather than parsed out of it client-side, so it keeps working
+/// behind any path prefix the daemon is mounted under. `data-on-approve`
+/// tells the shared script in `invite_wait.html` to resume this OAuth form
+/// on approval, rather than display the collected key the way the
+/// standalone join page's own waiting page does (`super::join`).
+fn render_request_submitted_page(
+    params: &ValidParams,
+    request_id: &str,
+    request_secret: &str,
+) -> Html<String> {
+    let page = render_consent_page(params, "", None, None).0;
+    let poll_url = escape_html(&format!("v1/invites/requests/{request_id}/poll"));
+    let body = format!(
+        "<body data-request-id=\"{}\" data-request-secret=\"{}\" data-poll-url=\"{}\" \
+         data-on-approve=\"submit\">",
+        escape_html(request_id),
+        escape_html(request_secret),
+        poll_url,
+    );
+    Html(
+        page.replace("<body>", &body)
+            .replace("<form method=", "<form hidden method=")
+            .replace("</body>", include_str!("invite_wait.html")),
+    )
+}
+
+fn oauth_error_page(err: OAuthError) -> Response {
+    (
+        err.status,
+        Html(format!(
+            "<!doctype html><html><body><h1>Authorization error</h1><p><code>{}</code>: {}</p></body></html>",
+            escape_html(err.code),
+            escape_html(&err.description)
+        )),
+    )
+        .into_response()
+}
+
+/// `GET /authorize` — renders the consent form. Params are validated before
+/// rendering so a structurally invalid request (bad `redirect_uri`, missing
+/// PKCE, unknown client) never gets a form that could plausibly complete.
+pub async fn get_authorize(
+    State(state): State<AppState>,
+    Query(query): Query<AuthorizeQuery>,
+) -> Response {
+    let params = match validate_authorize_params(
+        state.auth(),
+        query.response_type.as_deref(),
+        query.client_id.as_deref(),
+        query.redirect_uri.as_deref(),
+        query.state.as_deref(),
+        query.code_challenge.as_deref(),
+        query.code_challenge_method.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => return oauth_error_page(e),
+    };
+    let prefill = query.setup_code.unwrap_or_default();
+    render_consent_page(&params, &prefill, query.invite.as_deref(), None).into_response()
+}
+
+/// `POST /authorize` — validates the credential (setup code or API key),
+/// issues a single-use authorization code, and redirects to `redirect_uri`
+/// with `code` + the untouched `state` (or, for the `urn:ietf:wg:oauth:2.0:oob`
+/// no-browser sentinel, renders the code inline for copy/paste instead of
+/// redirecting — see `localdb_core::auth::OOB_REDIRECT_URI`).
+pub async fn post_authorize(
+    State(state): State<AppState>,
+    Form(form): Form<AuthorizeForm>,
+) -> Response {
+    let params = match validate_authorize_params(
+        state.auth(),
+        form.response_type.as_deref(),
+        form.client_id.as_deref(),
+        form.redirect_uri.as_deref(),
+        form.state.as_deref(),
+        form.code_challenge.as_deref(),
+        form.code_challenge_method.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => return oauth_error_page(e),
+    };
+
+    // An invite token takes an entirely different path — it identifies
+    // a *new* user (via `redeem_invite`, requiring a chosen name) rather
+    // than an existing one, and a `closed`-mode invite doesn't continue the
+    // OAuth flow at all (no admin has approved yet).
+    if let Some(invite_token) = form.invite.as_deref().filter(|s| !s.is_empty()) {
+        let requested_name = form.requested_name.unwrap_or_default();
+        return handle_invite_authorize(&state, &params, invite_token, requested_name.trim()).await;
+    }
+
+    let credential = form.credential.unwrap_or_default();
+    if credential.trim().is_empty() {
+        return render_consent_page(&params, "", None, Some("Enter a setup code or API key."))
+            .into_response();
+    }
+
+    let (user_id, origin) = match resolve_credential(&state, credential.trim()).await {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            return render_consent_page(&params, "", None, Some(&message)).into_response()
+        }
+    };
+
+    issue_code_and_continue(&state, &params, &user_id, origin).await
+}
+
+/// Handle a consent-page submission that carries an invite token rather
+/// than a setup-code/API-key credential (`AuthorizeForm::invite`).
+///
+/// `open`-mode invites redeem immediately and continue the OAuth flow as
+/// the freshly created user, so `localdb login --invite <token>`'s browser
+/// path (if used — the direct-redeem path in `cli::cmds::login` is primary)
+/// yields ordinary browser-session tokens. `closed`-mode invites do NOT
+/// continue the flow here — no admin has approved yet, so there is no user
+/// to issue a code for; the requester sees a "request submitted" page and
+/// polls (or has the CLI poll for them) instead of getting a redirect.
+async fn handle_invite_authorize(
+    state: &AppState,
+    params: &ValidParams,
+    invite_token: &str,
+    requested_name: &str,
+) -> Response {
+    if requested_name.is_empty() {
+        return render_consent_page(params, "", Some(invite_token), Some("Enter your name."))
+            .into_response();
+    }
+    match state
+        .auth()
+        .redeem_invite(invite_token, requested_name)
+        .await
+    {
+        Ok(RedeemOutcome::Open { user, .. }) => {
+            // An invite mints a fresh, untainted user — no session ancestry.
+            issue_code_and_continue(state, params, &user.id, None).await
+        }
+        Ok(RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        }) => render_request_submitted_page(params, &request_id, &request_secret).into_response(),
+        Err(e) => render_consent_page(params, "", Some(invite_token), Some(&e.to_string()))
+            .into_response(),
+    }
+}
+
+/// Shared tail of `post_authorize`'s credential and invite branches: mint a
+/// single-use authorization code for `user_id` and either redirect to
+/// `redirect_uri` with it, or (the `--no-browser` oob sentinel) render it
+/// inline for copy/paste.
+///
+/// `minted_by_family` is the authorizing credential's own session ancestry
+/// (resolved by `resolve_credential`, or `None` for an invite redemption),
+/// carried onto the code so the session it ultimately mints
+/// (`issue_token_pair`) inherits it too.
+async fn issue_code_and_continue(
+    state: &AppState,
+    params: &ValidParams,
+    user_id: &str,
+    minted_by_family: Option<String>,
+) -> Response {
+    let issued = match state
+        .auth()
+        .issue_auth_code(
+            &params.client_id,
+            user_id,
+            &params.redirect_uri,
+            &params.code_challenge,
+            minted_by_family,
+        )
+        .await
+    {
+        Ok(issued) => issued,
+        Err(e) => {
+            return oauth_error_page(OAuthError::new("server_error", e.to_string()));
+        }
+    };
+
+    if params.redirect_uri == auth::OOB_REDIRECT_URI {
+        // No listener to redirect to (`localdb login --no-browser`): render
+        // the code inline for the operator to copy and paste back into the
+        // CLI's stdin prompt, rather than a 302 with nowhere to land.
+        return render_oob_success_page(&issued.secret).into_response();
+    }
+
+    let redirect_to = append_query(
+        &params.redirect_uri,
+        &[
+            ("code", issued.secret.as_str()),
+            ("state", params.state.as_str()),
+        ],
+    );
+    Redirect::to(&redirect_to).into_response()
+}
+
+/// The `localdb login --no-browser` success page: the code is displayed
+/// (escaped) for the operator to copy and paste back into the CLI's stdin
+/// prompt, since there is no listener to redirect to.
+fn render_oob_success_page(code: &str) -> Html<String> {
+    super::page_shell(
+        "localdb login code",
+        &format!(
+            r#"<h1>Authorization complete</h1>
+<p>Copy this code and paste it back into the terminal running <kbd>localdb login --no-browser</kbd>:</p>
+<p><code id="authorization-code">{}</code></p>"#,
+            escape_html(code)
+        ),
+    )
+}
+
+/// Resolve a presented consent-form credential to a user id and its session
+/// ancestry: try the one-time setup code first (bootstrap path — creates the
+/// first admin user and consumes the code, with no ancestry of its own),
+/// then fall back to treating it as an existing bearer secret (API key or
+/// access token) via `AuthService::authenticate_with_origin` — an access
+/// token's own family, or a tainted API key's, becomes the new authorization
+/// code's `minted_by_family`, so a session created by authorizing with a
+/// stolen credential is itself reachable from reuse detection on the
+/// original: revoking the original also revokes that new session and
+/// anything minted under it.
+///
+/// Invite-token redemption is a separate path: `post_authorize` checks for
+/// an invite token before calling this function at all and returns early via
+/// `handle_invite_authorize`, since invites identify a *new* user the way
+/// the setup code identifies the *first* one.
+async fn resolve_credential(
+    state: &AppState,
+    credential: &str,
+) -> Result<(String, Option<String>), String> {
+    let presented_hash = auth::hash_secret(credential);
+    if state.setup_code_hash().as_deref() == Some(&presented_hash) {
+        return state
+            .auth()
+            .begin_bootstrap()
+            .await
+            .map(|user| (user.id, None))
+            .map_err(|e| e.to_string());
+    }
+
+    match state.auth().authenticate_with_origin(credential).await {
+        Ok((principal, origin)) => Ok((principal.user_id, origin.0)),
+        Err(_) => Err("invalid setup code or API key".to_string()),
+    }
+}
+
+/// Append `pairs` as query parameters to `redirect_uri`, preserving any
+/// query string it already carries.
+fn append_query(redirect_uri: &str, pairs: &[(&str, &str)]) -> String {
+    match url::Url::parse(redirect_uri) {
+        Ok(mut parsed) => {
+            {
+                let mut qp = parsed.query_pairs_mut();
+                for (k, v) in pairs {
+                    qp.append_pair(k, v);
+                }
+            }
+            parsed.to_string()
+        }
+        // Unreachable in practice: `redirect_uri` was already validated by
+        // `validate_authorize_params`/`validate_redirect_uri`, which only
+        // accepts well-formed `http://` loopback URLs. Fall back to the raw
+        // string rather than panicking if that invariant is ever violated.
+        Err(_) => redirect_uri.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /token
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct TokenForm {
+    pub grant_type: Option<String>,
+    pub code: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub client_id: Option<String>,
+    pub code_verifier: Option<String>,
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenErrorBody {
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_description: Option<String>,
+}
+
+fn token_error(status: StatusCode, code: &'static str, description: impl Into<String>) -> Response {
+    (
+        status,
+        Json(TokenErrorBody {
+            error: code,
+            error_description: Some(description.into()),
+        }),
+    )
+        .into_response()
+}
+
+/// Generic RFC 6749 §5.2 `server_error` body for an internal-class fault:
+/// `500`, since RFC 6749's token-error status/code registry
+/// only constrains 4xx responses, and a fixed, generic description — never
+/// `err.to_string()` — so no internal detail leaks to the caller.
+fn internal_token_error() -> Response {
+    token_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "internal error",
+    )
+}
+
+/// Classify a token-issuance/rotation/auth-code-redemption failure: an
+/// internal-class error (see
+/// [`super::is_internal_class_error`]) becomes a generic `500`; anything else
+/// is genuine client input and stays a `400 invalid_grant` with `description`
+/// (the token-endpoint code for a bad, expired, or already-consumed grant,
+/// RFC 6749 §5.2).
+fn token_error_for_failure(err: CoreError, description: &'static str) -> Response {
+    if super::is_internal_class_error(&err) {
+        internal_token_error()
+    } else {
+        token_error(StatusCode::BAD_REQUEST, "invalid_grant", description)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TokenResponse {
+    access_token: String,
+    token_type: &'static str,
+    expires_in: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+}
+
+/// `POST /token` — `authorization_code` (+ `code_verifier`) and
+/// `refresh_token` grants (specs/05-surfaces.md §3.1). RFC 6749 §5.2 JSON
+/// error shape on failure, `400` (`401` for an unrecognized `client_id`).
+pub async fn post_token(State(state): State<AppState>, Form(form): Form<TokenForm>) -> Response {
+    match form.grant_type.as_deref() {
+        Some("authorization_code") => handle_auth_code_grant(&state, form).await,
+        Some("refresh_token") => handle_refresh_grant(&state, form).await,
+        Some(_) => token_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "grant_type must be 'authorization_code' or 'refresh_token'",
+        ),
+        None => token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "grant_type is required",
+        ),
+    }
+}
+
+async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
+    let (Some(code), Some(redirect_uri), Some(client_id), Some(code_verifier)) = (
+        form.code,
+        form.redirect_uri,
+        form.client_id,
+        form.code_verifier,
+    ) else {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "code, redirect_uri, client_id, and code_verifier are all required",
+        );
+    };
+    let known = match state.auth().is_known_client(&client_id).await {
+        Ok(known) => known,
+        Err(e) if super::is_internal_class_error(&e) => return internal_token_error(),
+        Err(_) => false,
+    };
+    if !known {
+        return token_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "unknown client_id",
+        );
+    }
+
+    let (user, origin) = match state
+        .auth()
+        .redeem_auth_code(&code, &client_id, &redirect_uri, &code_verifier)
+        .await
+    {
+        Ok(redeemed) => redeemed,
+        Err(e) => {
+            return token_error_for_failure(
+                e,
+                "the authorization code is invalid, expired, already used, or does not match \
+                 this client/redirect_uri/code_verifier",
+            )
+        }
+    };
+
+    issue_token_pair(state, &user.id, origin).await
+}
+
+async fn handle_refresh_grant(state: &AppState, form: TokenForm) -> Response {
+    let Some(refresh_token) = form.refresh_token else {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "refresh_token is required",
+        );
+    };
+
+    match state.auth().rotate_refresh_token(&refresh_token).await {
+        Ok((access, refresh)) => Json(TokenResponse {
+            access_token: access.secret,
+            token_type: "Bearer",
+            expires_in: localdb_core::auth::ACCESS_TOKEN_TTL_SECS,
+            refresh_token: Some(refresh.secret),
+        })
+        .into_response(),
+        Err(e) => {
+            token_error_for_failure(e, "the refresh token is invalid, expired, or already used")
+        }
+    }
+}
+
+async fn issue_token_pair(
+    state: &AppState,
+    user_id: &str,
+    minted_by_family: Option<String>,
+) -> Response {
+    // `issue_session` shares one family between the access and refresh
+    // token, so reuse detection on the refresh token revokes this very
+    // access token too — not just later-rotated replacements.
+    // `minted_by_family` is the authorizing credential's own ancestry (see
+    // `resolve_credential`), so reuse detection on *that* credential's
+    // family reaches this session too, however many hops away.
+    let (access, refresh) = match state.auth().issue_session(user_id, minted_by_family).await {
+        Ok(pair) => pair,
+        Err(e) => return token_error_for_failure(e, "the token request could not be completed"),
+    };
+    Json(TokenResponse {
+        access_token: access.secret,
+        token_type: "Bearer",
+        expires_in: localdb_core::auth::ACCESS_TOKEN_TTL_SECS,
+        refresh_token: Some(refresh.secret),
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /revoke (RFC 7009)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeForm {
+    pub token: Option<String>,
+    #[allow(dead_code)]
+    pub token_type_hint: Option<String>,
+}
+
+/// `POST /revoke` — `200` for unknown/already revoked tokens (RFC 7009 §2.2:
+/// revocation must never leak whether a presented token existed). Storage failures
+/// return a generic server error so clients can retry rather than forget a live token.
+pub async fn post_revoke(State(state): State<AppState>, Form(form): Form<RevokeForm>) -> Response {
+    if let Some(token) = form.token.filter(|t| !t.is_empty()) {
+        if let Err(error) = state.auth().revoke_by_secret(&token).await {
+            return token_error_for_failure(error, "revocation failed; retry the request");
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod tests;

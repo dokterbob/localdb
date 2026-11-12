@@ -31,6 +31,8 @@
 //! agent from *accidentally* reading another project's docs; it does not
 //! contain a hostile one. See specs/05-surfaces.md §4.2.1.
 
+use std::sync::Arc;
+
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -42,6 +44,10 @@ use rmcp::{
     },
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
+
+mod auth;
+use auth::RefreshingHttpClient;
+pub use auth::{BearerSource, StaticBearer};
 
 /// One store the upstream daemon exposes over MCP, as reported by its own
 /// `list_stores` tool.
@@ -75,14 +81,15 @@ impl ProxyScope {
     /// store the *upstream* would resolve it to, or `None` if it names no
     /// store at all.
     ///
-    /// Id pass before name pass, matching `tools::select_mcp_stores` exactly:
-    /// ids are unique and machine-generated, names are user-chosen and may
-    /// legitimately collide with some other store's id.
+    /// Id pass before name pass, matching `tools::select_mcp_stores` exactly
+    /// — both go through `crate::store_lookup::resolve_by_id_then_name`.
     fn resolve(&self, value: &str) -> Option<&UpstreamStore> {
-        self.upstream_stores
-            .iter()
-            .find(|s| s.id == value)
-            .or_else(|| self.upstream_stores.iter().find(|s| s.name == value))
+        crate::store_lookup::resolve_by_id_then_name(
+            &self.upstream_stores,
+            value,
+            |s| s.id.as_str(),
+            |s| s.name.as_str(),
+        )
     }
 
     /// Whether `id` is inside the scope.
@@ -156,8 +163,15 @@ fn scope_rejection(requested: &str, allowed: &str) -> CallToolResult {
 #[derive(Debug)]
 pub enum ProxyConnectError {
     /// The upstream could not be reached, or its handshake/`list_stores`
-    /// call failed -> `daemon_unreachable`, exit 5.
+    /// call failed for a reason other than authentication ->
+    /// `daemon_unreachable`, exit 5.
     Unreachable(anyhow::Error),
+    /// The upstream rejected the connect handshake itself with a 401 ->
+    /// unauthenticated, exit 6. Distinct from `Unreachable`: the daemon
+    /// answered, and answered that the caller has no valid credential, which
+    /// is a problem `localdb login`/`LOCALDB_API_KEY` fixes, not one that
+    /// goes away by retrying or restarting the daemon.
+    Unauthorized,
     /// A `--store` name the daemon does not have -> `store_not_found`, exit 3.
     StoreNotFound(String),
 }
@@ -166,12 +180,57 @@ impl std::fmt::Display for ProxyConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(e) => write!(f, "mcp proxy: upstream unreachable: {e}"),
+            Self::Unauthorized => write!(
+                f,
+                "mcp proxy: upstream rejected the connection as unauthenticated"
+            ),
             Self::StoreNotFound(name) => write!(f, "store not found: {name}"),
         }
     }
 }
 
 impl std::error::Error for ProxyConnectError {}
+
+/// Classify a failed upstream `initialize` handshake: a transport error
+/// whose cause, anywhere in its `source()` chain, is the upstream rejecting
+/// the connection as unauthenticated becomes [`ProxyConnectError::Unauthorized`];
+/// everything else (connection refused, timeout, protocol mismatch, ...)
+/// stays [`ProxyConnectError::Unreachable`].
+///
+/// Both transports this module builds (`RefreshingHttpClient` and the plain
+/// `reqwest::Client` from `StreamableHttpClientTransport::from_config`) have
+/// `StreamableHttpClient::Error = reqwest::Error`, so the transport-level
+/// error rmcp boxes into `ClientInitializeError::TransportError` is always a
+/// `StreamableHttpError<reqwest::Error>` — the same type
+/// `proxy::auth::is_auth_rejection` already classifies for a rejected
+/// in-session call.
+fn connect_error_from_initialize(error: rmcp::service::ClientInitializeError) -> ProxyConnectError {
+    let is_unauthorized = match &error {
+        rmcp::service::ClientInitializeError::TransportError { error: boxed, .. } => {
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(boxed.error.as_ref());
+            let mut found = false;
+            while let Some(current) = cause {
+                if let Some(http_error) = current.downcast_ref::<
+                    rmcp::transport::streamable_http_client::StreamableHttpError<reqwest::Error>,
+                >() {
+                    if auth::is_auth_rejection(http_error) {
+                        found = true;
+                        break;
+                    }
+                }
+                cause = current.source();
+            }
+            found
+        }
+        _ => false,
+    };
+
+    if is_unauthorized {
+        ProxyConnectError::Unauthorized
+    } else {
+        ProxyConnectError::Unreachable(error.into())
+    }
+}
 
 /// A `ServerHandler` that proxies every `tools/list`/`tools/call` request to
 /// an upstream rmcp server reached over Streamable HTTP — used when
@@ -219,13 +278,40 @@ impl ProxyHandler {
         daemon_base_url: &str,
         scope_names: &[String],
     ) -> Result<Self, ProxyConnectError> {
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(format!("{daemon_base_url}/mcp")),
-        );
-        let upstream = rmcp::model::ClientConfig::default()
-            .serve(transport)
-            .await
-            .map_err(|e| ProxyConnectError::Unreachable(e.into()))?;
+        Self::connect_with_auth(daemon_base_url, scope_names, None).await
+    }
+
+    pub async fn connect_with_auth(
+        daemon_base_url: &str,
+        scope_names: &[String],
+        bearer: Option<Arc<dyn BearerSource>>,
+    ) -> Result<Self, ProxyConnectError> {
+        let config =
+            StreamableHttpClientTransportConfig::with_uri(format!("{daemon_base_url}/mcp"));
+        let upstream = match bearer {
+            // No `auth_header` on the config: `RefreshingHttpClient` asks
+            // `source` for a token on every call instead, so a token
+            // refreshed mid-session (by this process or another one) is
+            // picked up on the very next request rather than only at the
+            // next `connect`.
+            Some(source) => {
+                let transport = StreamableHttpClientTransport::with_client(
+                    RefreshingHttpClient::new(source),
+                    config,
+                );
+                rmcp::model::ClientConfig::default()
+                    .serve(transport)
+                    .await
+                    .map_err(connect_error_from_initialize)?
+            }
+            None => {
+                let transport = StreamableHttpClientTransport::from_config(config);
+                rmcp::model::ClientConfig::default()
+                    .serve(transport)
+                    .await
+                    .map_err(connect_error_from_initialize)?
+            }
+        };
 
         if scope_names.is_empty() {
             return Ok(Self {
@@ -584,96 +670,4 @@ impl ServerHandler for ProxyHandler {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_scope(stores: &[(&str, &str)], allowed: &[&str]) -> ProxyScope {
-        ProxyScope {
-            upstream_stores: stores
-                .iter()
-                .map(|(id, name)| UpstreamStore {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                })
-                .collect(),
-            allowed_ids: allowed.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn canonicalize_accepts_in_scope_name_and_returns_its_id() {
-        let scope = test_scope(
-            &[("id-books", "books"), ("id-hydra", "hydra")],
-            &["id-books"],
-        );
-        assert_eq!(scope.canonicalize("books").unwrap(), "id-books");
-    }
-
-    #[test]
-    fn canonicalize_accepts_in_scope_id_verbatim() {
-        // #144's citation round-trip passes `store.id`, not the name.
-        let scope = test_scope(
-            &[("id-books", "books"), ("id-hydra", "hydra")],
-            &["id-books"],
-        );
-        assert_eq!(scope.canonicalize("id-books").unwrap(), "id-books");
-    }
-
-    #[test]
-    fn canonicalize_rejects_out_of_scope_store_by_name_and_by_id() {
-        let scope = test_scope(
-            &[("id-books", "books"), ("id-hydra", "hydra")],
-            &["id-books"],
-        );
-        assert!(scope.canonicalize("hydra").is_err());
-        assert!(scope.canonicalize("id-hydra").is_err());
-    }
-
-    #[test]
-    fn canonicalize_rejects_a_name_no_store_has() {
-        let scope = test_scope(&[("id-books", "books")], &["id-books"]);
-        assert!(scope.canonicalize("nonexistent").is_err());
-    }
-
-    /// The shadowing case: the caller passes a value that is an out-of-scope
-    /// store's **id** and simultaneously an in-scope store's **name**. The
-    /// upstream resolves ids first, so approving this on the name match would
-    /// hand back the out-of-scope store's data. Membership must therefore be
-    /// judged on what the *upstream* would resolve, not on the allowed subset.
-    #[test]
-    fn canonicalize_rejects_in_scope_name_shadowing_an_out_of_scope_id() {
-        let shadow = "shadow-value";
-        let scope = test_scope(
-            // `id-books` is named `shadow-value`; `shadow-value` is *also*
-            // the id of the out-of-scope `hydra`.
-            &[("id-books", shadow), (shadow, "hydra")],
-            &["id-books"],
-        );
-        assert!(
-            scope.canonicalize(shadow).is_err(),
-            "a value that resolves (id-first) to an out-of-scope store must be rejected \
-             even though it also matches an in-scope store's name"
-        );
-    }
-
-    #[test]
-    fn allowed_names_lists_only_in_scope_stores() {
-        let scope = test_scope(
-            &[("id-a", "alpha"), ("id-b", "beta"), ("id-c", "gamma")],
-            &["id-a", "id-c"],
-        );
-        assert_eq!(scope.allowed_names(), "alpha, gamma");
-    }
-
-    #[test]
-    fn scope_rejection_is_tool_level_invalid_request_naming_the_allowed_set() {
-        let result = scope_rejection("hydra", "books");
-        assert_eq!(result.is_error, Some(true));
-        let text = result.content[0].as_text().unwrap().text.clone();
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["error"]["code"], "invalid_request");
-        let message = parsed["error"]["message"].as_str().unwrap();
-        assert!(message.contains("hydra"), "{message}");
-        assert!(message.contains("books"), "{message}");
-    }
-}
+mod tests;

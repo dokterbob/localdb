@@ -26,7 +26,7 @@ use super::common::make_state;
 #[tokio::test]
 async fn get_or_build_fetchers_builds_once_across_repeated_calls() {
     let (_dir, state) = make_state().await;
-    let yaml = state.yaml_config().await;
+    let yaml = state.yaml_config().clone();
 
     let a = state.get_or_build_fetchers(&yaml).await.unwrap();
     let b = state.get_or_build_fetchers(&yaml).await.unwrap();
@@ -42,20 +42,19 @@ async fn get_or_build_fetchers_builds_once_across_repeated_calls() {
     );
 }
 
-/// A changed `http:` block (e.g. an operator editing
-/// `http.rate_limit.requests_per_second` and the daemon's config-file
-/// watcher reloading it) must miss the cache and rebuild a fresh pair —
-/// otherwise every job would keep pacing through a `HostLimiter` built
-/// from stale rate-limit settings indefinitely.
+/// A second call made with a changed `http:` block (a different
+/// `RawConfig`, e.g. a different `http.rate_limit.requests_per_second`)
+/// must miss the cache and rebuild a fresh pair — otherwise a caller
+/// passing different http settings on two calls would keep pacing through
+/// a `HostLimiter` built from the first call's settings.
 #[tokio::test]
 async fn get_or_build_fetchers_rebuilds_on_http_config_change() {
     let (_dir, state) = make_state().await;
-    let old_yaml = state.yaml_config().await;
+    let old_yaml = state.yaml_config().clone();
     let first = state.get_or_build_fetchers(&old_yaml).await.unwrap();
 
     let mut new_yaml = old_yaml.clone();
     new_yaml.http.max_retries = old_yaml.http.max_retries + 1;
-    state.reload_yaml_config(new_yaml.clone()).await;
     let second = state.get_or_build_fetchers(&new_yaml).await.unwrap();
 
     assert!(

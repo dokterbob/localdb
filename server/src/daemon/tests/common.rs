@@ -22,6 +22,7 @@ pub(in crate::daemon::tests) async fn make_state() -> (TempDir, AppState) {
         dir.path().join("models"),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();

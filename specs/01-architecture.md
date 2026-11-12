@@ -21,7 +21,7 @@ one).
 | `fetch`         | Owns the shared outgoing-HTTP layer (issue #207): retry via `backon` (429/408/5xx/timeout, honoring `Retry-After`), per-host pacing via `governor` (keyed on the destination host, loopback/LAN exempt), and the SSRF destination guard for third-party-discovered URLs. `ingest`'s `UrlIngestor` and `embed`'s hosted providers both build their `reqwest::Client` through it rather than constructing one directly.                                          |
 | `store-libsql`  | libsql implementation of `RetrievalStore` (DiskANN vectors + FTS5).                                                                                                                                                                                                                                                                                                                                                                                            |
 | `embed`         | `Embedder` implementations: local ONNX (fastembed-class), OpenAI-compatible HTTP provider, contextualized-embedding providers. Model download/cache management. Hosted providers consume `fetch`'s retry/`Retry-After` handling (reactive only — no proactive per-host pacing against paid APIs).                                                                                                                                                              |
-| `server`        | HTTP API (axum or similar), daemon runtime: file watching, URL refresh scheduling, job queue, unix socket.                                                                                                                                                                                                                                                                                                                                                     |
+| `server`        | HTTP API (axum or similar), daemon runtime: URL refresh scheduling, job queue, unix socket. Owns a debounced path-watching building block (`server::watcher`), not wired into any daemon code path.                                                                                                                                                                                                                                                            |
 | `mcp`           | MCP server over stdio, thin layer on `core` (or on the daemon client, see §3).                                                                                                                                                                                                                                                                                                                                                                                 |
 | `cli`           | Command implementations, thin layer on `core` / daemon client.                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `localdb` (bin) | Single binary with subcommands: `serve`, `mcp`, `init`, `index`, `search`, `status`, `store`, `source`. See [05-surfaces.md](05-surfaces.md).                                                                                                                                                                                                                                                                                                                  |
@@ -96,13 +96,14 @@ when one is running, CLI and MCP become thin clients of its HTTP API.
   via `BEGIN IMMEDIATE`), while reads are served from a small pool of read-only connections that
   never queue behind a writer. Cross-process coordination is unchanged — WAL plus `busy_timeout`
   remains the sole primitive between separate OS processes.
-- **Daemon-exclusive capabilities:** continuous file watching, scheduled URL refresh, the HTTP API
-  and (later) web UI, background job queue. Embedded mode does one-shot equivalents (`localdb index`
-  = scan now; no watching).
+- **Daemon-exclusive capabilities:** scheduled URL refresh, the HTTP API and (later) web UI,
+  background job queue. Embedded mode does one-shot equivalents (`localdb index` = scan now).
+  Watching source directories for changes is not implemented on either mode — a `file` source only
+  re-indexes on an explicit `localdb index`.
 
 **Rationale:** `localdb search foo` must work seconds after install with nothing running — this is
 the local-first promise. **Rejected:** daemon-always — heavier install, worse first-run;
-pure-embedded with no daemon — loses watching, refresh, and the web surface for home-server mode.
+pure-embedded with no daemon — loses refresh and the web surface for home-server mode.
 
 ## 4. Stores vs. backends
 
@@ -141,7 +142,7 @@ and specified in [06-roadmap.md](06-roadmap.md) §3, but every MVP component mus
 
 **Decision:** async on **tokio** for all I/O and orchestration — but not literally everything.
 
-- **Async:** the daemon (HTTP API, file watching, schedulers, job queue), the `RetrievalStore` and
+- **Async:** the daemon (HTTP API, refresh scheduler, job queue), the `RetrievalStore` and
   `Embedder` traits (their backends are inherently async: libsql's Rust API is async, hosted
   providers are HTTP), URL fetching, and surface plumbing.
 - **Not async:** CPU-bound work — ONNX inference, extraction/parsing, chunking, blake3 hashing —
@@ -151,7 +152,7 @@ and specified in [06-roadmap.md](06-roadmap.md) §3, but every MVP component mus
 - **Embedded mode:** one-shot CLI/MCP commands spin up a tokio runtime per invocation; the cost is
   negligible against model load and index I/O.
 
-**Rationale:** the daemon needs real concurrency (watchers + jobs + HTTP) regardless, and the
+**Rationale:** the daemon needs real concurrency (scheduler + jobs + HTTP) regardless, and the
 storage/embedding dependencies are async-native — one execution model everywhere beats a sync core
 wrapped in adapter shims. **Rejected:** fully synchronous core with hand-rolled threads (fights the
 storage backend's async API, reinvents the daemon's scheduling); async-everything including CPU work

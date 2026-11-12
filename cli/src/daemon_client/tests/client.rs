@@ -230,10 +230,15 @@ async fn walk_daemon_pages_joins_cursor_with_ampersand_when_path_already_has_a_q
     let base_url = format!("http://{addr}");
 
     let mut total_items = 0;
-    walk_daemon_pages(&base_url, "/v1/things?source=abc", |items| {
-        total_items += items.len();
-        false
-    })
+    walk_daemon_pages(
+        &crate::tests::context(),
+        &base_url,
+        "/v1/things?source=abc",
+        |items| {
+            total_items += items.len();
+            false
+        },
+    )
     .await
     .unwrap();
 
@@ -262,9 +267,14 @@ async fn walk_daemon_pages_joins_cursor_with_question_mark_when_path_has_no_quer
     });
     let base_url = format!("http://{addr}");
 
-    walk_daemon_pages(&base_url, "/v1/things", |_items| false)
-        .await
-        .unwrap();
+    walk_daemon_pages(
+        &crate::tests::context(),
+        &base_url,
+        "/v1/things",
+        |_items| false,
+    )
+    .await
+    .unwrap();
 
     let requests = seen.lock().await;
     assert_eq!(requests.len(), 2);

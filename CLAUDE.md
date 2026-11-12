@@ -51,7 +51,7 @@ to the short directory name, so imports in code stay unprefixed (`use extract::�
 | `ingest`       | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O                                                                                                                                                                                                                                                   |
 | `localdb`      | Binary entry point; wires all subcommands                                                                                                                                                                                                                                                                                                                                                                               |
 | `mcp`          | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores`, `list_documents`                                                                                                                                                                                                                                                           |
-| `server`       | HTTP daemon (`/v1` axum routes), background jobs, file-watch, discovery-socket lifecycle                                                                                                                                                                                                                                                                                                                                |
+| `server`       | HTTP daemon (`/v1` axum routes), background jobs, discovery-socket lifecycle; owns a debounced path-watching building block (`watcher`) not wired into any daemon code path                                                                                                                                                                                                                                             |
 | `store-libsql` | `RetrievalStore` impl: libsql (DiskANN vectors + FTS5 BM25); RRF fusion lives in `core`, not here                                                                                                                                                                                                                                                                                                                       |
 
 **Design authority is `specs/`** — read the relevant spec before changing behavior; fix the spec
@@ -73,8 +73,8 @@ first if it is wrong.
 - **No domain logic in surface crates** (`cli`, `mcp`, `server`) — see
   `specs/01-architecture.md §1`.
 - **Exit codes are stable API**: 0 ok, 1 internal, 2 invalid usage/config, 3 not found, 4
-  conflict/locked, 5 unavailable — see `specs/05-surfaces.md §5`. Do not add new codes without a
-  spec change.
+  conflict/locked, 5 unavailable, 6 unauthorized/forbidden — see `specs/05-surfaces.md §5`. Do not
+  add new codes without a spec change.
 - **Async**: the project's async model is documented in `specs/01-architecture.md §6` — follow it
   for all new async code.
 - **No issue references in code comments.** An issue closes and the comment becomes a pointer to
@@ -122,8 +122,11 @@ first if it is wrong.
   `localdb index` submits a job to the daemon and attaches to its live progress via SSE
   (`GET /v1/jobs/{id}/events`, issue #83, falling back to polling), rendering an identical
   summary/`--json`/`--strict` to embedded mode; `--delete` works daemon-attached too. **Stopping the
-  daemon before running `localdb index` is no longer required.** Still experimental as a surface —
-  no auth. See `specs/05-surfaces.md §2-3` and `docs/architecture.md#known-gaps`.
+  daemon before running `localdb index` is no longer required.** The daemon enforces authentication
+  (`server.auth`: `auto` by default, enforcing iff the bound address is non-loopback; `required`
+  always enforces; `off` is a hard startup error combined with a non-loopback bind) over `/v1/*` and
+  `/mcp` — bearer tokens, principals, roles and per-store `StoreGrant`s. Still experimental as a
+  surface otherwise. See `specs/05-surfaces.md §2-3` and `docs/architecture.md#known-gaps`.
 - **Schema changes require a chain entry AND a `create_schema` fold-in**: every migration is written
   twice — once in `store-libsql/src/migrations/chain.rs`'s `migrations()`, once folded into
   `schema::create_schema` — the drift-guard test

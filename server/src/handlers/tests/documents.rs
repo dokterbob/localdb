@@ -1,3 +1,4 @@
+use super::common::{make_state_with_auth_mode, seed_user_with_key};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -53,8 +54,8 @@ async fn get_document_returns_record_when_indexed() {
     .await;
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -188,8 +189,8 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
         .unwrap();
 
     let app = crate::daemon::build_router(
-        state,
-        vec![],
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
         vec![],
     );
@@ -651,4 +652,302 @@ async fn get_document_unknown_store_name_in_query_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = json_body(resp.into_body()).await;
     assert_eq!(body["code"], "store_not_found");
+}
+
+/// A miss on an unscoped lookup (no `?store=`) must be a plain 404 even when
+/// the document exists in a store the caller cannot read — scanning every
+/// store to decide between 404 and 403 would turn the miss into an oracle
+/// that confirms the document (and the private store's name) exist.
+#[tokio::test]
+async fn get_document_without_store_grant_and_no_store_param_returns_404_not_403() {
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        SeedChunkInput {
+            chunk_id: "chunk-secret-1",
+            doc_id: "doc-secret-1",
+            text: "confidential contents the ungranted member must never see",
+            uri: "file:///secret.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let bearer =
+        seed_user_with_key(&state, "member-no-grant", localdb_core::auth::Role::Member).await;
+
+    state
+        .update_store("store-shared", Some("shared"))
+        .await
+        .unwrap();
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-secret-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "resource_not_found");
+    let body_text = body.to_string();
+    assert!(
+        !body_text.contains("store-shared"),
+        "a 404 on an unscoped miss must not name the private store: {body_text}"
+    );
+}
+
+/// The explicit-store counterpart: naming an unreadable store with `?store=`
+/// still gets 403 — only the scan on an *unscoped* miss was the leak.
+#[tokio::test]
+async fn get_document_explicit_unreadable_store_still_returns_403() {
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        SeedChunkInput {
+            chunk_id: "chunk-secret-2",
+            doc_id: "doc-secret-2",
+            text: "confidential contents the ungranted member must never see",
+            uri: "file:///secret2.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let bearer = seed_user_with_key(
+        &state,
+        "member-no-grant-2",
+        localdb_core::auth::Role::Member,
+    )
+    .await;
+
+    state
+        .update_store("store-shared", Some("shared"))
+        .await
+        .unwrap();
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-secret-2?store=store-shared")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "forbidden");
+}
+
+/// P1 regression: a member who *can* read some stores, but whose readable
+/// stores hold no document under this id, must still get a plain 404 even
+/// when the id exists in two *other* stores the member cannot read — the
+/// bug scanned every store (including ones outside the caller's grants) to
+/// decide between "not found" and "ambiguous", so a hidden-but-ambiguous id
+/// surfaced as `400 invalid_request` instead, and its message named the
+/// document as existing elsewhere. This is the two-or-more-readable-stores
+/// case (`readable_store_names` returns 2 names, no `?store=` param); the
+/// zero-readable-stores case is already covered by
+/// `get_document_without_store_grant_and_no_store_param_returns_404_not_403`.
+#[tokio::test]
+async fn get_document_hidden_ambiguity_in_unreadable_stores_returns_404_not_400() {
+    use localdb_core::types::StoreVisibility;
+
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    // Two stores the member CAN read, neither holding the id in question.
+    seed_chunk_in_store(
+        &state,
+        "store-readable-1",
+        SeedChunkInput {
+            chunk_id: "chunk-readable-1",
+            doc_id: "doc-readable-1",
+            text: "unrelated content",
+            uri: "file:///r1.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+    seed_chunk_in_store(
+        &state,
+        "store-readable-2",
+        SeedChunkInput {
+            chunk_id: "chunk-readable-2",
+            doc_id: "doc-readable-2",
+            text: "unrelated content",
+            uri: "file:///r2.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    // Two stores the member CANNOT read, both holding the SAME id.
+    seed_chunk_in_store(
+        &state,
+        "store-hidden-1",
+        SeedChunkInput {
+            chunk_id: "chunk-hidden-1",
+            doc_id: "doc-ambiguous",
+            text: "hidden content one",
+            uri: "file:///h1.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+    seed_chunk_in_store(
+        &state,
+        "store-hidden-2",
+        SeedChunkInput {
+            chunk_id: "chunk-hidden-2",
+            doc_id: "doc-ambiguous",
+            text: "hidden content two",
+            uri: "file:///h2.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let admin = state
+        .auth()
+        .create_user("admin-granter-2", localdb_core::auth::Role::Admin)
+        .await
+        .unwrap();
+    let member = state
+        .auth()
+        .create_user("member-partial-grant", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    for name in ["store-readable-1", "store-readable-2"] {
+        state.update_store(name, Some("shared")).await.unwrap();
+        state
+            .auth()
+            .grant_store(name, StoreVisibility::Shared, &member.id, &admin.id)
+            .await
+            .unwrap();
+    }
+    // store-hidden-1/2 stay private and ungranted.
+    let bearer = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-ambiguous")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "resource_not_found");
+    let body_text = body.to_string();
+    assert!(
+        !body_text.contains("store-hidden"),
+        "a 404 must not name either hidden store, nor hint that the id exists elsewhere: \
+         {body_text}"
+    );
+}
+
+/// Positive counterpart to `get_document_without_store_grant_returns_403`:
+/// a `Role::Member` principal *with* a grant on the document's owning
+/// `shared` store gets the document back, status `200`.
+#[tokio::test]
+async fn get_document_with_store_grant_returns_200() {
+    use localdb_core::types::StoreVisibility;
+
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        SeedChunkInput {
+            chunk_id: "chunk-visible-1",
+            doc_id: "doc-visible-1",
+            text: "contents a granted member may read",
+            uri: "file:///visible.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let admin = state
+        .auth()
+        .create_user("admin-granter", localdb_core::auth::Role::Admin)
+        .await
+        .unwrap();
+    let member = state
+        .auth()
+        .create_user("member-with-grant", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    state
+        .auth()
+        .grant_store(
+            "store-shared",
+            StoreVisibility::Shared,
+            &member.id,
+            &admin.id,
+        )
+        .await
+        .unwrap();
+    let bearer = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    state
+        .update_store("store-shared", Some("shared"))
+        .await
+        .unwrap();
+    let app = crate::daemon::build_router(
+        state.clone(),
+        std::sync::Arc::new(crate::mcp_bridge::AppStateStoreProvider::new(state)),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-visible-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["id"], "doc-visible-1");
 }

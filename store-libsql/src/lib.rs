@@ -1,3 +1,4 @@
+mod auth;
 mod backend;
 mod connection;
 pub mod migrations;
@@ -6,6 +7,7 @@ mod schema;
 mod tenant;
 mod vectors;
 
+pub use auth::LibsqlAuthStore;
 pub use backend::SqliteBackend;
 
 // Maintenance API for the CLI's `db migrate` / `db downgrade` / `db status`

@@ -4,6 +4,7 @@
 //! trait, the `Embedder` trait, the `Ingestor` trait, and the shared error
 //! taxonomy live here.
 
+pub mod auth;
 pub mod backend;
 pub mod block;
 pub mod blocking;
@@ -82,9 +83,9 @@ pub use store::{
     StaleFeedResource, StoreStats,
 };
 pub use types::{
-    validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Chunk, ChunkingConfig,
-    Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,
-    IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span,
-    Store, StoreVisibility,
+    validate_dc_meta_key, validate_msg_meta_key, BackendConfig, Chunk, ChunkingConfig, Document,
+    EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState, IndexJobStats,
+    IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span, Store,
+    StoreVisibility,
 };
 pub use uri::Uri;

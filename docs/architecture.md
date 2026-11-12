@@ -99,10 +99,11 @@ to the HTTP API (thin-client mode) or opens the store in-process (embedded mode)
 ### `server`
 
 The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon unix socket for
-discovery, runs the file-watcher (`notify`), the URL refresh scheduler, and the background job
-queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is
-visible. Multi-process is the first-class concurrency model — the daemon is one writer among peers
-(CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
+discovery, runs the URL refresh scheduler and the background job queue. Watching source directories
+for changes is not implemented — sources refresh via `localdb index` or the URL scheduler. Opens the
+same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is visible.
+Multi-process is the first-class concurrency model — the daemon is one writer among peers (CLI
+sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
 `busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
 (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
 (`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a stub;
@@ -208,6 +209,107 @@ database; embeddings come from the configured embedder, defaulting to the local 
 configuration is needed for the common case. See
 [specs/01-architecture.md](https://github.com/dokterbob/localdb/blob/main/specs/01-architecture.md)
 §3.
+
+---
+
+## Authentication {#authentication}
+
+The daemon's HTTP surface (`/v1/*` and `/mcp`) is bearer-token authenticated once auth is _enforced_
+— controlled by `server.auth: auto | required | off` (default `auto`, which enforces iff the daemon
+is bound to a non-loopback address). A loopback-bound daemon under `auto`, and every daemonless
+CLI/embedded-MCP invocation, remain unauthenticated by design: the same trust boundary as the
+on-disk files themselves. See
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3/§3.1
+for the full decision matrix.
+
+**Bootstrap.** The first `localdb serve` with auth enforced and no admin yet mints a one-time setup
+code. Presentation is the CLI's job, not the daemon's: `localdb serve` prints it to stdout right
+after the `daemon listening on http://…` line, alongside the ready-to-run
+`localdb login --url http://<addr> --setup-code <code>`, and `serve --json` carries it as the
+`setup_code` field of the `listening` object. Paste the code into the browser consent page
+`/authorize` opens, or pass it via `localdb login --setup-code <code>`, to create the first admin
+account. A singleton `pending_bootstrap` record keeps interrupted onboarding recoverable until an
+issued admin credential authenticates a protected request. Retrying reuses the same admin; restart
+rotates the in-memory setup code. Established accounts do not reopen setup. Minting the code lives
+in the shared auth service, independent of terminal, browser, or future native UI presentation —
+only how it's shown is the CLI's choice.
+
+**Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a blake3
+hash. A login session mints an access token (1h) and a refresh token (30d) sharing one rotation
+family; refresh tokens rotate on every use with reuse detection — presenting an already-rotated
+refresh token revokes the whole _compromise closure_ of its family: every access token issued under
+that session (not just later rotations), any API key minted while authenticated by it, and —
+transitively — any other session created by authorizing an `/authorize` request with a credential
+from that family, plus everything minted under that descendant session in turn. Every family swept
+this way is also recorded as compromised, so a token insert naming one as its ancestor is refused
+rather than slipping in after the fact. Logout revokes only the session's own access and refresh
+tokens, with no such marker. The sweep covers credentials only, not administrative actions taken
+with the session: users and invites it created, grants it changed and users it deleted are left as
+they are. A user's deletion removes that user's token rows, and with them the ancestry links they
+carried, so credentials derived through a deleted user's session are out of the sweep's reach. After
+a compromised _admin_ session, review users, keys and invites as well. API keys
+(`localdb key create`) share the same token table, never expire by default, and track
+`last_used_at`.
+
+**OAuth2 authorization-code + PKCE (S256)** is the flow behind `GET/POST /authorize` (an inline-HTML
+consent page) and `POST /token`. `POST /revoke` implements RFC 7009 (always `200`, even for an
+unknown token).
+
+**Zero-config MCP client onboarding (RFC 9728 + 8414 + 7591).** A stock MCP client (Claude Code and
+similar) pointed at `http://host:port/mcp` with no static header can onboard with no manual
+configuration: a `401` on any protected route carries
+`WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource"`; that
+protected-resource metadata document (RFC 9728) points at the authorization server; the
+authorization-server metadata document (RFC 8414, `/.well-known/oauth-authorization-server`)
+advertises `/register`, `/authorize`, and `/token`; `POST /register` (RFC 7591 Dynamic Client
+Registration) mints the client a `client_id` it then uses to run the ordinary code+PKCE flow.
+`<base>` is `server.public_url` when configured (set this behind a TLS-terminating reverse proxy —
+see [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §1) or,
+otherwise, derived from the request's own `Host` header after strict sanitization
+(`server::auth::base_url`) — the header is attacker-influencable on these unauthenticated routes, so
+a malformed one is rejected rather than ever echoed back.
+
+Client redirect-uri policy differs by origin: the built-in `localdb-cli` client keeps the RFC 8252
+§7.3 loopback-any-port exception (`http://127.0.0.1:<any port>/...` /
+`http://localhost:<any port>/...`, since the CLI binds a fresh ephemeral port per login attempt); a
+client created via `/register` is matched by **exact** redirect_uri only — no loopback-any-port
+leniency — and its `redirect_uris` must each be either an `https://` URL or a loopback `http://` URL
+(custom URI schemes such as `myapp://callback` are rejected; see
+`core::auth::validate_registration_redirect_uri`'s doc comment for the rationale). Public clients
+only — DCR never mints a `client_secret`.
+
+**Authorization (D7).** Every user has a role, `admin` or `member`. Admins see and manage every
+store; members see/search only `shared`-visibility stores they hold an explicit grant for
+(`localdb store grant/revoke`). `private` stores are always admin-only, ungrantable. Invites
+(`localdb invite create/list/revoke/requests/approve/deny`) let a new user join without an admin
+creating their account directly: `open`-mode invites mint a user + API key immediately on
+redemption; `closed`-mode invites file a pending access request an admin must approve before a
+credential is minted.
+
+**CLI identity.** `localdb login` drives the browser OAuth flow (`--invite <token>` redeems an
+invite instead — no browser round trip) and caches the resulting bearer in `credentials.json` next
+to `config.yaml`
+([specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §6);
+`localdb logout` revokes it and clears the cache only after successful revocation; failures retain
+the cache for retry. `localdb status` shows the caller's identity and cached token expiry once
+authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached credential for a
+single invocation and is never refreshed. Every daemon-bound request refreshes an expired, or
+about-to-expire, cached access token before sending it (`cli::daemon_client::fresh_bearer_for_url`),
+rather than only after a `401`; a request still retries once more on an outright `401` as a
+backstop. Exit code `6` (new) is reserved for `unauthorized`/`forbidden`.
+
+**Behavior changes worth flagging to anyone tracking this branch:**
+
+- **Config hot-reload was removed.** Earlier builds re-read `config.yaml` on file change while the
+  daemon ran; as of the auth work, config is read once at process startup only
+  ([specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §5) — a
+  change to the file takes effect on the next restart, not live.
+- **Pre-migration-list unified databases now hard-error at startup** instead of being silently
+  reinitialized: a database whose schema version has no migration path gets `invalid_config`
+  instructing the operator to recreate it or restore from backup, and the file is left completely
+  untouched before that error is raised
+  ([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+  §9).
 
 ---
 
@@ -424,11 +526,18 @@ folded into `policy_version`. The per-file chunk preset is determined determinis
 filename/MIME type at index time, so re-indexing existing content with the new code produces correct
 results without a policy-hash change.
 
-**6. `/mcp` (HTTP) doesn't see stores added after daemon startup.**
-`server::mcp_bridge::build_available_stores` snapshots the daemon's store list once, at
-`start_daemon` time — a store added later via `POST /v1/stores` is invisible over MCP until the
-daemon restarts. Root cause: `rmcp`'s Streamable HTTP service factory is synchronous, so there's no
-hook to redo the async `AppState` lookup per session without an ugly blocking bridge. See
+**6. Resolved as of T2 (2026-07-07): `/mcp` now sees stores added after daemon startup.**
+`McpHandler` no longer holds a `Vec<AvailableStore>` snapshot taken once at `start_daemon` time. It
+instead holds a `StoreProvider` (`mcp::store_provider`, design decision D12) —
+`server::mcp_bridge::AppStateStoreProvider` for the daemon-hosted `/mcp` route,
+`cli::app_db::AppDbStoreProvider` for embedded-stdio `localdb mcp` — that re-derives the store list
+from the database on every tool call. A store added later via `POST /v1/stores` (or a concurrent
+`localdb store add`) is visible on the very next `search`/`get_document`/`get_chunks`/`list_stores`
+call, no restart needed. This was previously blocked by the mistaken belief that `rmcp`'s
+synchronous Streamable HTTP service-factory closure prevented any async re-resolution; in fact that
+closure only constrains _construction-time_ lookups (building a new `McpHandler` per session) — an
+individual tool method's own `async fn` body is unaffected, which is exactly where
+`StoreProvider::available_stores().await` is now called. See
 [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine).
 
 **7. MCP `--store` scoping is a guardrail, not a security boundary.** `localdb mcp --store <name>`
@@ -438,12 +547,17 @@ it). In proxied mode the scope is enforced per request, on the `stores`/`store` 
 because `rmcp`'s Streamable HTTP service factory is synchronous and has no access to the request —
 so there is no transport-level channel for a per-connection scope (same root cause as gap 6 above).
 
-The residual gap is containment, not enforcement: the daemon's `/mcp` route is loopback and
-**unauthenticated**, so any process that can open a socket can bypass `localdb mcp` and talk to it
-unscoped. This stops an agent reading another project's docs by accident; it does not contain a
-hostile one. Closing it needs daemon-side auth, which v1 does not have. Embedded mode has no such
-endpoint, so there the scope is as strong as the process boundary. See
-[docs/mcp.md](mcp.md#store-scoping) and
+`--store` is scoping, not a security boundary: a caller that reaches `/mcp` directly sees every
+store its own credential is authorized for, regardless of what any `localdb mcp --store` proxy in
+front of it narrowed. Real containment is the daemon's own authorization (§3.1): once `server.auth`
+enforces (any non-loopback bind under `auto`, or `required`), reaching `/mcp` directly still
+requires a valid bearer token, and the tool results it returns are filtered to that principal's
+store access — admins see every store, members only the `shared` stores they hold a `StoreGrant`
+for. On a loopback bind under the default `auto`, `/mcp` is unauthenticated by design, the same
+trust boundary as every other daemonless command — so on that bind, any local process can still open
+the socket and bypass `localdb mcp --store`'s narrowing, the same way it could open the on-disk
+database directly. Embedded mode has no such endpoint, so there the scope is as strong as the
+process boundary. See [docs/mcp.md](mcp.md#store-scoping) and
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2.1.
 
 **8. `extractor_version` is dead code; PDF reindex relies on the content hash.** The
@@ -731,3 +845,12 @@ recommendation:
   already decided this; the implementation is what is deferred.
 - **[#268](https://github.com/dokterbob/localdb/issues/268)**: allowed character set for store names
   beyond traversal-safety.
+
+### Authentication
+
+Loopback binds default to local trust. On non-loopback binds, `server.auth: auto` requires bearer
+authentication; `required` enforces it on every bind, and `off` refuses non-loopback binds. Use
+`localdb login` for browser login, or an API key. Admins manage users, keys, grants, invites,
+stores, sources and jobs. Members read only shared stores they have been granted. HTTP and MCP apply
+the same policy. Configuration is loaded at startup; restart the daemon to apply edits. See
+[the HTTP API](http-api.md) for the authentication endpoints and flows.

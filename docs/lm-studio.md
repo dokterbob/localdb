@@ -2,12 +2,12 @@
 
 LM Studio can be the AI app you chat with and the MCP client that searches localdb. In this setup,
 localdb indexes and searches your files with its local embedding model, and LM Studio runs the
-language model that reads the retrieved excerpts and writes an answer. Both run on your machine;
-you do not need an API key or a cloud model subscription.
+language model that reads the retrieved excerpts and writes an answer. Both run on your machine; you
+do not need an API key or a cloud model subscription.
 
 LM Studio is available for macOS, Windows, and Linux; check its
-[system requirements](https://lmstudio.ai/docs/app/system-requirements) for supported hardware.
-This walkthrough targets macOS Apple Silicon and Linux, the platforms with
+[system requirements](https://lmstudio.ai/docs/app/system-requirements) for supported hardware. This
+walkthrough targets macOS Apple Silicon and Linux, the platforms with
 [published localdb binaries](install.md#supported-platforms). It does not assume a native Windows
 localdb installation.
 
@@ -57,8 +57,8 @@ Find the installed binary's absolute path:
 which localdb
 ```
 
-In LM Studio, open the **Program** tab in the right sidebar, then **Install → Edit mcp.json**.
-Add the `localdb` entry under `mcpServers`, preserving any existing entries. A complete minimal file
+In LM Studio, open the **Program** tab in the right sidebar, then **Install → Edit mcp.json**. Add
+the `localdb` entry under `mcpServers`, preserving any existing entries. A complete minimal file
 looks like this; replace `/absolute/path/to/localdb` with the path printed above:
 
 ```json
@@ -73,26 +73,26 @@ looks like this; replace `/absolute/path/to/localdb` with the path printed above
 ```
 
 Save the file and enable localdb's tools for your chat. See LM Studio's
-[MCP setup instructions](https://lmstudio.ai/docs/app/mcp) for its configuration UI.
-LM Studio launches `localdb mcp` as a local subprocess and talks to it over stdio. Neither
-`localdb serve` nor LM Studio's HTTP API server is needed. If you use a custom localdb configuration,
-append `"--config", "/absolute/path/to/config.yaml"` to `args`.
+[MCP setup instructions](https://lmstudio.ai/docs/app/mcp) for its configuration UI. LM Studio
+launches `localdb mcp` as a local subprocess and talks to it over stdio. Neither `localdb serve` nor
+LM Studio's HTTP API server is needed. If you use a custom localdb configuration, append
+`"--config", "/absolute/path/to/config.yaml"` to `args`.
 
 ## 4. Ask a question and verify tool use
 
 Start a chat with your downloaded model and try:
 
-> Use localdb to list the available stores, then search my notes for [a topic you indexed].
-> Answer from the search results and cite the source paths. If nothing matches, say so.
+> Use localdb to list the available stores, then search my notes for [a topic you indexed]. Answer
+> from the search results and cite the source paths. If nothing matches, say so.
 
-Check that the chat actually calls `list_stores` and `search` and that the returned paths match
-your notes. A plausible answer alone does not prove the model searched. The `--store default`
-argument limits which store this connection exposes; repeat `--store` to include another one.
+Check that the chat actually calls `list_stores` and `search` and that the returned paths match your
+notes. A plausible answer alone does not prove the model searched. The `--store default` argument
+limits which store this connection exposes; repeat `--store` to include another one.
 
-If localdb fails to start, check the absolute binary path, config path, and store name. If tools
-are available but the model never calls them, check that they are enabled and that the loaded
-model supports tool calling. For context overflow, ask for fewer search results or short excerpts
-instead of entire documents.
+If localdb fails to start, check the absolute binary path, config path, and store name. If tools are
+available but the model never calls them, check that they are enabled and that the loaded model
+supports tool calling. For context overflow, ask for fewer search results or short excerpts instead
+of entire documents.
 
 ## 5. Verify offline operation
 

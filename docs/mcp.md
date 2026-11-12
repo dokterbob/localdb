@@ -1,13 +1,13 @@
 # MCP Server
 
 localdb ships an MCP server that exposes your indexed stores to an AI app such as Claude Desktop,
-Claude Code, Codex, or LM Studio. That app is the **MCP client**: it calls localdb's tools and passes
-the results to the model answering your questions. For a local model walkthrough, see
+Claude Code, Codex, or LM Studio. That app is the **MCP client**: it calls localdb's tools and
+passes the results to the model answering your questions. For a local model walkthrough, see
 [Chat with your notes locally using LM Studio](lm-studio.md).
 
-The server is built on the official [`rmcp`](https://docs.rs/rmcp) SDK
-and speaks the [MCP 2025-06-18 protocol](https://modelcontextprotocol.io/). Two transports are
-available, both serving the same five read-only tools:
+The server is built on the official [`rmcp`](https://docs.rs/rmcp) SDK and speaks the
+[MCP 2025-06-18 protocol](https://modelcontextprotocol.io/). Two transports are available, both
+serving the same five read-only tools:
 
 - **Stdio** (`localdb mcp`) — the default, no daemon required.
 - **HTTP** (`/mcp`, mounted on a running `localdb serve` daemon) — for connecting a remote MCP
@@ -112,8 +112,8 @@ server reachable over Tailscale, or a NAS on your LAN.
 
 1. Start the daemon bound to an address reachable from the client machine (not just `127.0.0.1`).
    Binding to a specific non-loopback address — a Tailscale IP, a LAN IP — is a deliberate,
-   supported trust decision; see [docs/http-api.md](http-api.md#trust-model) for the full trust
-   model and how to configure it in `config.yaml`.
+   supported trust decision; see [docs/http-api.md](http-api.md#trust-model-and-authentication) for
+   the full trust model and how to configure it in `config.yaml`.
 
    ```yaml
    server:
@@ -135,8 +135,47 @@ deliberately-chosen non-loopback bind is added to the allowlist alongside `rmcp`
 entirely, since it already accepts connections from any network. See
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2.)
 
-**Known v1 limitation:** the HTTP `/mcp` route snapshots the daemon's stores once at startup — a
-store added later via `POST /v1/stores` won't appear over MCP until the daemon restarts.
+Store resolution over `/mcp` is realtime: a store added later via `POST /v1/stores` appears on the
+very next MCP call (`search`, `get_document`, `get_chunks`, `list_stores`) — no daemon restart
+needed.
+
+### Authentication
+
+A daemon bound to a non-loopback address enforces bearer-token auth automatically (see
+[docs/http-api.md](http-api.md#trust-model-and-authentication) for the full mode matrix) — `/mcp` is
+one of the protected routes. Two ways to connect:
+
+**Zero-config discovery (recommended for MCP clients that support it).** Point the client at `/mcp`
+with no credential at all. A stock MCP client (Claude Code and similar) follows the standard chain
+automatically: the first request gets `401` with
+`WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource"`; the
+client fetches that document, follows it to `/.well-known/oauth-authorization-server`, registers
+itself via `POST /register` (RFC 7591 Dynamic Client Registration — no client secret, since this
+only ever mints public clients), and completes the ordinary authorization-code + PKCE flow, opening
+a browser for the human to approve. No token needs to be typed in anywhere. See
+[docs/http-api.md](http-api.md#oauth-discovery--dynamic-client-registration) for the full protocol
+walk-through and the exact JSON shapes.
+
+**Static bearer header (for clients without OAuth discovery support, or scripted/headless use).**
+Mint a credential ahead of time — `localdb login` (interactive browser flow) or
+`localdb key create --user <name>` (long-lived API key, no browser) — and pass it as a static header
+when registering the MCP server:
+
+```
+claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
+  --header "Authorization: Bearer ldb_..."
+```
+
+Any MCP client that lets you attach a static header to an HTTP transport works the same way.
+
+**The stdio side never asks for a token.** The MCP client that launches `localdb mcp` over stdio
+sends no credentials; stdio access to the local process is trusted as local-files-equivalent, the
+same trust boundary as every other daemonless CLI command. Embedded, that is the whole story.
+Proxied to a daemon (see [Daemon-proxied stdio](#daemon-proxied-stdio) below), the proxy itself
+authenticates upstream to `/mcp` with the credential `localdb login` saved (or `LOCALDB_API_KEY`)
+whenever the daemon enforces `server.auth`. It refreshes an expired or rejected access token
+mid-session, so a long-running proxy keeps working across token lifetimes and picks up a token
+another `localdb` process refreshed.
 
 ---
 
@@ -199,12 +238,13 @@ While the tool set is fixed at five read-only tools, a scoped session relays onl
 other tool name is rejected, so a future mutating tool cannot slip through unscoped on the day it
 lands.
 
-> **This is scoping, not a security boundary.** The daemon's `/mcp` route is loopback and
-> **unauthenticated**: anything that can open a socket can bypass `localdb mcp` entirely and talk to
-> the unscoped endpoint directly. `--store` stops an agent from _accidentally_ reading another
-> project's docs; it does not contain a hostile one. Real containment needs daemon-side
-> authentication, which does not exist in v1. In embedded mode there is no such endpoint, so the
-> scope is as strong as the process boundary.
+> **This is scoping, not a security boundary.** `--store` is enforced by `localdb mcp`, not the
+> daemon: a caller that reaches the daemon's `/mcp` route directly sees every store its own
+> credential is authorized for. On an open-mode daemon (the loopback default) that is every store,
+> to anything that can open a socket. `--store` stops an agent from _accidentally_ reading another
+> project's docs; it does not contain a hostile one. Real containment is the daemon's own
+> authorization (`server.auth` plus per-member store grants). In embedded mode there is no such
+> endpoint, so the scope is as strong as the process boundary.
 
 ---
 
@@ -855,6 +895,15 @@ rm <data_dir>/daemon.sock
 
 After removing the socket, `localdb status` should report `daemon: not running (embedded mode)` and
 the MCP server will start normally.
+
+### `not authenticated; run localdb login or set LOCALDB_API_KEY` (exit 6)
+
+When `localdb mcp` proxies to a daemon running with `server.auth: required`, it sends whatever
+credential it has — a cached token from `localdb login`, or `LOCALDB_API_KEY` — on the connect
+handshake itself. If the daemon rejects that handshake with `401`, `localdb mcp` exits 6 with this
+message rather than the generic "daemon is unreachable" (exit 5): the daemon answered, and answered
+that the connection has no valid credential, which `localdb login` or `LOCALDB_API_KEY` fixes — not
+a reachability problem a retry or a daemon restart would.
 
 ### A remote HTTP MCP client reports "needs authentication"
 

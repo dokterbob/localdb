@@ -19,6 +19,10 @@ pub struct CliContext {
     pub daemon_url: Option<String>,
     /// Config file path from `LOCALDB_CONFIG` env var, read once at startup.
     pub config_env: Option<PathBuf>,
+    /// Bearer secret from `LOCALDB_API_KEY`, read once at startup. Overrides
+    /// any `credentials.json` entry for daemon-attached requests
+    /// (specs/03-config.md §6).
+    pub api_key: Option<String>,
 }
 
 /// Result of probing the daemon socket.
@@ -134,45 +138,290 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
 // writing directly to the embedded store. This thin client issues the
 // appropriate HTTP requests and maps responses to exit codes.
 
-pub(crate) async fn daemon_request_async(
-    method: reqwest::Method,
-    url: &str,
-    body: Option<serde_json::Value>,
-) -> Result<serde_json::Value, Error> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+/// Expiry margin for proactively refreshing a still-valid access token
+/// before it is actually used: a request that would otherwise land just
+/// past expiry (network latency, clock skew) gets a fresh token instead of
+/// a guaranteed 401. Applied by `refresh_cached_bearer`'s `needs_refresh`
+/// check, shared by every call site through `fresh_bearer_for_url`.
+const REFRESH_MARGIN_SECS: i64 = 30;
+
+pub(crate) fn resolved_config_file(ctx: &CliContext) -> Option<std::path::PathBuf> {
+    let options = localdb_core::config::loader::LoadOptions {
+        config_path: ctx.config.clone(),
+        ..Default::default()
+    };
+    localdb_core::config::loader::resolve_config_path(&options, ctx.config_env.as_deref()).ok()
+}
+
+/// Build a `reqwest::Client` with a fixed request timeout. The one place
+/// every daemon-bound HTTP exchange in `cli` builds its client, so a change
+/// to client defaults (timeout policy, redirect policy, ...) only has to
+/// happen here instead of at each call site.
+pub(crate) fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .timeout(timeout)
         .build()
         .map_err(|e| Error::Internal {
             message: format!("cannot build HTTP client: {}", e),
             correlation_id: "daemon_client_build".to_string(),
-        })?;
+        })
+}
 
+/// Issue one HTTP request, with an explicit bearer override (rather than
+/// re-resolving it from `ctx`/`credentials.json`) so a post-refresh retry
+/// can use the freshly rotated access token without a second file lookup.
+async fn send_once(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+    bearer: Option<&str>,
+) -> Result<(reqwest::StatusCode, serde_json::Value), Error> {
     let mut req = client.request(method, url);
-    if let Some(b) = body {
-        req = req.json(&b);
+    if let Some(secret) = bearer {
+        req = req.bearer_auth(secret);
     }
-
+    if let Some(b) = body {
+        req = req.json(b);
+    }
     let resp = req.send().await.map_err(|_| Error::DaemonUnreachable)?;
-
     let status = resp.status();
     let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    Ok((status, json))
+}
+
+/// Redeem `refresh_token` against `base_url`'s `/token` endpoint, returning
+/// the new access token and the rotated `CredentialEntry` to persist, or
+/// `None` if the request failed outright or the daemon rejected it (expired
+/// or revoked refresh token). Pure HTTP exchange — callers own the
+/// credentials-file lookup and write so this can be shared by both the
+/// retry-on-401 path (`try_refresh_and_persist`) and the proactive
+/// pre-connect path (`fresh_bearer_for_url`).
+async fn redeem_refresh_token(
+    base_url: &str,
+    refresh_token: &str,
+) -> Option<(String, crate::credentials::CredentialEntry)> {
+    let client = build_http_client(std::time::Duration::from_secs(30)).ok()?;
+    let token_url = format!("{base_url}/token");
+    let resp = client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let access_token = json.get("access_token")?.as_str()?.to_string();
+    let new_refresh_token = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expires_in = json
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+
+    let new_entry = crate::credentials::CredentialEntry {
+        secret: None,
+        access_token: Some(access_token.clone()),
+        refresh_token: new_refresh_token.or_else(|| Some(refresh_token.to_string())),
+        access_expires_at: Some(localdb_core::auth::rfc3339_from_now(expires_in)),
+    };
+    Some((access_token, new_entry))
+}
+
+/// Attempt a refresh-grant exchange for the stored refresh token (if any)
+/// against the matching credentials-file key's `/token` endpoint,
+/// persisting the rotated pair on success. The key is resolved from `url`
+/// by the same longest-path-segment-prefix match `fresh_bearer_for_url`
+/// uses, so a path-prefixed daemon refreshes under the key its credential
+/// was written under rather than a re-derived origin. Returns the new
+/// access token to retry with, or `None` if there was nothing to refresh,
+/// no stored key matched `url`, or the refresh itself failed — either way
+/// the caller falls through to surfacing the original rejection (a 401 for
+/// `daemon_request_async`, the presented bearer for
+/// `cmds::surface::CliBearerSource::refresh`).
+///
+/// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
+/// statically configured bearer isn't part of the login token-pair rotation
+/// model, so there is nothing to refresh.
+pub(crate) async fn try_refresh_and_persist(
+    ctx: &CliContext,
+    url: &str,
+    rejected: Option<&str>,
+) -> Option<String> {
+    let config_file = resolved_config_file(ctx)?;
+    let path = crate::credentials::credentials_path(&config_file);
+    let (key, _) = crate::credentials::lookup_entry_for_url(&path, url)?;
+    refresh_cached_bearer(ctx, &key, rejected).await
+}
+
+/// Test-only rendezvous between two concurrent callers of
+/// `refresh_cached_bearer`, used to prove the credential lock genuinely
+/// serializes a race rather than the test merely running sequentially.
+/// A no-op unless `LOCALDB_TEST_REFRESH_READY_DIR` is set (it never is
+/// outside `concurrent_processes_share_one_refresh_and_preserve_other_origins`'s
+/// own child processes): writes this process's marker file, named after
+/// `LOCALDB_TEST_REFRESH_WORKER_ID`, then blocks until the sibling worker's
+/// marker also appears, bounded so a stuck sibling fails the test loudly
+/// instead of hanging it.
+#[cfg(test)]
+fn rendezvous_before_credential_lock() {
+    let Ok(dir) = std::env::var("LOCALDB_TEST_REFRESH_READY_DIR") else {
+        return;
+    };
+    let my_id = std::env::var("LOCALDB_TEST_REFRESH_WORKER_ID").unwrap();
+    let sibling_id = if my_id == "0" { "1" } else { "0" };
+    std::fs::write(
+        std::path::Path::new(&dir).join(format!("prelock-{my_id}")),
+        b"",
+    )
+    .unwrap();
+    let sibling_marker = std::path::Path::new(&dir).join(format!("prelock-{sibling_id}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !sibling_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sibling worker did not reach the pre-lock rendezvous in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// One serialized path for reactive HTTP refresh and proactive refresh
+/// alike. `rejected` is the bearer sent by the failed request, not a new
+/// cache lookup. `base_url` is the exact credentials-file key, not a
+/// request URL — callers that only have a request URL resolve the key
+/// first (`try_refresh_and_persist`'s `lookup_entry_for_url` call, and
+/// `fresh_bearer_for_url`'s own).
+pub(crate) async fn refresh_cached_bearer(
+    ctx: &CliContext,
+    base_url: &str,
+    rejected: Option<&str>,
+) -> Option<String> {
+    if let Some(key) = ctx.api_key.as_deref().filter(|key| !key.is_empty()) {
+        return if rejected.is_none() {
+            Some(key.to_string())
+        } else {
+            None
+        };
+    }
+    let config_file = resolved_config_file(ctx)?;
+    let path = crate::credentials::credentials_path(&config_file);
+    let needs_refresh = |entry: &crate::credentials::CredentialEntry| {
+        let current = entry.access_token.as_deref().or(entry.secret.as_deref());
+        let due = entry.access_token.is_some()
+            && entry
+                .access_expires_at
+                .as_deref()
+                .is_some_and(|at| localdb_core::auth::expires_within(at, REFRESH_MARGIN_SECS));
+        due || rejected.is_some_and(|old| current == Some(old))
+    };
+    // Ordinary reads need no writable directory or lock: rename makes them atomic.
+    let entry = crate::credentials::lookup_entry(&path, base_url)?;
+    if !needs_refresh(&entry) {
+        return entry.access_token.or(entry.secret);
+    }
+    let current = entry.access_token.clone().or_else(|| entry.secret.clone());
+    #[cfg(test)]
+    rendezvous_before_credential_lock();
+    let Some(lock) = crate::credentials::CredentialLock::acquire(&path)
+        .await
+        .ok()
+    else {
+        // A still-usable token must not be dropped just because a proactive
+        // refresh can't take the lock (read-only credentials dir, or
+        // something else occupying the lock path) — only a bearer the
+        // daemon already rejected must never be reused.
+        return if rejected.is_none() { current } else { None };
+    };
+    let entry = lock.lookup(base_url)?;
+    let current = entry.access_token.clone().or_else(|| entry.secret.clone());
+    // A process that waited for the lock must recheck the replacement entry.
+    if needs_refresh(&entry) {
+        if let Some(refresh) = entry.refresh_token {
+            if let Some((access, updated)) = redeem_refresh_token(base_url, &refresh).await {
+                lock.write(base_url, updated).ok()?;
+                return Some(access);
+            }
+        }
+        return if rejected.is_none() { current } else { None };
+    }
+    current
+}
+
+/// Resolve a fresh bearer for a request to `url`, refreshing an expired or
+/// soon-to-expire cached access token before handing it back instead of
+/// after a guaranteed 401:
+///
+/// 1. A non-empty `ctx.api_key` (`LOCALDB_API_KEY`/`--api-key`) wins
+///    unchanged, with no refresh — a statically configured bearer isn't
+///    part of the login token-pair rotation model.
+/// 2. Otherwise, the `credentials.json` entry whose key is the longest
+///    path-segment prefix of `url` is looked up — covering both a
+///    bare-origin daemon and one served behind a path (e.g.
+///    `https://example.com/team`). No matching entry means no bearer at
+///    all (fine against an open-mode daemon).
+/// 3. The matched entry is then run through `refresh_cached_bearer`'s
+///    proactive-refresh check, so a token that is expired or due to expire
+///    within `REFRESH_MARGIN_SECS` is redeemed before use.
+///
+/// Used by every daemon-bound CLI request: `daemon_request_async` (which
+/// keeps its own 401 retry as a backstop for a token that expires mid-flight
+/// or is revoked out of band), the job-attach SSE path, and the MCP
+/// daemon-proxy's `current()` bearer.
+pub(crate) async fn fresh_bearer_for_url(ctx: &CliContext, url: &str) -> Option<String> {
+    if let Some(key) = ctx.api_key.as_deref().filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+    let config_file = resolved_config_file(ctx)?;
+    let path = crate::credentials::credentials_path(&config_file);
+    let (key, _) = crate::credentials::lookup_entry_for_url(&path, url)?;
+    refresh_cached_bearer(ctx, &key, None).await
+}
+
+pub(crate) async fn daemon_request_async(
+    ctx: &CliContext,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Error> {
+    let client = build_http_client(std::time::Duration::from_secs(30))?;
+    let bearer = fresh_bearer_for_url(ctx, url).await;
+    let (status, json) = send_once(
+        &client,
+        method.clone(),
+        url,
+        body.as_ref(),
+        bearer.as_deref(),
+    )
+    .await?;
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(new_access) = try_refresh_and_persist(ctx, url, bearer.as_deref()).await {
+            let (status2, json2) =
+                send_once(&client, method, url, body.as_ref(), Some(&new_access)).await?;
+            return if status2.is_success() {
+                Ok(json2)
+            } else {
+                Err(daemon_response_error(status2, &json2))
+            };
+        }
+        return Err(Error::Unauthorized {
+            message: "credentials rejected or expired; run `localdb login` to re-authenticate"
+                .to_string(),
+        });
+    }
 
     if status.is_success() {
         Ok(json)
     } else {
-        // Map HTTP error codes to our error types.
-        // The server's error body uses {code, message} (see server/src/error.rs).
-        let code = json
-            .get("code")
-            .and_then(|e| e.as_str())
-            .unwrap_or("internal");
-        let msg = json
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("daemon error")
-            .to_string();
-
-        Err(decode_daemon_error(code, msg, status))
+        Err(daemon_response_error(status, &json))
     }
 }
 
@@ -188,6 +437,22 @@ pub(crate) async fn daemon_request_async(
 /// which round-trip through a single message string) is specific to this
 /// call site: it folds the HTTP status into the message, which `from_code`
 /// has no access to.
+pub(crate) fn daemon_response_error(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> Error {
+    decode_daemon_error(
+        body.get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("internal"),
+        body.get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon error")
+            .to_string(),
+        status,
+    )
+}
+
 fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> Error {
     Error::from_code(code, msg.clone()).unwrap_or_else(|| Error::Internal {
         message: format!("daemon returned {}: {}", status.as_u16(), msg),
@@ -265,6 +530,7 @@ const MAX_DAEMON_PAGES: usize = 10_000;
 ///   additionally bounds the walk even against a daemon that never repeats a
 ///   cursor value at all.
 pub(crate) async fn walk_daemon_pages(
+    ctx: &CliContext,
     base_url: &str,
     path: &str,
     mut on_page: impl FnMut(&[serde_json::Value]) -> bool,
@@ -280,7 +546,7 @@ pub(crate) async fn walk_daemon_pages(
             }
             None => format!("{base_url}{path}"),
         };
-        let resp = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+        let resp = daemon_request_async(ctx, reqwest::Method::GET, &url, None).await?;
         let items = resp
             .get("items")
             .and_then(|v| v.as_array())

@@ -55,7 +55,67 @@ pub async fn get_document_detail(
         .ok_or_else(|| Error::ResourceNotFound {
             id: doc_id.to_string(),
         })?;
+    fetch_detail(backend, info, include_text).await
+}
 
+/// Like [`get_document_detail`], but scoped to a caller-visible set of store
+/// ids rather than a single optional one — the shared 0/1/many semantics
+/// used wherever a surface has already resolved "which stores can this
+/// caller see" into a list.
+///
+/// - Empty slice: unscoped lookup (identical to `store_id: None` on
+///   `get_document_detail`) — keeps the existing global ambiguity error
+///   behavior when the id exists in multiple stores.
+/// - Exactly one id: SQL-scoped lookup via `store_id: Some(_)` — no
+///   ambiguity path, since the query itself restricts to that store.
+/// - More than one id: a `store_id: Some(_)`-scoped lookup against each
+///   allowed id in turn — never the global unscoped lookup. A document that
+///   exists only in stores outside this set reads as `Error::ResourceNotFound`,
+///   identically to one that doesn't exist anywhere; the cross-store
+///   ambiguity error fires only when two or more *allowed* stores hold the
+///   id. Text/chunk fetching (when `include_text`) runs only once the
+///   lookup has resolved to exactly one allowed store, never speculatively
+///   against a candidate the caller cannot see.
+pub async fn get_document_detail_scoped(
+    backend: &dyn StoreBackend,
+    doc_id: &str,
+    allowed_store_ids: &[String],
+    include_text: bool,
+) -> Result<DocumentDetail, Error> {
+    match allowed_store_ids {
+        [] => get_document_detail(backend, doc_id, None, include_text).await,
+        [only] => get_document_detail(backend, doc_id, Some(only.as_str()), include_text).await,
+        many => {
+            let mut found: Option<DocumentInfo> = None;
+            for store_id in many {
+                if let Some(info) = backend.find_document(doc_id, Some(store_id)).await? {
+                    if found.is_some() {
+                        return Err(Error::InvalidRequest {
+                            message: format!(
+                                "document '{doc_id}' exists in multiple stores; use \
+                                 store-scoped search to disambiguate"
+                            ),
+                        });
+                    }
+                    found = Some(info);
+                }
+            }
+            let info = found.ok_or_else(|| Error::ResourceNotFound {
+                id: doc_id.to_string(),
+            })?;
+            fetch_detail(backend, info, include_text).await
+        }
+    }
+}
+
+/// Fetch, when `include_text` is set, `info`'s reconstructed full text and
+/// chunk count — the tail shared by every `get_document_detail*` lookup once
+/// the document has already been resolved to exactly one store.
+async fn fetch_detail(
+    backend: &dyn StoreBackend,
+    info: DocumentInfo,
+    include_text: bool,
+) -> Result<DocumentDetail, Error> {
     let (text, chunk_count) = if include_text {
         let store = backend.retrieval_store(&info.store_id).await?;
         let chunks = store.get_chunks_for_resource(&info.id).await?;
@@ -71,43 +131,6 @@ pub async fn get_document_detail(
         text,
         chunk_count,
     })
-}
-
-/// Like [`get_document_detail`], but scoped to a caller-visible set of store
-/// ids rather than a single optional one — the shared 0/1/many semantics
-/// used wherever a surface has already resolved "which stores can this
-/// caller see" into a list.
-///
-/// - Empty slice: unscoped lookup (identical to `store_id: None` on
-///   `get_document_detail`) — keeps the existing global ambiguity error
-///   behavior when the id exists in multiple stores.
-/// - Exactly one id: SQL-scoped lookup via `store_id: Some(_)` — no
-///   ambiguity path, since the query itself restricts to that store.
-/// - More than one id: unscoped lookup followed by a post-hoc membership
-///   check. If the found document's `store_id` is not in
-///   `allowed_store_ids`, this returns `Error::ResourceNotFound` — from the
-///   caller's perspective, a document outside their visible scope simply
-///   does not exist.
-pub async fn get_document_detail_scoped(
-    backend: &dyn StoreBackend,
-    doc_id: &str,
-    allowed_store_ids: &[String],
-    include_text: bool,
-) -> Result<DocumentDetail, Error> {
-    match allowed_store_ids {
-        [] => get_document_detail(backend, doc_id, None, include_text).await,
-        [only] => get_document_detail(backend, doc_id, Some(only.as_str()), include_text).await,
-        many => {
-            let detail = get_document_detail(backend, doc_id, None, include_text).await?;
-            if many.iter().any(|id| id == &detail.info.store_id) {
-                Ok(detail)
-            } else {
-                Err(Error::ResourceNotFound {
-                    id: doc_id.to_string(),
-                })
-            }
-        }
-    }
 }
 
 /// Reconstruct a document's full text from its persisted blocks, falling

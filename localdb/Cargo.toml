@@ -37,3 +37,6 @@ schemars = { workspace = true }
 # RFC 3339 cutoff timestamps for the added/updated-axis filter fixtures in
 # cli_search_filters.rs. Already a workspace dependency; no new crate.
 chrono = { workspace = true }
+# Form-encoding and query-param parsing for the raw-socket OAuth round trip
+# in setup_code_cli.rs. Already a workspace dependency; no new crate.
+url = { workspace = true }

@@ -51,6 +51,8 @@
           "default": {
             "bind": "127.0.0.1",
             "port": 7700,
+            "auth": "auto",
+            "public_url": null,
             "job_workers": 1
           }
         },
@@ -130,6 +132,19 @@
           "description": "Port to listen on.",
           "default": 7700
         },
+        "auth": {
+          "$ref": "#/$defs/v1_ServerAuthMode",
+          "description": "Auth enforcement mode (specs/03-config.md §1, specs/05-surfaces.md §3):\n`auto` (default) enforces auth iff the daemon's actually-bound address\nis non-loopback; `required` always enforces; `off` never enforces and\nis a hard startup error (`invalid_config`) combined with a\nnon-loopback bind.",
+          "default": "auto"
+        },
+        "public_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional client-reachable public base URL (specs/03-config.md §1).\nOnly meaningful behind a TLS-terminating reverse proxy; used as the\nOAuth issuer/resource identifier in discovery responses and consent\nlinks. Surfaced to admins via `GET /v1/config`.",
+          "default": null
+        },
         "job_workers": {
           "type": "integer",
           "format": "uint",
@@ -139,6 +154,26 @@
         }
       },
       "description": "HTTP server configuration."
+    },
+    "v1_ServerAuthMode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "auto",
+          "description": "Enforce auth iff the actually-bound address is non-loopback."
+        },
+        {
+          "type": "string",
+          "const": "required",
+          "description": "Always enforce auth, including on loopback binds."
+        },
+        {
+          "type": "string",
+          "const": "off",
+          "description": "Never enforce auth; refuse to start on a non-loopback bind."
+        }
+      ],
+      "description": "`server.auth` values (specs/05-surfaces.md §3). Unknown values are\nrejected at parse time like any other invalid enum content, consistent\nwith the strict unknown-key policy (specs/03-config.md §5)."
     },
     "v1_PathsConfig": {
       "type": "object",

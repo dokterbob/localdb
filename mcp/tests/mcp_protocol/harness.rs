@@ -90,7 +90,13 @@ pub(crate) fn handler_with_stores(
 ) -> McpHandler {
     let backend: std::sync::Arc<dyn localdb_core::StoreBackend> =
         std::sync::Arc::new(mcp::tools::StoresBackend::new(&stores));
-    McpHandler::new(stores, backend, embedder, allow_write)
+    McpHandler::new(
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(stores)),
+        backend,
+        embedder,
+        allow_write,
+        Some(localdb_core::auth::Principal::local_trust()),
+    )
 }
 
 /// Build a handler with one empty store.

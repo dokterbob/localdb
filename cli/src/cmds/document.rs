@@ -150,7 +150,7 @@ impl DaemonAwareCommand for DocumentListCmd {
                 path.push_str("?source=");
                 path.push_str(&encode_path_segment(source));
             }
-            walk_daemon_pages(base_url, &path, |items| {
+            walk_daemon_pages(ctx, base_url, &path, |items| {
                 for item in items {
                     all.push(daemon_item_to_document_list_item(item, store_name));
                 }
@@ -365,7 +365,7 @@ impl DaemonAwareCommand for DocumentGetCmd<'_> {
             url.push('?');
             url.push_str(&query.join("&"));
         }
-        let v = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+        let v = daemon_request_async(ctx, reqwest::Method::GET, &url, None).await?;
         document_get_result_from_daemon_json(&v)
     }
 

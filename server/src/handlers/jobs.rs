@@ -1,10 +1,12 @@
+use super::require_principal;
+use localdb_core::auth::Principal;
 use std::convert::Infallible;
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::sse::{Event, Sse},
-    Json,
+    Extension, Json,
 };
 use futures::stream::{self, Stream};
 use serde::Deserialize;
@@ -54,8 +56,10 @@ fn parse_deletion_policy(raw: Option<&str>) -> Result<DeletionPolicy, ApiError> 
 
 pub async fn create_job(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     ApiJson(req): ApiJson<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    require_principal(principal)?.require_admin()?;
     let deletion = parse_deletion_policy(req.deletion_policy.as_deref())?;
 
     let store_row = state
@@ -112,14 +116,20 @@ pub async fn create_job(
 /// endpoints paginate against). Order is whatever `JobQueue::list_jobs`
 /// returns (registry iteration order — not guaranteed stable), same as
 /// every other consumer of that method.
-pub async fn list_jobs(State(state): State<AppState>) -> Json<Vec<IndexJob>> {
-    Json(state.job_queue().list_jobs().await)
+pub async fn list_jobs(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+) -> Result<Json<Vec<IndexJob>>, ApiError> {
+    require_principal(principal)?.require_admin()?;
+    Ok(Json(state.job_queue().list_jobs().await))
 }
 
 pub async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    principal: Option<Extension<Principal>>,
 ) -> Result<Json<IndexJob>, ApiError> {
+    require_principal(principal)?.require_admin()?;
     state
         .job_queue()
         .get_job(&job_id)
@@ -142,7 +152,9 @@ pub async fn get_job(
 pub async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    principal: Option<Extension<Principal>>,
 ) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    require_principal(principal)?.require_admin()?;
     let job = state.job_queue().cancel(&job_id).await?;
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -256,7 +268,9 @@ async fn next_job_event(
 pub async fn job_events(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    principal: Option<Extension<Principal>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    require_principal(principal)?.require_admin()?;
     let queue = state.job_queue().clone();
 
     let job = queue

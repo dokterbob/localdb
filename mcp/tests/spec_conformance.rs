@@ -342,7 +342,13 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
         std::sync::Arc::new(mcp::tools::StoresBackend::new(&stores));
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(stores, backend, embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(stores)),
+        backend,
+        embedder,
+        false,
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
     (handler, doc_id, ids)
 }
 

@@ -172,3 +172,5 @@ fn internal_maps_to_500() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
+
+mod auth;

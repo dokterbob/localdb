@@ -31,9 +31,10 @@ network — for seven years.
 **Status:** hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS
 automatically); the first indexing or search operation — including `add`'s auto-index — downloads
-~706 MB from HuggingFace (no API key required). The HTTP daemon remains experimental, with no auth.
-See [docs/architecture.md#known-gaps](docs/architecture.md#known-gaps) for the full list of what's
-not there yet.
+~706 MB from HuggingFace (no API key required). The HTTP daemon remains experimental, with
+authentication required by default on non-loopback binds. See
+[docs/architecture.md#known-gaps](docs/architecture.md#known-gaps) for the full list of what's not
+there yet.
 
 ---
 
@@ -118,13 +119,12 @@ example calls.
 
 > **Privacy boundary:** with a local embedding provider, localdb indexes, embeds, and searches your
 > data locally, but MCP results are delivered to the MCP client. If that client uses a cloud-hosted
-> model, retrieved excerpts or full
-> documents may be sent to that provider under its data-handling policy. To minimize data exposure,
-> use a local/self-hosted model and the stdio transport, and expose only the required stores with
-> `--store`. Preventing data egress also requires independently reviewing and restricting the client's
-> outbound networking, including telemetry, cloud memory, and plugins. Store scoping reduces what the
-> client can retrieve; neither it nor stdio controls what the client does with returned data.
-> See [docs/mcp.md](docs/mcp.md#data-and-model-privacy).
+> model, retrieved excerpts or full documents may be sent to that provider under its data-handling
+> policy. To minimize data exposure, use a local/self-hosted model and the stdio transport, and
+> expose only the required stores with `--store`. Preventing data egress also requires independently
+> reviewing and restricting the client's outbound networking, including telemetry, cloud memory, and
+> plugins. Store scoping reduces what the client can retrieve; neither it nor stdio controls what
+> the client does with returned data. See [docs/mcp.md](docs/mcp.md#data-and-model-privacy).
 
 ## Experimental HTTP daemon
 
@@ -171,3 +171,12 @@ behind, ahead, or predates the migration framework (exit 2) rather than silently
 ## License
 
 [AGPL-3.0-or-later](LICENSE). See the license file for full terms.
+
+### Authentication
+
+Loopback binds default to local trust. On non-loopback binds, `server.auth: auto` requires bearer
+authentication; `required` enforces it on every bind, and `off` refuses non-loopback binds. Use
+`localdb login` for browser login, or an API key. Admins manage users, keys, grants, invites,
+stores, sources and jobs. Members read only shared stores they have been granted. HTTP and MCP apply
+the same policy. Configuration is loaded at startup; restart the daemon to apply edits. See
+[the HTTP API](docs/http-api.md) for the authentication endpoints and flows.

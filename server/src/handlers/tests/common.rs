@@ -54,6 +54,7 @@ pub(crate) async fn make_app_with_queue_and_state(
         dir.path().join("models"),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();
@@ -88,7 +89,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/jobs/{id}/events", get(job_events))
         .route("/v1/status", get(get_status))
         .route("/v1/config", get(get_config))
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::auth::middleware::require_auth,
+        ))
 }
 
 pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {
@@ -97,6 +102,10 @@ pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {
 }
 
 pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
+    make_state_with_auth_mode(crate::auth::AuthMode::Open).await
+}
+
+pub(crate) async fn make_state_with_auth_mode(mode: crate::auth::AuthMode) -> (TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
         defaults: localdb_core::config::schema::DefaultsConfig {
@@ -118,6 +127,7 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
         dir.path().join("models"),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        mode,
     )
     .await
     .unwrap();
@@ -291,4 +301,13 @@ pub(crate) async fn seed_many_chunks(state: &AppState, count: usize) -> Vec<Stri
         .unwrap();
 
     ids
+}
+
+pub(crate) async fn seed_user_with_key(
+    state: &AppState,
+    name: &str,
+    role: localdb_core::auth::Role,
+) -> String {
+    let user = state.auth().create_user(name, role).await.unwrap();
+    state.auth().issue_api_key(&user.id).await.unwrap().secret
 }

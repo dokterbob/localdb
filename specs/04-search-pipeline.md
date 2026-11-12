@@ -12,12 +12,12 @@ how content reaches the pipeline and what kind of Resource it produces.
 
 ### Ingestor kinds
 
-- **`file` ingestor:** Scans paths on demand (`localdb index`); the daemon additionally watches
-  continuously via `notify` (FSEvents on macOS, inotify on Linux), with debounce so editor
-  save-storms coalesce. Include/exclude globs from the source spec. Runs the parser chain on each
-  file, receives a `ParsedDocument`, and converts it to a `Resource` with typed blocks via
-  `markdown_to_blocks()`. The parser chain is an implementation detail of this ingestor, not a
-  top-level pipeline concept.
+- **`file` ingestor:** Scans paths on demand (`localdb index`, run manually or daemon-attached).
+  Watching source directories for changes and re-indexing automatically is not implemented; a change
+  under a `file` source root is only picked up by the next `localdb index`. Include/exclude globs
+  from the source spec. Runs the parser chain on each file, receives a `ParsedDocument`, and
+  converts it to a `Resource` with typed blocks via `markdown_to_blocks()`. The parser chain is an
+  implementation detail of this ingestor, not a top-level pipeline concept.
 - **`url` ingestor:** HTTP fetch; runs the same parser chain (readability-style main-content
   extraction → Markdown); converts `ParsedDocument` to a `Resource` with blocks via
   `markdown_to_blocks()`. Conditional GET (ETag/Last-Modified) when available. Refreshes on the

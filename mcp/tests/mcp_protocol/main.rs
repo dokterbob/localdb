@@ -32,6 +32,7 @@
 //! declaration; every `#[tokio::test]` lives in a sibling file.
 
 mod anchor_pagination;
+mod auth;
 mod get_chunks;
 mod get_document;
 mod harness;

@@ -1,12 +1,12 @@
-//! File system watcher for config and path-source files.
+//! Debounced path watching, built as a reusable block for source watching.
 //!
-//! Uses `notify-debouncer-mini` to debounce rapid file changes.
-//!
-//! Two kinds of watching:
-//! 1. **Config watch** — re-read `config.yaml` when it changes; reload AppState.
-//! 2. **Source watch** — watch path-source roots; queue re-index when files change.
-//!
-//! See specs/03-config.md §3 (reload semantics) and T11 scope.
+//! Uses `notify-debouncer-mini` to debounce rapid file changes and deliver
+//! them over an `mpsc` channel. No daemon code path calls this module: the
+//! daemon reads configuration once at startup, and sources are refreshed
+//! through `localdb index` (run manually, or daemon-attached over SSE) and
+//! the refresh scheduler for URL/feed sources. Watching source directories
+//! for changes is not implemented; this module is the building block for
+//! adding it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
