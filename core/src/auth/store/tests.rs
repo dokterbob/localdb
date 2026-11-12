@@ -727,6 +727,91 @@ async fn fake_prune_and_create_evicts_the_oldest_unused_client_at_cap() {
 }
 
 #[tokio::test]
+async fn fake_prune_and_create_evicts_as_many_as_needed_to_reach_the_cap() {
+    let store = FakeAuthStore::new();
+    // Five unused dynamic clients already past a cap of two: the eviction
+    // must remove enough of the oldest that the table lands exactly at the
+    // cap once the candidate is inserted — not just the single oldest.
+    for (id, created_at) in [
+        ("c1", "2026-01-01T00:00:00Z"),
+        ("c2", "2026-01-02T00:00:00Z"),
+        ("c3", "2026-01-03T00:00:00Z"),
+        ("c4", "2026-01-04T00:00:00Z"),
+        ("c5", "2026-01-05T00:00:00Z"),
+    ] {
+        store
+            .create_oauth_client(&oauth_client(id, created_at))
+            .await
+            .unwrap();
+    }
+
+    let candidate = oauth_client("candidate", "2026-01-06T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    for id in ["c1", "c2", "c3", "c4"] {
+        assert!(
+            store.find_oauth_client(id).await.unwrap().is_none(),
+            "{id} should have been evicted to reach the cap"
+        );
+    }
+    assert!(
+        store.find_oauth_client("c5").await.unwrap().is_some(),
+        "the newest survivor must remain"
+    );
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_some());
+
+    let mut remaining = 0;
+    for id in ["c1", "c2", "c3", "c4", "c5", "candidate"] {
+        if store.find_oauth_client(id).await.unwrap().is_some() {
+            remaining += 1;
+        }
+    }
+    assert_eq!(remaining, 2, "the table must land exactly at the cap");
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_refuses_without_evicting_when_used_clients_alone_exceed_the_cap() {
+    let store = FakeAuthStore::new();
+    // Three used clients already over a cap of two: there is no unused
+    // client to evict, so the registration must refuse without deleting
+    // anything already registered.
+    for id in ["used-1", "used-2", "used-3"] {
+        store
+            .create_oauth_client(&oauth_client(id, OLD_CREATED_AT))
+            .await
+            .unwrap();
+        store.create_auth_code(&auth_code_for(id)).await.unwrap();
+    }
+
+    let candidate = oauth_client("candidate", "2026-07-08T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::CapReached);
+    for id in ["used-1", "used-2", "used-3"] {
+        assert!(
+            store.find_oauth_client(id).await.unwrap().is_some(),
+            "{id} must not be evicted"
+        );
+    }
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn fake_prune_and_create_never_evicts_a_used_client_even_at_cap() {
     let store = FakeAuthStore::new();
     let used = oauth_client("used", "2026-01-01T00:00:00Z");

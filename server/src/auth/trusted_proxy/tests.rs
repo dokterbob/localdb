@@ -307,6 +307,24 @@ fn resolve_client_addr_cases() {
             forwarded_for: Some(&["198.51.100.1, ::ffff:10.0.0.1"]),
             want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
+        Case {
+            name: "an IPv4 peer is never covered by an IPv6-only ::/0 range",
+            peer: "127.0.0.1",
+            trusted: &["::/0"],
+            forwarded_for: Some(&["198.51.100.1"]),
+            want: ClientAddr::Direct(addr("127.0.0.1")),
+        },
+        Case {
+            name: "an IPv4 peer is covered by an IPv4 0.0.0.0/0 range",
+            peer: "127.0.0.1",
+            trusted: &["0.0.0.0/0"],
+            // No header: this case only needs to show the peer itself is
+            // trusted (unlike the `::/0` case above) — resolving a forwarded
+            // address would also require that address to be untrusted, which
+            // a deliberately universal 0.0.0.0/0 range never is.
+            forwarded_for: None,
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
     ];
 
     for case in cases {

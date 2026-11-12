@@ -205,10 +205,12 @@ Limits on the daemon's public, unauthenticated auth routes (`/authorize`, `/join
 | `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                                                                                                                          |
 | `trusted_proxies`        | `[]`    | IP addresses/CIDR ranges this daemon forwards from — see below. Each entry must parse as an address or CIDR range.                                                                                                                      |
 
-At the registration cap, `POST /register` evicts the oldest dynamically registered client that has
-never completed an authorization, rather than refusing outright, so a registration flood can't lock
-out every other registration by filling every slot — only once every slot is held by a client with a
-completed authorization does it refuse. Trade-off: a client that registered but hasn't yet started
+At or past the registration cap, `POST /register` evicts exactly as many of the oldest dynamically
+registered clients that have never completed an authorization as it takes to land the table at the
+cap once the new registration is inserted, rather than refusing outright, so a registration flood
+can't lock out every other registration by filling every slot. If fewer unused clients exist than
+that — every remaining slot is held by a client with a completed authorization — it refuses instead
+of evicting anything at all. Trade-off: a client that registered but hasn't yet started
 authorization can be evicted this way and must register again.
 
 Over the limit: `429` with `Retry-After`. `/token` and `/register` keep their existing OAuth-style
@@ -234,7 +236,11 @@ address is additionally keyed on its /64 network prefix (not the full address), 
 commonly delegates an entire /64 to one customer. Because of that normalization, `trusted_proxies`
 rejects an IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`, bare or as a CIDR range) at load time — write
 the plain IPv4 form instead, since the mapped form could never match the normalized peer address
-anyway. See
+anyway. **An IPv4 range never matches an IPv6 peer, and an IPv6 range never matches an IPv4 peer** —
+`::/0` does not cover an IPv4 peer, and `0.0.0.0/0` does not cover an IPv6 one. An operator who
+means "trust every peer" must list both `0.0.0.0/0` and `::/0` — listing only one silently leaves
+every peer of the other family untrusted (and, if it is a direct loopback peer, not exempt from the
+rate limit either). See
 [specs/05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication)
 for the full behavior.
 

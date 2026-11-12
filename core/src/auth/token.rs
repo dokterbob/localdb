@@ -128,11 +128,12 @@ fn base64url_encode(bytes: &[u8]) -> String {
 /// `chrono` arithmetic (`Duration::seconds`, `DateTime + Duration`, which
 /// both panic on overflow by default): a delta past that bound saturates
 /// rather than panicking. Not every caller's delta is already bounded —
-/// `cli::cmds::invite::parse_expiry_duration` passes a duration straight
-/// from `localdb invite create --expires`, and the CLI's credential cache
-/// stores an expiry derived from a server-supplied `expires_in` — so this
-/// clamp is the function's own backstop, not a convenience for callers that
-/// already bound their input elsewhere. The bound is generous enough
+/// the CLI's credential cache stores an expiry derived from a
+/// server-supplied `expires_in`, which this function has no control over —
+/// so this clamp is the function's own backstop, not a convenience for
+/// callers that already bound their input elsewhere (e.g.
+/// `cli::cmds::invite::parse_expiry_duration`, which rejects anything past
+/// this same bound before it ever reaches here). The bound is generous enough
 /// (100 years) that no real caller is ever clamped, and tight enough that
 /// the result stays a normal 4-digit-year `YYYY-MM-DDTHH:MM:SSZ` string —
 /// unlike saturating to `chrono`'s absolute `DateTime::<Utc>::MIN_UTC`/

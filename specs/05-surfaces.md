@@ -650,14 +650,18 @@ inserting a newly validated registration, `AuthService::register_client` (via
    authorization" is derived from the existing `auth_codes` table (a row naming the client as
    `client_id`), the earliest point in the OAuth2 flow this schema records client activity at,
    strictly before any token is ever minted from that code; no new column was needed.
-2. If the table is still at the cap, evict the single oldest dynamically registered client that has
-   never completed an authorization (ties broken by `id`), regardless of its age. An unauthenticated
+2. If the table is still at or past the cap, evict exactly as many of the oldest dynamically
+   registered clients that have never completed an authorization (ties broken by `id`) as it takes
+   for the table to land at the cap once the new registration is inserted —
+   `dynamic_count - (max_dynamic_clients - 1)` of them — regardless of their age. An unauthenticated
    caller that fills every slot with fresh registrations must not be able to lock out every other
    registration attempt until those rows age past `unused_client_ttl_secs` on their own — eviction
    closes that gap. **Trade-off:** under a registration flood, a client that itself registered but
    has not yet started authorization can be evicted this way and must register again.
-3. Only if every remaining slot is held by a client with a completed authorization (or the built-in
-   client, excluded above) does this refuse with `429` and an RFC 7591 §3.2.2-shaped body
+3. If fewer unused dynamically registered clients exist than the number needed, every remaining slot
+   is held by a client with a completed authorization (or the built-in client, excluded above).
+   Refusing after destroying some of those registrations would be worse than refusing outright, so
+   this evicts nothing at all in that case and refuses with `429` and an RFC 7591 §3.2.2-shaped body
    (`error: "temporarily_unavailable"` — RFC 7591 defines no code for "capacity reached"; this is
    RFC 6749 §4.1.2.1's closest-fitting registered code) plus a fixed `Retry-After: 3600`.
 

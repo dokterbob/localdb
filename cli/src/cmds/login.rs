@@ -385,6 +385,10 @@ const MAX_CONSECUTIVE_RATE_LIMITS: u32 = 20;
 /// a terminal `Unauthorized` with a clear message, per specs/05-surfaces.md
 /// §2. The secret is sent in the JSON body, never the URL — see
 /// `server::handlers::invites::poll_request`'s doc comment for why.
+///
+/// Delegates the actual loop to [`poll_loop`], supplying the real HTTP
+/// request and `tokio::time::sleep` as its two effects — see that
+/// function's doc comment for why the loop itself lives there.
 async fn poll_until_decided(
     client: &reqwest::Client,
     base_url: &str,
@@ -393,15 +397,62 @@ async fn poll_until_decided(
     poll_interval: std::time::Duration,
 ) -> Result<String, Error> {
     let encoded_id = encode_path_segment(request_id);
+    poll_loop(
+        poll_interval,
+        || async {
+            let resp = client
+                .post(format!("{base_url}/v1/invites/requests/{encoded_id}/poll"))
+                .json(&json!({ "secret": request_secret }))
+                .send()
+                .await
+                .map_err(|_| Error::DaemonUnreachable)?;
+            let status = resp.status();
+            let retry_after = retry_after_duration(resp.headers());
+            let body = resp.json().await.unwrap_or(serde_json::Value::Null);
+            Ok(PollResponse {
+                status,
+                retry_after,
+                body,
+            })
+        },
+        |wait| tokio::time::sleep(wait),
+    )
+    .await
+}
+
+/// One real poll request's full outcome: status, the parsed `Retry-After`
+/// header, and the response body (parsed as JSON; `Value::Null` if parsing
+/// fails). Bundling the whole response as a single value — rather than
+/// fetching the body only once the status has been examined — is what lets
+/// a test script a sequence of these directly, with no socket.
+struct PollResponse {
+    status: reqwest::StatusCode,
+    retry_after: Option<std::time::Duration>,
+    body: serde_json::Value,
+}
+
+/// `poll_until_decided`'s state machine, taking the two effects it needs —
+/// "perform one poll request" (`poll_one`) and "sleep for a duration"
+/// (`sleep`) — as parameters instead of calling a real socket and
+/// `tokio::time::sleep` directly. This is what makes the loop's own
+/// behavior unit-testable with no socket and no real time: that the
+/// consecutive-429 counter carries across iterations, resets on a non-429
+/// response, and the exact number of requests and sleeps before giving up
+/// (`cli::cmds::login::rate_limit_tests`). The production caller
+/// (`poll_until_decided`) passes the real HTTP call and
+/// `tokio::time::sleep`; this function has no knowledge of either.
+async fn poll_loop<PollFut, SleepFut>(
+    poll_interval: std::time::Duration,
+    mut poll_one: impl FnMut() -> PollFut,
+    mut sleep: impl FnMut(std::time::Duration) -> SleepFut,
+) -> Result<String, Error>
+where
+    PollFut: std::future::Future<Output = Result<PollResponse, Error>>,
+    SleepFut: std::future::Future<Output = ()>,
+{
     let mut consecutive_rate_limits = 0u32;
     loop {
-        let resp = client
-            .post(format!("{base_url}/v1/invites/requests/{encoded_id}/poll"))
-            .json(&json!({ "secret": request_secret }))
-            .send()
-            .await
-            .map_err(|_| Error::DaemonUnreachable)?;
-        let status = resp.status();
+        let resp = poll_one().await?;
         // A 429 from the daemon's per-IP rate limiter (specs/05-surfaces.md
         // §3.1) is not a decision failure — it means this poll loop itself
         // is the thing being throttled (e.g. several concurrent logins
@@ -409,8 +460,12 @@ async fn poll_until_decided(
         // a sane range, and keep polling rather than surfacing an error for
         // a condition this loop caused and can resolve by itself — unless
         // it keeps happening (see `MAX_CONSECUTIVE_RATE_LIMITS`).
-        let retry_after = retry_after_duration(resp.headers());
-        match next_poll_step(status, retry_after, poll_interval, consecutive_rate_limits) {
+        match next_poll_step(
+            resp.status,
+            resp.retry_after,
+            poll_interval,
+            consecutive_rate_limits,
+        ) {
             PollStep::GiveUp => {
                 return Err(Error::RateLimited {
                     message: format!(
@@ -421,20 +476,23 @@ async fn poll_until_decided(
             }
             PollStep::WaitAndRetry { wait, new_count } => {
                 consecutive_rate_limits = new_count;
-                tokio::time::sleep(wait).await;
+                sleep(wait).await;
                 continue;
             }
             PollStep::Proceed => {
                 consecutive_rate_limits = 0;
             }
         }
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        if !status.is_success() {
-            return Err(crate::daemon_client::daemon_response_error(status, &body));
+        if !resp.status.is_success() {
+            return Err(crate::daemon_client::daemon_response_error(
+                resp.status,
+                &resp.body,
+            ));
         }
-        match body.get("state").and_then(|v| v.as_str()) {
+        match resp.body.get("state").and_then(|v| v.as_str()) {
             Some("approved") => {
-                return body
+                return resp
+                    .body
                     .get("api_key")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
@@ -456,7 +514,7 @@ async fn poll_until_decided(
                     correlation_id: "login_invite_poll_already_collected".to_string(),
                 });
             }
-            Some("pending") => tokio::time::sleep(poll_interval).await,
+            Some("pending") => sleep(poll_interval).await,
             _ => {
                 return Err(Error::Internal {
                     message: "invalid approval response".into(),

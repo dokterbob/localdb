@@ -197,7 +197,10 @@ path; `paths.*` in config override the rest.
   with a path-precise message naming its index (`server.abuse_limits.trusted_proxies[0]: ...`). An
   IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`, bare or as a CIDR range) is rejected the same way,
   naming the plain IPv4 form to use instead — the resolved peer address is normalized to IPv4 before
-  matching (`server::auth::trusted_proxy::unmap_ipv4`), so a mapped entry could never match it.
+  matching (`server::auth::trusted_proxy::unmap_ipv4`), so a mapped entry could never match it. An
+  IPv4 range never matches an IPv6 peer and vice versa — `::/0` does not cover an IPv4 peer, and
+  `0.0.0.0/0` does not cover an IPv6 one — so an operator who means "trust every peer" must list
+  both `0.0.0.0/0` and `::/0`, not just one of the two.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the

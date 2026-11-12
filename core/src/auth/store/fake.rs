@@ -594,25 +594,30 @@ impl AuthStore for FakeAuthStore {
             .filter(|c| c.id != builtin_client_id)
             .count() as u64;
         if dynamic_count >= max_dynamic_clients {
-            // Evict the oldest unused dynamic client (ties broken by id,
-            // matching the libsql store's `ORDER BY created_at ASC, id
-            // ASC`) to free exactly the one slot this registration needs.
-            // Only refuse if no unused client is left to evict — every
-            // remaining slot is held by a client with a completed
-            // authorization (or the built-in client, excluded above).
-            let victim = inner
+            // Exactly how many of the oldest unused dynamic clients (ties
+            // broken by id, matching the libsql store's `ORDER BY
+            // created_at ASC, id ASC`) must go for the table to land at
+            // the cap once the insert below adds one back. If fewer
+            // unused clients exist than that, every remaining slot is held
+            // by a client with a completed authorization (or the built-in
+            // client, excluded above) — refuse instead, evicting nothing.
+            let needed = dynamic_count - (max_dynamic_clients - 1);
+            let mut unused: Vec<(&str, &str)> = inner
                 .oauth_clients
                 .iter()
                 .filter(|c| c.id != builtin_client_id && !used_client_ids.contains(&c.id))
-                .min_by(|a, b| {
-                    (a.created_at.as_str(), a.id.as_str())
-                        .cmp(&(b.created_at.as_str(), b.id.as_str()))
-                })
-                .map(|c| c.id.clone());
-            match victim {
-                Some(id) => inner.oauth_clients.retain(|c| c.id != id),
-                None => return Ok(RegisterClientOutcome::CapReached),
+                .map(|c| (c.created_at.as_str(), c.id.as_str()))
+                .collect();
+            if (unused.len() as u64) < needed {
+                return Ok(RegisterClientOutcome::CapReached);
             }
+            unused.sort_unstable();
+            let victims: std::collections::HashSet<String> = unused
+                .into_iter()
+                .take(needed as usize)
+                .map(|(_, id)| id.to_string())
+                .collect();
+            inner.oauth_clients.retain(|c| !victims.contains(&c.id));
         }
         inner.oauth_clients.push(client.clone());
         Ok(RegisterClientOutcome::Created)

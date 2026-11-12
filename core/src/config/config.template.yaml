@@ -27,6 +27,8 @@ server:
   #   burst: 20
   #   trusted_proxies: []           # peers whose X-Forwarded-For is honored; e.g. [127.0.0.1, ::1];
   #                                 # IPv4-mapped entries (::ffff:a.b.c.d) are rejected — write a.b.c.d
+  #                                 # IPv4 and IPv6 ranges never cover each other's family — to trust
+  #                                 # every peer, list 0.0.0.0/0 AND ::/0, not just one of the two
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:

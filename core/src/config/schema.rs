@@ -207,6 +207,13 @@ pub struct AbuseLimitsConfig {
     /// form) outright — write the plain IPv4 form instead, since the
     /// resolved peer address is itself normalized to IPv4 before matching,
     /// so the mapped form could never match anyway.
+    ///
+    /// An IPv4 and an IPv6 range never match each other's address family:
+    /// `::/0` does not cover an IPv4 peer, and `0.0.0.0/0` does not cover an
+    /// IPv6 one. An operator who means "trust every peer" must list both
+    /// `0.0.0.0/0` and `::/0` rather than either alone; one alone silently
+    /// leaves every peer of the other family untrusted (and, if it is a
+    /// direct loopback peer, not exempt from the rate limit either).
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }

@@ -406,18 +406,23 @@ pub trait AuthStore: Send + Sync + 'static {
     ///    activity at, earlier than a token ever being minted — and were
     ///    registered before `unused_before` (RFC 3339).
     /// 2. If the number of dynamically registered clients (every
-    ///    `oauth_clients` row except `builtin_client_id`) is still at
-    ///    `max_dynamic_clients`, evict the single oldest dynamically
-    ///    registered client that has never completed an authorization
-    ///    (ties broken by `id`), regardless of its age — an unauthenticated
-    ///    caller that fills every slot with fresh registrations must not be
-    ///    able to lock out every other registration attempt until those
-    ///    rows age past `unused_before` on their own. A client that
-    ///    registered but has not yet started authorization can be evicted
-    ///    this way and must register again.
-    /// 3. Only if every remaining slot is held by a client with a completed
-    ///    authorization (or the built-in client, which never counts and is
-    ///    never pruned or evicted) does this return
+    ///    `oauth_clients` row except `builtin_client_id`) is still at or
+    ///    past `max_dynamic_clients`, evict exactly as many of the oldest
+    ///    dynamically registered clients that have never completed an
+    ///    authorization (ties broken by `id`) as it takes for the table to
+    ///    land at `max_dynamic_clients` once the insert below adds one back
+    ///    — regardless of their age. An unauthenticated caller that fills
+    ///    every slot with fresh registrations must not be able to lock out
+    ///    every other registration attempt until those rows age past
+    ///    `unused_before` on their own. A client that registered but has
+    ///    not yet started authorization can be evicted this way and must
+    ///    register again.
+    /// 3. If fewer unused dynamically registered clients exist than the
+    ///    number needed, every remaining slot is held by a client with a
+    ///    completed authorization (or the built-in client, which never
+    ///    counts and is never pruned or evicted) — refusing after
+    ///    destroying some of those registrations would be worse than
+    ///    refusing outright, so this evicts nothing at all and returns
     ///    [`RegisterClientOutcome::CapReached`] without inserting anything.
     ///
     /// Steps 1-3 commit as one transaction. Pruning and eviction commit even
