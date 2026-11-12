@@ -827,7 +827,7 @@ Returns `201`:
 ```json
 {
   "id": "01ARZ3NDEKTSV4RRFFQ69G5KEY",
-  "secret": "ldb_QUFBQTExMTFCQkJCMjIyMkNDQ0MzMzMzRERERDQ0NAA"
+  "secret": "ldb_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 }
 ```
 
@@ -1011,8 +1011,8 @@ Returns `201`:
   "max_uses": 1,
   "expires_at": null,
   "created_at": "2026-06-10T12:00:00Z",
-  "token": "ldb_S0VZMWFhYWFCQkJCY2NjY0RERERlZWVlRkZGRmdnZwA",
-  "consent_url": "http://127.0.0.1:7700/join?invite=ldb_S0VZMWFhYWFCQkJCY2NjY0RERERlZWVlRkZGRmdnZwA"
+  "token": "ldb_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+  "consent_url": "http://127.0.0.1:7700/join?invite=ldb_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
 }
 ```
 
@@ -1071,7 +1071,7 @@ invite-redemption flow — see [Trust model and authentication](#trust-model-and
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/invites/redeem \
   -H 'Content-Type: application/json' \
-  -d '{"token":"ldb_S0VZMWFhYWFCQkJCY2NjY0RERERlZWVlRkZGRmdnZwA","requested_name":"alice"}'
+  -d '{"token":"ldb_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE","requested_name":"alice"}'
 ```
 
 `open`-mode invite → `201`, the user, its granted stores, and a show-once API key, all created
@@ -1081,7 +1081,7 @@ immediately:
 {
   "user": { "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "name": "alice", "role": "member" },
   "granted_stores": ["docs"],
-  "api_key": "ldb_QUFBQTExMTFCQkJCMjIyMkNDQ0MzMzMzRERERDQ0NAA"
+  "api_key": "ldb_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 }
 ```
 
@@ -1090,7 +1090,7 @@ immediately:
 ```json
 {
   "request_id": "01ARZ3NDEKTSV4RRFFQ69G5REQ",
-  "request_secret": "ldb_UkRNMmZmZmZHR0dHaGhoaElJSUlqampqS0tLS2xsbAA",
+  "request_secret": "ldb_IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
   "poll": "/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/poll"
 }
 ```
@@ -1219,7 +1219,7 @@ poll first and collect the one-time API key ahead of the real requester (the sam
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/poll \
   -H 'Content-Type: application/json' \
-  -d '{"secret":"ldb_UkRNMmZmZmZHR0dHaGhoaElJSUlqampqS0tLS2xsbAA"}'
+  -d '{"secret":"ldb_IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII"}'
 ```
 
 Malformed JSON, a wrong field type, or a missing/wrong `Content-Type` is `invalid_request`, 400,
@@ -1240,7 +1240,7 @@ user created by the approval is deleted before the key has been collected, the p
 ```
 
 ```json
-{ "state": "approved", "api_key": "ldb_QUFBQTExMTFCQkJCMjIyMkNDQ0MzMzMzRERERDQ0NAA" }
+{ "state": "approved", "api_key": "ldb_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
 ```
 
 ```json
