@@ -14,6 +14,13 @@ const AUTH_CODE_COLUMNS: &str = "id, client_id, user_id, code_hash, code_challen
 
 pub(crate) async fn create_auth_code(db: &LibsqlDb, code: &AuthCodeRow) -> Result<(), Error> {
     let conn = db.writer().await;
+    create_auth_code_on(&conn, code).await
+}
+
+pub(super) async fn create_auth_code_on(
+    conn: &libsql::Connection,
+    code: &AuthCodeRow,
+) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO auth_codes
             (id, client_id, user_id, code_hash, code_challenge, code_challenge_method,

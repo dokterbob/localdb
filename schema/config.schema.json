@@ -214,8 +214,9 @@
         "unused_client_ttl_secs": {
           "type": "integer",
           "format": "int64",
-          "description": "How long (seconds) a dynamically registered client may sit unused —\nno authorization code ever issued to it — before a later\nregistration attempt may prune it to make room under\n`max_dynamic_clients`. Must be at least 1 — `validate_config` rejects\n`0`.",
+          "description": "How long (seconds) a dynamically registered client may sit unused —\nno authorization code ever issued to it — before a later\nregistration attempt may prune it to make room under\n`max_dynamic_clients`. Must be between 1 and 315360000 (10 years) —\n`validate_config` rejects `0` and anything past the 10-year ceiling,\nsince an unbounded value here reaches `chrono` duration arithmetic\nthat would otherwise overflow.",
           "minimum": 1,
+          "maximum": 315360000,
           "default": 86400
         },
         "requests_per_second": {

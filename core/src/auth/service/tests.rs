@@ -11,7 +11,7 @@ fn service() -> AuthService<FakeAuthStore> {
 /// exercising the cap/TTL behavior — high enough cap, long enough TTL that
 /// ordinary registration tests never trip it.
 fn test_registration_policy() -> crate::auth::client::RegistrationPolicy {
-    crate::auth::client::RegistrationPolicy {
+    crate::auth::client::RegistrationPolicy::Limited {
         max_dynamic_clients: 1000,
         unused_client_ttl_secs: 86400,
     }

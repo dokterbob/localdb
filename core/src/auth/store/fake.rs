@@ -747,6 +747,59 @@ impl AuthStore for FakeAuthStore {
         Ok(true)
     }
 
+    async fn redeem_open_invite_and_issue_code(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+        builtin_client_id: &str,
+        auth_code: &AuthCodeRow,
+    ) -> Result<RedeemAndIssueCodeOutcome, Error> {
+        let mut inner = self.inner.write().await;
+        let Some(index) = invite_use_index_if_eligible(&inner.invites, invite_id) else {
+            return Ok(RedeemAndIssueCodeOutcome::NotEligible);
+        };
+        // The built-in client is never a row in `oauth_clients` to begin
+        // with — mirrors `prune_and_create_oauth_client`'s own exemption.
+        if auth_code.client_id != builtin_client_id
+            && !inner
+                .oauth_clients
+                .iter()
+                .any(|c| c.id == auth_code.client_id)
+        {
+            return Ok(RedeemAndIssueCodeOutcome::UnknownClient);
+        }
+        if name_taken(&inner.users, &user.name) {
+            return Err(Error::InvalidRequest {
+                message: format!("user '{}' already exists", user.name),
+            });
+        }
+        if inner.poison_next_insert_token {
+            inner.poison_next_insert_token = false;
+            return Err(Error::Internal {
+                message: "simulated token insert failure".into(),
+                correlation_id: "fake_redeem_open_invite_and_issue_code".into(),
+            });
+        }
+        if let Some(parent) = &credential.minted_by_family {
+            if inner.compromised_families.contains(parent) {
+                return Err(Error::Unauthorized {
+                    message: "session revoked".to_string(),
+                });
+            }
+        }
+        // Every check above ran before touching any state, so a
+        // `NotEligible`/`UnknownClient`/`Err` return here never leaves a
+        // partial mutation behind.
+        inner.invites[index].uses += 1;
+        inner.users.push(user.clone());
+        inner.grants.extend_from_slice(grants);
+        inner.tokens.push(credential.clone());
+        inner.auth_codes.push(auth_code.clone());
+        Ok(RedeemAndIssueCodeOutcome::Issued)
+    }
+
     async fn redeem_closed_invite(
         &self,
         invite_id: &str,

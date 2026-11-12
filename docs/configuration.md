@@ -196,14 +196,14 @@ Limits on the daemon's public, unauthenticated auth routes (`/authorize`, `/join
 `/revoke`, `/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`) — the
 `/.well-known/*` discovery documents are never limited.
 
-| Field                    | Default | Notes                                                                                                                                                             |
-| ------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enable`                 | `true`  | Master switch for this whole section — registration cap/TTL/eviction and the rate limit alike. Loopback callers are always exempt from the rate limit regardless. |
-| `max_dynamic_clients`    | `1000`  | Cap on dynamically registered OAuth2 clients (`POST /register`). The built-in `localdb-cli` client never counts.                                                  |
-| `unused_client_ttl_secs` | `86400` | How long an unused registration (no authorization ever completed) may sit before it becomes eligible for pruning/eviction.                                        |
-| `requests_per_second`    | `5`     | Per-client-address sustained request rate across the limited routes (integer; must be `>= 1`)                                                                     |
-| `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                                                    |
-| `trusted_proxies`        | `[]`    | IP addresses/CIDR ranges this daemon forwards from — see below. Each entry must parse as an address or CIDR range.                                                |
+| Field                    | Default | Notes                                                                                                                                                                      |
+| ------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enable`                 | `true`  | Master switch for this whole section — registration cap/TTL/eviction and the rate limit alike. Loopback callers are always exempt from the rate limit regardless.          |
+| `max_dynamic_clients`    | `1000`  | Cap on dynamically registered OAuth2 clients (`POST /register`). The built-in `localdb-cli` client never counts.                                                           |
+| `unused_client_ttl_secs` | `86400` | How long an unused registration (no authorization ever completed) may sit before it becomes eligible for pruning/eviction (must be between `1` and `315360000`, 10 years). |
+| `requests_per_second`    | `5`     | Per-client-address sustained request rate across the limited routes (integer; must be `>= 1`)                                                                              |
+| `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                                                             |
+| `trusted_proxies`        | `[]`    | IP addresses/CIDR ranges this daemon forwards from — see below. Each entry must parse as an address or CIDR range.                                                         |
 
 At the registration cap, `POST /register` evicts the oldest dynamically registered client that has
 never completed an authorization, rather than refusing outright, so a registration flood can't lock
@@ -218,14 +218,20 @@ daemon's standard `{"code", "message"}` shape.
 **Address resolution and `trusted_proxies`:** the rate limiter keys on the real TCP peer address,
 unless that peer is listed in `trusted_proxies`, in which case the client address is instead taken
 from the `X-Forwarded-For` header (only this header — RFC 7239's `Forwarded: for=` is not accepted),
-walked right to left and skipping any entry that is itself a trusted proxy. Without a configured
-trusted proxy, every client behind a reverse proxy shares the proxy's own address, exactly as
-before. **Listing a proxy that does not itself overwrite or correctly append `X-Forwarded-For` lets
-any client spoof its own address — only list proxies you control and that set the header
-correctly.** The loopback exemption and the limiter's bucket key both normalize IPv4-mapped IPv6
-addresses to their IPv4 form first; a genuine (non-mapped) IPv6 address is additionally keyed on its
-/64 network prefix (not the full address), since an ISP commonly delegates an entire /64 to one
-customer. See
+walked right to left and skipping any entry that is itself a trusted proxy. The **loopback exemption
+applies only to a direct peer that is not itself a trusted proxy** — an address `X-Forwarded-For`
+names is rate-limited like any other client even if it happens to be `127.0.0.1`, and a trusted
+proxy whose header resolves to nothing usable (missing, empty, non-UTF-8, every hop malformed, or an
+entirely-trusted chain) is rate-limited under the proxy's own address rather than treated as exempt.
+A hop that doesn't parse as a bare IP address ends resolution outright — it is never skipped past in
+favor of an earlier, possibly attacker-controlled hop; no `ip:port`/`[ipv6]:port` normalization is
+attempted. Without a configured trusted proxy, every client behind a reverse proxy shares the
+proxy's own address, exactly as before. **Listing a proxy that does not itself overwrite or
+correctly append `X-Forwarded-For` lets any client spoof its own address — only list proxies you
+control and that set the header correctly.** The trust/loopback checks and the limiter's bucket key
+both normalize IPv4-mapped IPv6 addresses to their IPv4 form first; a genuine (non-mapped) IPv6
+address is additionally keyed on its /64 network prefix (not the full address), since an ISP
+commonly delegates an entire /64 to one customer. See
 [specs/05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication)
 for the full behavior.
 

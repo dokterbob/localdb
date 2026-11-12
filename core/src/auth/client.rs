@@ -141,38 +141,37 @@ pub fn registration_client_name_within_bounds(client_name: Option<&str>) -> bool
 /// above: those bound a single request's payload size; this bounds how many
 /// dynamically registered clients may accumulate over time. Sourced from
 /// `server.abuse_limits` config (`core::config::schema::AbuseLimitsConfig`);
-/// kept as a plain struct here rather than importing that type, so `core`
+/// kept as a plain enum here rather than importing that type, so `core`
 /// stays free of any dependency direction on `server`'s config module.
+///
+/// An explicit `Disabled` variant, not a `Limited` with an effectively
+/// infinite cap and TTL: the latter still runs
+/// `AuthStore::prune_and_create_oauth_client`'s prune/count/evict logic on
+/// every registration — for an extreme-enough TTL, against a row whose
+/// `created_at` predates it, that logic can still delete something, even
+/// though the whole point of `server.abuse_limits.enable: false` is that
+/// nothing in this section ever removes a row. `Disabled` makes
+/// registration a plain insert instead, so there is no condition under
+/// which it prunes or evicts anything.
 #[derive(Debug, Clone, Copy)]
-pub struct RegistrationPolicy {
-    /// Maximum number of dynamically registered clients kept at once. The
-    /// built-in [`LOCALDB_CLI_CLIENT_ID`] client never counts toward this
-    /// and is never pruned.
-    pub max_dynamic_clients: u64,
-    /// How long a dynamically registered client may sit unused — no
-    /// authorization code ever issued to it — before it becomes eligible
-    /// for pruning at the next registration attempt.
-    pub unused_client_ttl_secs: i64,
-}
-
-/// A TTL large enough that [`RegistrationPolicy::unlimited`]'s pruning
-/// condition (`created_at < now - unused_client_ttl_secs`) can never match a
-/// real row, while staying well inside the range `rfc3339_from_now` can
-/// format without overflow (unlike `i64::MAX`, which would).
-const UNLIMITED_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
-
-impl RegistrationPolicy {
-    /// No pruning, no eviction, no cap: every registration is accepted and
-    /// nothing already registered is ever removed. Used for
-    /// `server.abuse_limits.enable: false` — that switch turns off every
-    /// limit in its section, registration included, rather than only the
-    /// rate limiter.
-    pub const fn unlimited() -> Self {
-        Self {
-            max_dynamic_clients: u64::MAX,
-            unused_client_ttl_secs: UNLIMITED_TTL_SECS,
-        }
-    }
+pub enum RegistrationPolicy {
+    /// `server.abuse_limits.enable: false`: every registration is a plain
+    /// insert — no pruning, no counting, no eviction, and nothing already
+    /// registered is ever removed.
+    Disabled,
+    /// `server.abuse_limits.enable: true`: `AuthStore::
+    /// prune_and_create_oauth_client`'s prune/count/evict/insert sequence
+    /// applies to every registration.
+    Limited {
+        /// Maximum number of dynamically registered clients kept at once.
+        /// The built-in [`LOCALDB_CLI_CLIENT_ID`] client never counts
+        /// toward this and is never pruned.
+        max_dynamic_clients: u64,
+        /// How long a dynamically registered client may sit unused — no
+        /// authorization code ever issued to it — before it becomes
+        /// eligible for pruning at the next registration attempt.
+        unused_client_ttl_secs: i64,
+    },
 }
 
 /// A `POST /register` request that fails this server's DCR validation policy

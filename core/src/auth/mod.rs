@@ -26,15 +26,15 @@ pub use client::{
 };
 pub use principal::{Principal, Role, SessionOrigin, StoreAccess};
 pub use service::{
-    AuthService, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome, RedeemOutcome,
-    RegisterClientError,
+    AuthService, AuthorizeInviteOutcome, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome,
+    RedeemOutcome, RegisterClientError,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeAuthStore;
 pub use store::{
     first_unused_name, AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow,
-    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RegisterClientOutcome, RotateOutcome,
-    StoreGrantRow, TokenKind, UserRow,
+    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RedeemAndIssueCodeOutcome,
+    RegisterClientOutcome, RotateOutcome, StoreGrantRow, TokenKind, UserRow,
 };
 pub use token::{
     expires_within, generate_pkce_pair, hash_secret, is_expired, mint_secret, rfc3339_from_now,

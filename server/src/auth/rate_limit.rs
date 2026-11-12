@@ -25,6 +25,16 @@
 //! client. [`trusted_proxy::limiter_key`] then reduces that address to its
 //! bucket key — unchanged for IPv4, masked to its /64 network prefix for a
 //! genuine IPv6 address (specs/05-surfaces.md §3.1).
+//!
+//! The loopback exemption applies to exactly one of
+//! [`trusted_proxy::ClientAddr`]'s three cases — a *direct* TCP peer that is
+//! not itself a configured trusted proxy. An address `X-Forwarded-For`
+//! named is never exempt, whatever it is, because nothing authenticates a
+//! header's content; a trusted proxy whose header resolves to nothing
+//! usable is limited under its own address instead of being treated as
+//! exempt or as an unidentifiable caller. See `trusted_proxy::
+//! resolve_client_addr`'s doc comment for the exact walk and why a
+//! malformed hop ends resolution rather than being skipped.
 
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
@@ -44,7 +54,7 @@ use serde::Serialize;
 
 use localdb_core::config::schema::{parse_ip_cidr, AbuseLimitsConfig};
 
-use super::trusted_proxy;
+use super::trusted_proxy::{self, ClientAddr};
 use crate::error::ErrorResponse;
 use crate::state::AppState;
 
@@ -142,10 +152,38 @@ impl AbuseLimiter {
         }
     }
 
+    /// A limiter with `burst` capacity and a 5-minute replenish period,
+    /// trusting no proxy. Used by tests that make exactly `burst` calls and
+    /// assert the next one is rejected: a 5-minute-per-token quota (instead
+    /// of `requests_per_second: 1`'s real one-second quota) makes a token
+    /// refilling between those calls impossible short of a multi-minute
+    /// scheduler stall, so the assertion never depends on how quickly the
+    /// two calls actually ran.
+    #[cfg(test)]
+    pub fn for_test_with_burst(burst: u32) -> Self {
+        let quota = Quota::with_period(Duration::from_secs(300))
+            .expect("300s is a valid quota period")
+            .allow_burst(nonzero_or(burst, 1));
+        let limiter: GovernorLimiter = GovernorRateLimiter::new(
+            quota,
+            DefaultKeyedStateStore::default(),
+            DefaultClock::default(),
+        );
+        Self {
+            inner: Some(Arc::new(Inner {
+                limiter,
+                check_count: AtomicU64::new(0),
+            })),
+            trusted_proxies: Arc::new(Vec::new()),
+        }
+    }
+
     /// Resolve the address a request from `peer` carrying `forwarded_for`
-    /// (every `X-Forwarded-For` header line present, in order) should be
-    /// limited/exempted on — see [`trusted_proxy::resolve_client_addr`].
-    fn resolve_client_addr(&self, peer: IpAddr, forwarded_for: &[String]) -> IpAddr {
+    /// (every `X-Forwarded-For` header line present, in order — `None` if
+    /// the header was missing or any line of it failed to decode as text)
+    /// should be limited/exempted on — see
+    /// [`trusted_proxy::resolve_client_addr`].
+    fn resolve_client_addr(&self, peer: IpAddr, forwarded_for: Option<&[String]>) -> ClientAddr {
         trusted_proxy::resolve_client_addr(peer, &self.trusted_proxies, forwarded_for)
     }
 
@@ -230,12 +268,16 @@ fn too_many_requests(path: &str, wait: Duration) -> Response {
 /// client behind a reverse proxy shares the proxy's own address, same as
 /// before trusted-proxy support existed.
 ///
-/// Loopback peers are always exempt, regardless of `abuse_limits.enable` —
-/// a local daemon must never throttle its own user; the check runs against
-/// the *resolved* address (unmapped but not yet /64-masked), so a direct
-/// loopback peer that is not a trusted proxy stays exempt, while a request
-/// arriving via a trusted loopback proxy is limited by the real client
-/// address `X-Forwarded-For` names instead.
+/// A direct loopback peer that is not itself a configured trusted proxy is
+/// always exempt, regardless of `abuse_limits.enable` — a local daemon
+/// must never throttle its own user. Every other case is limited,
+/// including a request arriving via a trusted loopback proxy: the real
+/// client `X-Forwarded-For` names is limited on its own address (never
+/// exempt, even if that address is itself loopback — a header never
+/// authenticates anything), and a trusted proxy whose header resolves to
+/// nothing usable is limited under the proxy's own address rather than
+/// treated as exempt or unidentifiable. See
+/// `trusted_proxy::ClientAddr::is_loopback_exempt`'s doc comment.
 ///
 /// A request with no `ConnectInfo` at all (a test harness invoking a
 /// handler directly, bypassing the real TCP listener) is also never
@@ -259,25 +301,35 @@ pub async fn limit_abuse(State(state): State<AppState>, req: Request, next: Next
     };
     let forwarded_for = forwarded_for_header_values(&req);
     let limiter = state.abuse_limiter();
-    let client = limiter.resolve_client_addr(addr.ip(), &forwarded_for);
-    if client.is_loopback() {
+    let client = limiter.resolve_client_addr(addr.ip(), forwarded_for.as_deref());
+    if client.is_loopback_exempt() {
         return next.run(req).await;
     }
-    match limiter.check(trusted_proxy::limiter_key(client)) {
+    match limiter.check(trusted_proxy::limiter_key(client.key())) {
         Ok(()) => next.run(req).await,
         Err(wait) => too_many_requests(req.uri().path(), wait),
     }
 }
 
-/// Every `X-Forwarded-For` header line on `req`, in the order they appear.
-/// Only this header is accepted — not RFC 7239's `Forwarded: for=` — see
-/// `trusted_proxy::resolve_client_addr`'s doc comment.
-fn forwarded_for_header_values(req: &Request) -> Vec<String> {
-    req.headers()
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|v| v.to_str().ok().map(str::to_string))
-        .collect()
+/// Every `X-Forwarded-For` header line on `req`, in the order they appear,
+/// or `None` if the header is absent or any one line is not valid UTF-8.
+/// A header that fails to decode must not silently fall back to whatever
+/// other lines *did* decode — that would let an attacker who can make one
+/// line unreadable control which of the remaining lines resolution sees,
+/// the same class of problem a malformed hop inside a line is (see
+/// `trusted_proxy::resolve_client_addr`'s doc comment) — so one bad line
+/// fails the whole header, just as a missing header does. Only this header
+/// is accepted — not RFC 7239's `Forwarded: for=`.
+fn forwarded_for_header_values(req: &Request) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    for v in req.headers().get_all("x-forwarded-for").iter() {
+        values.push(v.to_str().ok()?.to_string());
+    }
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 #[cfg(test)]

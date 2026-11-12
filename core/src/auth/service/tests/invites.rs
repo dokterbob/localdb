@@ -775,3 +775,187 @@ async fn invite_expiry_is_validated_and_normalized() {
         Some("2030-01-01T00:00:00Z")
     );
 }
+
+// -----------------------------------------------------------------
+// `redeem_invite_for_authorize` — the OAuth consent page's invite branch
+// only: an `open`-mode mint and its first authorization code commit as one
+// transaction, checking `client_id` still exists inside that same
+// transaction.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn redeem_invite_for_authorize_open_mode_issues_a_code_for_the_builtin_client() {
+    let svc = service();
+    let issued = make_open_invite(&svc, 1).await;
+    let (_verifier, challenge) = crate::auth::generate_pkce_pair();
+
+    let outcome = svc
+        .redeem_invite_for_authorize(
+            &issued.secret,
+            "newbie",
+            LOCALDB_CLI_CLIENT_ID,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+        )
+        .await
+        .unwrap();
+    let AuthorizeInviteOutcome::Issued {
+        user,
+        grants,
+        issued: code,
+    } = outcome
+    else {
+        panic!("expected Issued outcome");
+    };
+    assert_eq!(user.name, "newbie");
+    assert_eq!(grants, vec!["docs".to_string()]);
+    assert!(code.secret.starts_with(TOKEN_PREFIX));
+    assert_eq!(code.row.client_id, LOCALDB_CLI_CLIENT_ID);
+    assert_eq!(code.row.user_id, user.id);
+
+    // The invite's use is burned, and the code actually redeems.
+    let invite = svc
+        .store
+        .find_invite(&issued.row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invite.uses, 1);
+    let (redeemed_user, _family) = svc
+        .redeem_auth_code(
+            &code.secret,
+            LOCALDB_CLI_CLIENT_ID,
+            "http://127.0.0.1:1/cb",
+            &_verifier,
+        )
+        .await
+        .unwrap();
+    assert_eq!(redeemed_user.id, user.id);
+}
+
+#[tokio::test]
+async fn redeem_invite_for_authorize_open_mode_issues_a_code_for_a_registered_client() {
+    let svc = service();
+    let policy = test_registration_policy();
+    let client = svc
+        .register_client(
+            vec!["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .unwrap();
+    let issued = make_open_invite(&svc, 1).await;
+    let (_verifier, challenge) = crate::auth::generate_pkce_pair();
+
+    let outcome = svc
+        .redeem_invite_for_authorize(
+            &issued.secret,
+            "newbie",
+            &client.id,
+            "https://app.example.com/cb",
+            &challenge,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AuthorizeInviteOutcome::Issued { .. }));
+}
+
+/// The core regression this finding fixes: a `client_id` that doesn't
+/// exist (evicted, or never registered) must refuse atomically — nothing
+/// commits, not even the invite's reserved use.
+#[tokio::test]
+async fn redeem_invite_for_authorize_unknown_client_commits_nothing() {
+    let svc = service();
+    let issued = make_open_invite(&svc, 1).await;
+    let (_verifier, challenge) = crate::auth::generate_pkce_pair();
+
+    let outcome = svc
+        .redeem_invite_for_authorize(
+            &issued.secret,
+            "newbie",
+            "evicted-dynamic-client",
+            "https://app.example.com/cb",
+            &challenge,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AuthorizeInviteOutcome::UnknownClient));
+
+    let invite = svc
+        .store
+        .find_invite(&issued.row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        invite.uses, 0,
+        "an unknown client must not burn the invite's use"
+    );
+    assert!(
+        svc.store
+            .get_user_by_name("newbie")
+            .await
+            .unwrap()
+            .is_none(),
+        "an unknown client must not create a user"
+    );
+}
+
+#[tokio::test]
+async fn redeem_invite_for_authorize_closed_mode_behaves_like_redeem_invite() {
+    let svc = service();
+    let issued = make_closed_invite(&svc, 1).await;
+    let (_verifier, challenge) = crate::auth::generate_pkce_pair();
+
+    let outcome = svc
+        .redeem_invite_for_authorize(
+            &issued.secret,
+            "newbie",
+            LOCALDB_CLI_CLIENT_ID,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+        )
+        .await
+        .unwrap();
+    let AuthorizeInviteOutcome::Closed {
+        request_id,
+        request_secret,
+    } = outcome
+    else {
+        panic!("expected Closed outcome");
+    };
+    assert!(!request_id.is_empty());
+    assert!(!request_secret.is_empty());
+
+    let invite = svc
+        .store
+        .find_invite(&issued.row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invite.uses, 1);
+}
+
+#[tokio::test]
+async fn redeem_invite_for_authorize_revoked_or_expired_is_rejected_like_redeem_invite() {
+    let svc = service();
+    let issued = make_open_invite(&svc, 1).await;
+    svc.store.revoke_invite(&issued.row.id).await.unwrap();
+    let (_verifier, challenge) = crate::auth::generate_pkce_pair();
+
+    let err = svc
+        .redeem_invite_for_authorize(
+            &issued.secret,
+            "newbie",
+            LOCALDB_CLI_CLIENT_ID,
+            "http://127.0.0.1:1/cb",
+            &challenge,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized { .. }));
+}

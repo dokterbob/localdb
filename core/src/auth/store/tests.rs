@@ -843,3 +843,129 @@ async fn deleting_a_user_cascades_their_auth_codes_so_the_client_they_used_becom
         .unwrap()
         .is_some());
 }
+
+// -----------------------------------------------------------------
+// `redeem_open_invite_and_issue_code` (specs/05-surfaces.md §3.1): the
+// `FakeAuthStore` counterpart to `store-libsql`'s equivalent tests — the
+// OAuth consent page's invite branch only, mint plus first authorization
+// code as one transaction, checking `client_id` still exists inside it.
+// -----------------------------------------------------------------
+
+fn auth_code_for_client_and_user(client_id: &str, user_id: &str, code_hash: &str) -> AuthCodeRow {
+    AuthCodeRow {
+        id: format!("code-{code_hash}"),
+        client_id: client_id.to_string(),
+        user_id: user_id.to_string(),
+        code_hash: code_hash.to_string(),
+        code_challenge: "challenge".to_string(),
+        code_challenge_method: "S256".to_string(),
+        redirect_uri: "https://app.example.com/cb".to_string(),
+        expires_at: "2099-01-01T00:00:00Z".to_string(),
+        consumed_at: None,
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+        minted_by_family: None,
+    }
+}
+
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_succeeds_with_a_registered_client() {
+    let store = FakeAuthStore::new();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("client-1", "2026-06-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let u = user("u1", "newbie");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user("client-1", "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::Issued);
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 1);
+    assert!(store.get_user("u1").await.unwrap().is_some());
+    assert!(store.find_token("t1").await.unwrap().is_some());
+    assert!(store
+        .find_auth_code_by_hash("code-hash")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// The built-in client is never a row in `oauth_clients` — the existence
+/// check must not refuse it.
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_succeeds_with_the_builtin_client() {
+    let store = FakeAuthStore::new();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let u = user("u1", "newbie");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::Issued);
+}
+
+/// The core regression this closes: a `client_id` with no row in
+/// `oauth_clients` — evicted, or (as here) simply never registered — must
+/// refuse atomically. Nothing commits: not the invite's use, not the user,
+/// not the credential, not the code.
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_refuses_an_unknown_client_and_commits_nothing() {
+    let store = FakeAuthStore::new();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let u = user("u1", "newbie");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user("evicted-client", "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::UnknownClient);
+
+    assert_eq!(
+        store.find_invite("i1").await.unwrap().unwrap().uses,
+        0,
+        "an unknown client must not burn the invite's use"
+    );
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store.find_token("t1").await.unwrap().is_none());
+    assert!(store
+        .find_auth_code_by_hash("code-hash")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_revoked_or_expired_is_not_eligible() {
+    let store = FakeAuthStore::new();
+    let mut revoked = invite("i1", "h1", InviteMode::Open);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    let u = user("u1", "alice");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+}

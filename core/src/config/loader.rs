@@ -12,7 +12,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    config::{platform::PlatformPaths, schema::parse_ip_cidr, schema::RawConfig},
+    config::{
+        platform::PlatformPaths,
+        schema::{parse_ip_cidr, RawConfig, MAX_UNUSED_CLIENT_TTL_SECS},
+    },
     Error,
 };
 
@@ -213,10 +216,14 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         });
     }
 
-    if config.server.abuse_limits.unused_client_ttl_secs < 1 {
+    if config.server.abuse_limits.unused_client_ttl_secs < 1
+        || config.server.abuse_limits.unused_client_ttl_secs > MAX_UNUSED_CLIENT_TTL_SECS
+    {
         return Err(Error::InvalidConfig {
-            message: "server.abuse_limits.unused_client_ttl_secs must be greater than zero"
-                .to_string(),
+            message: format!(
+                "server.abuse_limits.unused_client_ttl_secs must be between 1 and \
+                 {MAX_UNUSED_CLIENT_TTL_SECS} (10 years)"
+            ),
         });
     }
 

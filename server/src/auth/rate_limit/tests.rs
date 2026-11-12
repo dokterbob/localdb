@@ -18,13 +18,17 @@ fn ip(last_octet: u8) -> IpAddr {
 
 // -----------------------------------------------------------------
 // `AbuseLimiter::check` — a tiny burst makes the token-bucket boundary
-// deterministic without a fake clock or any sleep: two back-to-back calls
-// against burst=1 always land on either side of the boundary.
+// deterministic without a sleep: two back-to-back calls against burst=1
+// always land on either side of the boundary. `for_test_with_burst` gives
+// these a 5-minute replenish period (rather than going through `cfg`'s real
+// `requests_per_second: 1`, a one-second quota) so the boundary can never
+// flip out from under the assertion even if the test thread is descheduled
+// between the two calls — see its doc comment.
 // -----------------------------------------------------------------
 
 #[test]
 fn burst_of_one_then_the_second_call_is_rejected() {
-    let limiter = AbuseLimiter::new(&cfg(true, 1, 1));
+    let limiter = AbuseLimiter::for_test_with_burst(1);
     assert!(limiter.check(ip(1)).is_ok(), "first call is within burst");
     assert!(
         limiter.check(ip(1)).is_err(),
@@ -34,7 +38,7 @@ fn burst_of_one_then_the_second_call_is_rejected() {
 
 #[test]
 fn rejection_reports_a_positive_wait() {
-    let limiter = AbuseLimiter::new(&cfg(true, 1, 1));
+    let limiter = AbuseLimiter::for_test_with_burst(1);
     limiter.check(ip(1)).unwrap();
     let wait = limiter.check(ip(1)).unwrap_err();
     assert!(wait > Duration::ZERO);
@@ -42,7 +46,7 @@ fn rejection_reports_a_positive_wait() {
 
 #[test]
 fn distinct_ips_have_independent_buckets() {
-    let limiter = AbuseLimiter::new(&cfg(true, 1, 1));
+    let limiter = AbuseLimiter::for_test_with_burst(1);
     assert!(limiter.check(ip(1)).is_ok());
     assert!(
         limiter.check(ip(2)).is_ok(),
@@ -85,8 +89,11 @@ fn cfg_with_trusted_proxies(trusted_proxies: Vec<String>) -> AbuseLimitsConfig {
 #[test]
 fn resolve_client_addr_ignores_the_header_from_an_untrusted_peer() {
     let limiter = AbuseLimiter::new(&cfg_with_trusted_proxies(Vec::new()));
-    let resolved = limiter.resolve_client_addr(ip(7), &["198.51.100.1".to_string()]);
-    assert_eq!(resolved, ip(7));
+    let resolved = limiter.resolve_client_addr(ip(7), Some(&["198.51.100.1".to_string()]));
+    assert_eq!(
+        resolved,
+        crate::auth::trusted_proxy::ClientAddr::Direct(ip(7))
+    );
 }
 
 #[test]
@@ -94,9 +101,50 @@ fn resolve_client_addr_honors_the_header_from_a_trusted_peer() {
     let limiter = AbuseLimiter::new(&cfg_with_trusted_proxies(vec!["127.0.0.1".to_string()]));
     let resolved = limiter.resolve_client_addr(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
-        &["198.51.100.1".to_string()],
+        Some(&["198.51.100.1".to_string()]),
     );
-    assert_eq!(resolved, "198.51.100.1".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        resolved,
+        crate::auth::trusted_proxy::ClientAddr::Forwarded(
+            "198.51.100.1".parse::<IpAddr>().unwrap()
+        )
+    );
+}
+
+/// A trusted peer whose header resolves to nothing usable is limited under
+/// its own address, never exempt — the regression this finding fixes
+/// (loopback via a trusted proxy escaping the limiter entirely).
+#[test]
+fn resolve_client_addr_a_trusted_loopback_peer_with_no_header_is_not_exempt() {
+    let limiter = AbuseLimiter::new(&cfg_with_trusted_proxies(vec!["127.0.0.1".to_string()]));
+    let resolved = limiter.resolve_client_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+    assert_eq!(
+        resolved,
+        crate::auth::trusted_proxy::ClientAddr::TrustedProxyUnresolved(IpAddr::V4(
+            Ipv4Addr::LOCALHOST
+        ))
+    );
+    assert!(!resolved.is_loopback_exempt());
+}
+
+/// A trusted peer whose header names a loopback address must still not be
+/// exempt — only a *direct* loopback peer is.
+#[test]
+fn resolve_client_addr_a_forwarded_loopback_address_is_not_exempt() {
+    let limiter = AbuseLimiter::new(&cfg_with_trusted_proxies(vec!["127.0.0.1".to_string()]));
+    let resolved = limiter.resolve_client_addr(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(&["127.0.0.2".to_string()]),
+    );
+    assert_eq!(
+        resolved,
+        crate::auth::trusted_proxy::ClientAddr::Forwarded(addr_v4(127, 0, 0, 2))
+    );
+    assert!(!resolved.is_loopback_exempt());
+}
+
+fn addr_v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(a, b, c, d))
 }
 
 #[test]

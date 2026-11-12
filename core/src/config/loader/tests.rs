@@ -265,6 +265,52 @@ fn http_rate_limit_valid_values_accepted() {
     assert_eq!(cfg.http.rate_limit.burst, 8);
 }
 
+// --- server.abuse_limits.unused_client_ttl_secs validation ---
+
+#[test]
+fn abuse_limits_unused_client_ttl_secs_zero_rejected() {
+    let yaml = "version: 1\nserver:\n  abuse_limits:\n    unused_client_ttl_secs: 0\n";
+    let err = load_config_from_str(yaml).unwrap_err();
+    match err {
+        Error::InvalidConfig { message } => {
+            assert!(
+                message.contains("server.abuse_limits.unused_client_ttl_secs"),
+                "error message '{}' should mention the offending path",
+                message
+            );
+        }
+        other => panic!("expected InvalidConfig, got {:?}", other),
+    }
+}
+
+/// A TTL past the 10-year ceiling must be rejected at load time — an
+/// unbounded value here reaches `rfc3339_from_now`'s negated-delta
+/// arithmetic in `AuthService::register_client`, which panicked on
+/// overflow before this bound existed.
+#[test]
+fn abuse_limits_unused_client_ttl_secs_past_the_ceiling_rejected() {
+    let yaml =
+        "version: 1\nserver:\n  abuse_limits:\n    unused_client_ttl_secs: 9223372036854775807\n";
+    let err = load_config_from_str(yaml).unwrap_err();
+    match err {
+        Error::InvalidConfig { message } => {
+            assert!(
+                message.contains("server.abuse_limits.unused_client_ttl_secs"),
+                "error message '{}' should mention the offending path",
+                message
+            );
+        }
+        other => panic!("expected InvalidConfig, got {:?}", other),
+    }
+}
+
+#[test]
+fn abuse_limits_unused_client_ttl_secs_at_the_ceiling_accepted() {
+    let yaml = "version: 1\nserver:\n  abuse_limits:\n    unused_client_ttl_secs: 315360000\n";
+    let cfg = load_config_from_str(yaml).expect("the 10-year ceiling itself should load");
+    assert_eq!(cfg.server.abuse_limits.unused_client_ttl_secs, 315_360_000);
+}
+
 // --- server.abuse_limits.trusted_proxies validation ---
 
 #[test]

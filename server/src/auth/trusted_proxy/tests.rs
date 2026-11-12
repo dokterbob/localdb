@@ -119,6 +119,41 @@ fn is_trusted_with_an_empty_list_trusts_nothing() {
 }
 
 // -----------------------------------------------------------------
+// `ClientAddr` — which cases are loopback-exempt (item 1).
+// -----------------------------------------------------------------
+
+#[test]
+fn only_direct_is_loopback_exempt() {
+    assert!(ClientAddr::Direct(addr("127.0.0.1")).is_loopback_exempt());
+    assert!(!ClientAddr::Direct(addr("203.0.113.7")).is_loopback_exempt());
+    assert!(
+        !ClientAddr::Forwarded(addr("127.0.0.1")).is_loopback_exempt(),
+        "a forwarded address must never be exempt, even when it is loopback"
+    );
+    assert!(
+        !ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")).is_loopback_exempt(),
+        "the proxy's own unresolved-fallback address must never be exempt, even when it is \
+         loopback"
+    );
+}
+
+#[test]
+fn key_unwraps_every_case() {
+    assert_eq!(
+        ClientAddr::Direct(addr("203.0.113.1")).key(),
+        addr("203.0.113.1")
+    );
+    assert_eq!(
+        ClientAddr::Forwarded(addr("203.0.113.2")).key(),
+        addr("203.0.113.2")
+    );
+    assert_eq!(
+        ClientAddr::TrustedProxyUnresolved(addr("203.0.113.3")).key(),
+        addr("203.0.113.3")
+    );
+}
+
+// -----------------------------------------------------------------
 // `resolve_client_addr` — table-driven, including spoofing attempts.
 // -----------------------------------------------------------------
 
@@ -126,40 +161,43 @@ struct Case {
     name: &'static str,
     peer: &'static str,
     trusted: &'static [&'static str],
-    forwarded_for: &'static [&'static str],
-    want: &'static str,
+    /// `None` means no `X-Forwarded-For` header at all; `Some(&[])` is not
+    /// a meaningful distinction at this layer and isn't exercised here —
+    /// `rate_limit::forwarded_for_header_values` never returns `Some(&[])`.
+    forwarded_for: Option<&'static [&'static str]>,
+    want: ClientAddr,
 }
 
 #[test]
 fn resolve_client_addr_cases() {
     let cases: &[Case] = &[
         Case {
-            name: "untrusted peer with no header: peer is the client",
+            name: "untrusted peer with no header: peer is the client, directly",
             peer: "203.0.113.7",
             trusted: &[],
-            forwarded_for: &[],
-            want: "203.0.113.7",
+            forwarded_for: None,
+            want: ClientAddr::Direct(addr("203.0.113.7")),
         },
         Case {
             name: "untrusted peer sending a spoofed header is ignored entirely",
             peer: "203.0.113.7",
             trusted: &[],
-            forwarded_for: &["198.51.100.1"],
-            want: "203.0.113.7",
+            forwarded_for: Some(&["198.51.100.1"]),
+            want: ClientAddr::Direct(addr("203.0.113.7")),
         },
         Case {
-            name: "trusted peer, single hop: the header value is the client",
+            name: "trusted peer, single hop: the header value is the client, forwarded",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1"],
-            forwarded_for: &["198.51.100.1"],
-            want: "198.51.100.1",
+            forwarded_for: Some(&["198.51.100.1"]),
+            want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
         Case {
             name: "trusted peer, chain of two proxies: skip the trusted hop",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1", "10.0.0.1"],
-            forwarded_for: &["198.51.100.1, 10.0.0.1"],
-            want: "198.51.100.1",
+            forwarded_for: Some(&["198.51.100.1, 10.0.0.1"]),
+            want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
         Case {
             name: "forged leftmost entry behind a trusted proxy: still walk right to left",
@@ -169,57 +207,105 @@ fn resolve_client_addr_cases() {
             // the request reaches the trusted proxy; the proxy appends the
             // real address. The leftmost (attacker-controlled) entry must
             // never be trusted blindly.
-            forwarded_for: &["10.0.0.9, 198.51.100.1"],
-            want: "198.51.100.1",
+            forwarded_for: Some(&["10.0.0.9, 198.51.100.1"]),
+            want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
         Case {
-            name: "trusted peer, entirely-trusted chain: fall back to peer",
+            name: "trusted peer, entirely-trusted chain: fall back to the proxy, unresolved",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1", "10.0.0.1"],
-            forwarded_for: &["10.0.0.1"],
-            want: "127.0.0.1",
+            forwarded_for: Some(&["10.0.0.1"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
         },
         Case {
-            name: "trusted peer, missing header: fall back to peer",
+            name: "trusted peer, missing header: fall back to the proxy, unresolved",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1"],
-            forwarded_for: &[],
-            want: "127.0.0.1",
+            forwarded_for: None,
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
         },
         Case {
-            name: "trusted peer, empty header value: fall back to peer",
+            name: "trusted peer, empty header value: fall back to the proxy, unresolved",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1"],
-            forwarded_for: &[""],
-            want: "127.0.0.1",
+            forwarded_for: Some(&[""]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
         },
         Case {
-            name: "trusted peer, malformed trailing entry is skipped",
+            name: "trusted peer, malformed trailing entry fails resolution outright",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1"],
-            forwarded_for: &["198.51.100.1, not-an-address"],
-            want: "198.51.100.1",
+            // The nearest proxy's own appended hop is the first (rightmost)
+            // one this walk reaches; it is malformed, so resolution fails
+            // before the leftmost, attacker-controlled entry is ever
+            // consulted — it must never become the client.
+            forwarded_for: Some(&["198.51.100.1, not-an-address"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
+        Case {
+            name: "trusted peer, bracketed ipv6 entry is unparsable (no bracket stripping)",
+            peer: "127.0.0.1",
+            trusted: &["127.0.0.1"],
+            forwarded_for: Some(&["[2001:db8::1]"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
+        Case {
+            name: "trusted peer, ip:port entry is unparsable (no port stripping)",
+            peer: "127.0.0.1",
+            trusted: &["127.0.0.1"],
+            forwarded_for: Some(&["203.0.113.7:5678"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
+        Case {
+            name: "trusted peer, a zone id on an ipv6 entry is unparsable",
+            peer: "127.0.0.1",
+            trusted: &["127.0.0.1"],
+            forwarded_for: Some(&["fe80::1%eth0"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
+        Case {
+            name: "trusted peer, the literal token 'unknown' is unparsable",
+            peer: "127.0.0.1",
+            trusted: &["127.0.0.1"],
+            forwarded_for: Some(&["unknown"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
+        Case {
+            name: "trusted peer, an obfuscated identifier is unparsable",
+            peer: "127.0.0.1",
+            trusted: &["127.0.0.1"],
+            forwarded_for: Some(&["_hidden"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
+        },
+        Case {
+            name: "trusted peer, an empty element between commas is unparsable",
+            peer: "127.0.0.1",
+            // "10.0.0.1" must be trusted here so the walk actually reaches
+            // the empty element instead of stopping on it as the client.
+            trusted: &["127.0.0.1", "10.0.0.1"],
+            forwarded_for: Some(&["198.51.100.1,,10.0.0.1"]),
+            want: ClientAddr::TrustedProxyUnresolved(addr("127.0.0.1")),
         },
         Case {
             name: "trusted peer, multiple header lines concatenated in order",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1", "10.0.0.1"],
-            forwarded_for: &["198.51.100.1", "10.0.0.1"],
-            want: "198.51.100.1",
+            forwarded_for: Some(&["198.51.100.1", "10.0.0.1"]),
+            want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
         Case {
             name: "trusted peer arriving as an IPv4-mapped IPv6 address",
             peer: "::ffff:127.0.0.1",
             trusted: &["127.0.0.1"],
-            forwarded_for: &["198.51.100.1"],
-            want: "198.51.100.1",
+            forwarded_for: Some(&["198.51.100.1"]),
+            want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
         Case {
             name: "IPv4-mapped IPv6 form in the header is unmapped before trust-checking",
             peer: "127.0.0.1",
             trusted: &["127.0.0.1", "10.0.0.1"],
-            forwarded_for: &["198.51.100.1, ::ffff:10.0.0.1"],
-            want: "198.51.100.1",
+            forwarded_for: Some(&["198.51.100.1, ::ffff:10.0.0.1"]),
+            want: ClientAddr::Forwarded(addr("198.51.100.1")),
         },
     ];
 
@@ -229,13 +315,14 @@ fn resolve_client_addr_cases() {
             .iter()
             .map(|s| localdb_core::config::schema::parse_ip_cidr(s).unwrap())
             .collect();
-        let forwarded_for: Vec<String> = case.forwarded_for.iter().map(|s| s.to_string()).collect();
-        let got = resolve_client_addr(case.peer.parse().unwrap(), &trusted, &forwarded_for);
-        assert_eq!(
-            got,
-            case.want.parse::<IpAddr>().unwrap(),
-            "case {:?} failed",
-            case.name
+        let forwarded_for: Option<Vec<String>> = case
+            .forwarded_for
+            .map(|lines| lines.iter().map(|s| s.to_string()).collect());
+        let got = resolve_client_addr(
+            case.peer.parse().unwrap(),
+            &trusted,
+            forwarded_for.as_deref(),
         );
+        assert_eq!(got, case.want, "case {:?} failed", case.name);
     }
 }

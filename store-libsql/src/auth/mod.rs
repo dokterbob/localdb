@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::auth::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
-    InviteRow, OAuthClientRow, RegisterClientOutcome, Role, RotateOutcome, StoreGrantRow, UserRow,
+    InviteRow, OAuthClientRow, RedeemAndIssueCodeOutcome, RegisterClientOutcome, Role,
+    RotateOutcome, StoreGrantRow, UserRow,
 };
 use localdb_core::Error;
 
@@ -227,6 +228,27 @@ impl AuthStore for LibsqlAuthStore {
         credential: &AuthTokenRow,
     ) -> Result<bool, Error> {
         atomic::redeem_open_invite(&self.conn, invite_id, user, grants, credential).await
+    }
+
+    async fn redeem_open_invite_and_issue_code(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+        builtin_client_id: &str,
+        auth_code: &AuthCodeRow,
+    ) -> Result<RedeemAndIssueCodeOutcome, Error> {
+        atomic::redeem_open_invite_and_issue_code(
+            &self.conn,
+            invite_id,
+            user,
+            grants,
+            credential,
+            builtin_client_id,
+            auth_code,
+        )
+        .await
     }
 
     async fn redeem_closed_invite(

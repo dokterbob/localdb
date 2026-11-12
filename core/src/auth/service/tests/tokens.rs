@@ -892,7 +892,7 @@ async fn a_rotated_descendant_token_still_carries_the_ancestor_family() {
 #[tokio::test]
 async fn register_client_evicts_the_oldest_unused_client_once_the_cap_is_hit() {
     let svc = service();
-    let policy = crate::auth::client::RegistrationPolicy {
+    let policy = crate::auth::client::RegistrationPolicy::Limited {
         max_dynamic_clients: 1,
         unused_client_ttl_secs: 86400,
     };
@@ -929,7 +929,7 @@ async fn register_client_evicts_the_oldest_unused_client_once_the_cap_is_hit() {
 async fn register_client_errors_cap_reached_once_every_slot_is_used() {
     let svc = service();
     let user = svc.create_user("alice", Role::Member).await.unwrap();
-    let policy = crate::auth::client::RegistrationPolicy {
+    let policy = crate::auth::client::RegistrationPolicy::Limited {
         max_dynamic_clients: 1,
         unused_client_ttl_secs: 86400,
     };
@@ -973,9 +973,9 @@ async fn register_client_errors_cap_reached_once_every_slot_is_used() {
 }
 
 #[tokio::test]
-async fn register_client_with_the_unlimited_policy_never_prunes_or_caps() {
+async fn register_client_with_the_disabled_policy_never_prunes_or_caps() {
     let svc = service();
-    let policy = crate::auth::client::RegistrationPolicy::unlimited();
+    let policy = crate::auth::client::RegistrationPolicy::Disabled;
 
     let old_client = svc
         .register_client(
@@ -990,7 +990,7 @@ async fn register_client_with_the_unlimited_policy_never_prunes_or_caps() {
         .expect("registration should succeed");
 
     // Tiny-cap-worth of further registrations must all succeed too — the
-    // unlimited policy has no cap to hit.
+    // disabled policy has no cap to hit.
     for i in 1..5 {
         svc.register_client(
             vec![format!("https://app{i}.example.com/cb")],
@@ -1001,12 +1001,49 @@ async fn register_client_with_the_unlimited_policy_never_prunes_or_caps() {
             &policy,
         )
         .await
-        .expect("the unlimited policy must never refuse a registration");
+        .expect("the disabled policy must never refuse a registration");
     }
 
-    // The first client is old and was never used, but the unlimited policy
+    // The first client is old and was never used, but the disabled policy
     // prunes and evicts nothing.
     assert!(svc.is_known_client(&old_client.id).await.unwrap());
+}
+
+/// `Disabled` must be a plain insert with no eviction condition at all —
+/// not merely a `Limited` policy with an effectively infinite cap/TTL,
+/// which would still run the prune query and could delete a row old enough
+/// to predate even a 100-year TTL. This plants a client whose `created_at`
+/// is older than any real `Limited` TTL would tolerate and proves it
+/// survives registering past it under `Disabled`.
+#[tokio::test]
+async fn register_client_with_the_disabled_policy_never_prunes_an_artificially_ancient_client() {
+    let svc = service();
+    let ancient = OAuthClientRow {
+        id: "ancient-dynamic-client".to_string(),
+        client_name: None,
+        redirect_uris: vec!["https://ancient.example.com/cb".to_string()],
+        created_at: "0001-01-01T00:00:00Z".to_string(),
+    };
+    svc.store.create_oauth_client(&ancient).await.unwrap();
+
+    let policy = crate::auth::client::RegistrationPolicy::Disabled;
+    for i in 0..5 {
+        svc.register_client(
+            vec![format!("https://app{i}.example.com/cb")],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .expect("the disabled policy must never refuse a registration");
+    }
+
+    assert!(
+        svc.is_known_client(&ancient.id).await.unwrap(),
+        "an artificially ancient client must survive under the disabled policy"
+    );
 }
 
 #[tokio::test]
@@ -1016,7 +1053,7 @@ async fn register_client_cap_does_not_count_the_builtin_client() {
     // built-in `localdb-cli` client (seeded at the store layer in
     // production, absent from `FakeAuthStore` by construction) must never
     // count toward it either way.
-    let policy = crate::auth::client::RegistrationPolicy {
+    let policy = crate::auth::client::RegistrationPolicy::Limited {
         max_dynamic_clients: 1,
         unused_client_ttl_secs: 86400,
     };

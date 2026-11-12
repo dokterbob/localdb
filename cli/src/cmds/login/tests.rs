@@ -970,8 +970,9 @@ async fn poll_until_decided_gives_up_after_too_many_consecutive_429s() {
     );
     assert_eq!(
         call_count.load(std::sync::atomic::Ordering::SeqCst) as u32,
-        MAX_CONSECUTIVE_RATE_LIMITS + 1,
-        "the loop must give up exactly once MAX_CONSECUTIVE_RATE_LIMITS is exceeded"
+        MAX_CONSECUTIVE_RATE_LIMITS,
+        "the loop must give up on the MAX_CONSECUTIVE_RATE_LIMITSth consecutive 429, not the \
+         (MAX_CONSECUTIVE_RATE_LIMITS + 1)th"
     );
     server.abort();
 }

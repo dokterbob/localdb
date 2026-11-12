@@ -184,13 +184,17 @@ path; `paths.*` in config override the rest.
   runs its own single-worker queue and never reads this key.
 - **`server.abuse_limits`:** `max_dynamic_clients` (`u64`), `unused_client_ttl_secs` (`i64`),
   `requests_per_second` (`u32`), and `burst` (`u32`) must each be `>= 1`; `0` is rejected with a
-  path-precise message for each key, the same convention as `http.rate_limit`. `enable` (`bool`,
-  default `true`) is the master switch for this whole section — see [05-surfaces.md](05-surfaces.md)
-  §3.1 for what each limit bounds and the loopback exemption. `trusted_proxies` (`Vec<String>`,
-  default empty) is validated entry-by-entry: each must parse as a single IPv4/IPv6 address or that
-  address with a `/<prefix-len>` CIDR suffix (prefix length in range for the address's family — 0-32
-  for IPv4, 0-128 for IPv6); a malformed entry is rejected with a path-precise message naming its
-  index (`server.abuse_limits.trusted_proxies[0]: ...`).
+  path-precise message for each key, the same convention as `http.rate_limit`.
+  `unused_client_ttl_secs` additionally has an upper bound of `315360000` (10 years) — a value past
+  it is rejected the same way, since it feeds `chrono` duration arithmetic
+  (`AuthService::register_client`'s negated-delta call to `rfc3339_from_now`) that would otherwise
+  overflow; that helper also saturates rather than panicking as a second line of defense. `enable`
+  (`bool`, default `true`) is the master switch for this whole section — see
+  [05-surfaces.md](05-surfaces.md) §3.1 for what each limit bounds and the loopback exemption.
+  `trusted_proxies` (`Vec<String>`, default empty) is validated entry-by-entry: each must parse as a
+  single IPv4/IPv6 address or that address with a `/<prefix-len>` CIDR suffix (prefix length in
+  range for the address's family — 0-32 for IPv4, 0-128 for IPv6); a malformed entry is rejected
+  with a path-precise message naming its index (`server.abuse_limits.trusted_proxies[0]: ...`).
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the

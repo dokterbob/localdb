@@ -159,9 +159,11 @@ pub struct AbuseLimitsConfig {
     /// How long (seconds) a dynamically registered client may sit unused —
     /// no authorization code ever issued to it — before a later
     /// registration attempt may prune it to make room under
-    /// `max_dynamic_clients`. Must be at least 1 — `validate_config` rejects
-    /// `0`.
-    #[schemars(range(min = 1))]
+    /// `max_dynamic_clients`. Must be between 1 and 315360000 (10 years) —
+    /// `validate_config` rejects `0` and anything past the 10-year ceiling,
+    /// since an unbounded value here reaches `chrono` duration arithmetic
+    /// that would otherwise overflow.
+    #[schemars(range(min = 1, max = 315_360_000))]
     #[serde(default = "default_unused_client_ttl_secs")]
     pub unused_client_ttl_secs: i64,
 
@@ -260,6 +262,13 @@ fn default_max_dynamic_clients() -> u64 {
 fn default_unused_client_ttl_secs() -> i64 {
     24 * 60 * 60
 }
+
+/// Upper bound on `server.abuse_limits.unused_client_ttl_secs`
+/// (`core::config::loader::validate_config`): 10 years is ample for any
+/// real deployment, and keeps the negated delta `AuthService::
+/// register_client` feeds to `rfc3339_from_now` comfortably inside the
+/// range that function's own clamp accepts without ever engaging it.
+pub const MAX_UNUSED_CLIENT_TTL_SECS: i64 = 10 * 365 * 24 * 60 * 60;
 
 /// 5 req/s sustained comfortably clears the CLI invite-approval poll's 1s
 /// interval (`cli::cmds::login::poll_until_decided`) with headroom for

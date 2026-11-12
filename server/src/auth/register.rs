@@ -194,12 +194,12 @@ pub async fn post_register(
     // (its own doc comment) — registration's cap/TTL/eviction included, not
     // just the rate limiter.
     let policy = if limits.enable {
-        RegistrationPolicy {
+        RegistrationPolicy::Limited {
             max_dynamic_clients: limits.max_dynamic_clients,
             unused_client_ttl_secs: limits.unused_client_ttl_secs,
         }
     } else {
-        RegistrationPolicy::unlimited()
+        RegistrationPolicy::Disabled
     };
     let row = match state
         .auth()

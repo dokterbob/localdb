@@ -411,7 +411,7 @@ async fn poll_until_decided(
         // it keeps happening (see `MAX_CONSECUTIVE_RATE_LIMITS`).
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             consecutive_rate_limits += 1;
-            if consecutive_rate_limits > MAX_CONSECUTIVE_RATE_LIMITS {
+            if consecutive_rate_limits >= MAX_CONSECUTIVE_RATE_LIMITS {
                 return Err(Error::RateLimited {
                     message: format!(
                         "the daemon rate-limited this poll {consecutive_rate_limits} times in a \

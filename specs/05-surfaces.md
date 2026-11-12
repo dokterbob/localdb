@@ -668,7 +668,12 @@ cascades to their `auth_codes` (`ON DELETE CASCADE`; mirrored by `FakeAuthStore`
 only completed authorization belonged to a deleted user becomes unused again.
 `server.abuse_limits. enable: false` disables this cap/TTL/eviction machinery entirely, the same
 master switch that disables the rate limit below — `AuthService::register_client` is then called
-with `RegistrationPolicy::unlimited()`.
+with `RegistrationPolicy::Disabled`, a plain insert with no pruning, counting, or eviction condition
+at all (not a `Limited` policy with an effectively infinite cap/TTL, which would still run the prune
+query and could delete a sufficiently old row). `unused_client_ttl_secs` must be between 1 and
+315360000 (10 years) — `validate_config` rejects anything past that ceiling, since an unbounded
+value reaches `chrono` duration arithmetic in `AuthService::register_client` that would otherwise
+overflow.
 
 **Rate limiting the public auth routes (`server.abuse_limits`):** `/authorize`, `/join`, `/token`,
 `/revoke`, `/register`, `/v1/invites/redeem`, and `/v1/invites/requests/{id}/poll` share a
@@ -679,36 +684,50 @@ CLI's 1s invite-poll interval (`cli::cmds::login::poll_until_decided`) even with
 sharing one IP behind NAT. The `/.well-known/*` discovery documents are never limited — they are
 static and a client needs them before it can attempt any of the routes above.
 
-**Client address resolution (`server::auth::trusted_proxy`):** the limiter keys on the TCP peer
-address (`axum::extract::ConnectInfo<SocketAddr>`, wired via `into_make_service_with_connect_info`)
-unless that peer is listed in `server.abuse_limits.trusted_proxies` (a list of IP addresses or CIDR
-ranges, default empty — see 03-config.md §1), in which case the client address is instead taken from
-`X-Forwarded-For` (only this header; RFC 7239's `Forwarded: for=` is not accepted). The header is
-walked **right to left** — the entry nearest this daemon was appended most recently by the nearest
-proxy; the leftmost entry is whatever the original caller claimed and is never trusted on its own —
-skipping entries that themselves parse as a trusted proxy (a chain of proxies forwarding through
-each other), and the first untrusted entry found is the client. Multiple `X-Forwarded-For` header
-lines are concatenated in order. A malformed or empty entry, an entirely-trusted chain, or a missing
-header from a trusted proxy all fall back to the peer address. **Without a configured trusted proxy,
-every client behind a reverse proxy shares the proxy's own address, as before this support existed —
-listing a proxy that does not itself overwrite or correctly append `X-Forwarded-For` lets any client
-spoof its own address, so only list proxies you control.** A request with no `ConnectInfo` available
-(a test harness driving a handler directly, bypassing the real TCP listener) is never limited, the
-same "nothing to key on, so don't limit" rule a Unix-socket transport would get if the daemon ever
-served `/v1` that way; today it does not — the discovery socket (`server::socket::SocketGuard`) is a
-liveness probe only, never an HTTP transport.
+**Client address resolution (`server::auth::trusted_proxy`):** resolution produces one of three
+cases (`trusted_proxy::ClientAddr`), and only the first is ever exempt from the rate limit as a
+loopback caller:
+
+- **Direct** — the TCP peer address (`axum::extract::ConnectInfo<SocketAddr>`, wired via
+  `into_make_service_with_connect_info`) is not itself listed in
+  `server.abuse_limits.trusted_proxies` (a list of IP addresses or CIDR ranges, default empty — see
+  03-config.md §1). The limiter keys/exempts on the peer address itself.
+- **Forwarded** — the peer _is_ a trusted proxy, and `X-Forwarded-For` (only this header; RFC 7239's
+  `Forwarded: for=` is not accepted) resolves to a usable address: walked **right to left** — the
+  entry nearest this daemon was appended most recently by the nearest proxy; the leftmost entry is
+  whatever the original caller claimed and is never trusted on its own — skipping entries that
+  themselves parse as a trusted proxy (a chain of proxies forwarding through each other), and the
+  first untrusted entry found is the client. Multiple `X-Forwarded-For` header lines are
+  concatenated in order. **Never exempt as loopback, whatever the resolved address is** — a header
+  never authenticates anything, so a forwarded `127.0.0.1` is not this daemon's own loopback caller,
+  it is whatever the proxy claims, and is rate-limited like any other client.
+- **TrustedProxyUnresolved** — the peer is a trusted proxy, but no usable address could be resolved:
+  a missing or empty header, a non-UTF-8 header line, an entirely-trusted chain, or **any hop the
+  right-to-left walk reaches that does not parse as a bare `IpAddr`** (this includes the nearest
+  proxy's own malformed append, not only an attacker-controlled earlier hop — a malformed entry ends
+  resolution outright rather than being skipped past). No `ip:port`/`[ipv6]:port` normalization is
+  attempted; such an entry is unparsable. This case is keyed/limited under **the proxy's own
+  address** — one shared bucket for everything that proxy forwards without a usable header — and is
+  never exempt either.
+
+**Without a configured trusted proxy, every client behind a reverse proxy shares the proxy's own
+address, as before this support existed — listing a proxy that does not itself overwrite or
+correctly append `X-Forwarded-For` lets any client spoof its own address, so only list proxies you
+control.** A request with no `ConnectInfo` available (a test harness driving a handler directly,
+bypassing the real TCP listener) is never limited, the same "nothing to key on, so don't limit" rule
+a Unix-socket transport would get if the daemon ever served `/v1` that way; today it does not — the
+discovery socket (`server::socket::SocketGuard`) is a liveness probe only, never an HTTP transport.
 
 **Loopback exemption and IPv6 keying:** the resolved client address is normalized before the
-loopback check and before use as the limiter's bucket key: an IPv4-mapped IPv6 address
+trust/loopback checks and before use as the limiter's bucket key: an IPv4-mapped IPv6 address
 (`::ffff:a.b.c.d`) becomes its plain IPv4 form (so `::ffff:127.0.0.1` is recognized as loopback,
 same as `127.0.0.1`), and — for the bucket key only, not the loopback check — a genuine (non-mapped)
 IPv6 address is further masked to its /64 network prefix, since an ISP commonly delegates an entire
 /64 to one residential customer; keying on the full address would let that customer spread requests
 across many buckets for free, the same reason IPv4 NAT already pools many devices behind one bucket.
-Loopback peers are always exempt (a local daemon must never throttle its own user), regardless of
-`abuse_limits.enable`; this applies to the _resolved_ address, so a direct loopback peer that is not
-a configured trusted proxy stays exempt, while a request arriving via a trusted loopback proxy is
-limited by the real client address `X-Forwarded-For` names instead.
+A direct loopback peer that is not itself a configured trusted proxy is always exempt (a local
+daemon must never throttle its own user), regardless of `abuse_limits.enable` — every other case
+above is rate-limited, including a trusted loopback proxy's own fallback address.
 
 **Over the limit:** `429` with `Retry-After` (seconds, from the limiter's own computed wait);
 `/token` and `/register` both keep the OAuth-style `{"error", "error_description"}` body with
@@ -837,6 +856,16 @@ invite: `open` mode continues OAuth as the newly created user; `closed` mode ret
 secret and original OAuth parameters in the waiting page. JavaScript polls the existing collection
 endpoint and resumes authorization after approval. Denial ends the wait; request errors offer an
 explicit retry. OAuth and invite responses disable caching and referrers.
+
+`open` mode's redemption here (`AuthService::redeem_invite_for_authorize`) is deliberately not the
+plain `redeem_invite` this page's other branches use: the mint and the first authorization code
+issued to the newly created user commit as one transaction with `client_id`'s existence checked
+inside it (`AuthStore::redeem_open_invite_and_issue_code`) — closing a race where a registration
+that evicts `client_id` (the dynamic-client cap, above) between this page's own client validation
+and the mint's commit would otherwise burn the invite's use and create a user for an authorization
+that can never complete. If `client_id` is gone by commit time, nothing is committed and the page
+shows the same `unauthorized_client` error an unknown client gets at validation time. `closed` mode
+is unaffected — no code is issued until an admin approves, so there is nothing to race.
 
 The CLI's `login --invite` redeems and polls the same JSON endpoints directly. Redemption and
 polling preserve server error codes; only explicit successful `pending` responses keep polling.

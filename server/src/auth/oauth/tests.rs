@@ -5,7 +5,7 @@ use std::sync::Arc;
 /// A permissive policy for tests that aren't exercising the registration
 /// cap/TTL behavior themselves.
 fn test_registration_policy() -> RegistrationPolicy {
-    RegistrationPolicy {
+    RegistrationPolicy::Limited {
         max_dynamic_clients: 1000,
         unused_client_ttl_secs: 86400,
     }

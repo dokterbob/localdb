@@ -81,6 +81,29 @@ fn rfc3339_from_now_matches_fixed_width_zero_padded_shape() {
 }
 
 #[test]
+fn rfc3339_from_now_saturates_instead_of_panicking_on_an_extreme_negative_delta() {
+    // `Duration::seconds`/`DateTime + Duration` panic on overflow by
+    // default; a config-sourced TTL (`unused_client_ttl_secs`) reaching
+    // this as a huge negated delta must saturate, not crash the daemon.
+    let ts = rfc3339_from_now(i64::MIN);
+    assert!(ts.ends_with('Z'), "{ts}");
+    assert!(
+        is_expired(&ts),
+        "a saturated-past timestamp is still expired"
+    );
+}
+
+#[test]
+fn rfc3339_from_now_saturates_instead_of_panicking_on_an_extreme_positive_delta() {
+    let ts = rfc3339_from_now(i64::MAX);
+    assert!(ts.ends_with('Z'), "{ts}");
+    assert!(
+        !is_expired(&ts),
+        "a saturated-future timestamp is never expired"
+    );
+}
+
+#[test]
 fn is_expired_true_for_past_timestamp() {
     assert!(is_expired(&rfc3339_from_now(-10)));
 }

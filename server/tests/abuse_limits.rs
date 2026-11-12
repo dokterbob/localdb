@@ -457,6 +457,74 @@ async fn mapped_ipv4_loopback_peer_is_exempt() {
     }
 }
 
+// -----------------------------------------------------------------
+// The loopback exemption applies ONLY to a direct peer that is not itself
+// a trusted proxy — never to an address `X-Forwarded-For` names, and never
+// to a trusted proxy's own unresolved fallback, even when either happens
+// to be loopback. Regression coverage for the exemption escaping through
+// a trusted local proxy.
+// -----------------------------------------------------------------
+
+/// Every one of these cases must be rate-limited past the burst, keyed
+/// uniformly: a loopback address named by a trusted proxy's header is not
+/// exempt, and neither is the proxy's own fallback when the header gives it
+/// nothing usable.
+#[tokio::test]
+async fn forwarded_for_through_a_trusted_loopback_proxy_is_always_rate_limited() {
+    let peer = loopback_peer();
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        ("forwarded 127.0.0.2", &[("x-forwarded-for", "127.0.0.2")]),
+        ("forwarded 127.0.0.1", &[("x-forwarded-for", "127.0.0.1")]),
+        ("forwarded ::1", &[("x-forwarded-for", "::1")]),
+        ("missing header", &[]),
+        ("empty header", &[("x-forwarded-for", "")]),
+        ("malformed header", &[("x-forwarded-for", "not-an-address")]),
+    ];
+    for (name, headers) in cases {
+        let (_dir, _state, app) = make_app_with_abuse_limits(abuse_limits_with_trusted_proxies(
+            1,
+            1,
+            vec!["127.0.0.1".to_string()],
+        ))
+        .await;
+        let first =
+            request_from_with_headers(app.clone(), Method::GET, "/join", None, peer, headers).await;
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "case {name:?}: the first call is within the burst"
+        );
+        let second =
+            request_from_with_headers(app.clone(), Method::GET, "/join", None, peer, headers).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "case {name:?}: must be rate-limited past the burst, not exempt as loopback"
+        );
+    }
+}
+
+/// A direct loopback peer that is not itself listed stays exempt even while
+/// `trusted_proxies` lists other, unrelated peers.
+#[tokio::test]
+async fn direct_loopback_peer_not_itself_listed_stays_exempt_while_other_proxies_are() {
+    let (_dir, _state, app) = make_app_with_abuse_limits(abuse_limits_with_trusted_proxies(
+        1,
+        1,
+        vec!["203.0.113.99".to_string()],
+    ))
+    .await;
+    let peer = loopback_peer();
+    for i in 0..10 {
+        let resp = request_from(app.clone(), Method::GET, "/join", None, peer).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "call {i} via a direct, unlisted loopback peer must stay exempt"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_trusted_proxy_connecting_directly_with_no_header_falls_back_to_its_own_address() {
     let (_dir, _state, app) = make_app_with_abuse_limits(abuse_limits_with_trusted_proxies(
