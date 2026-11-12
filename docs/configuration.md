@@ -72,7 +72,7 @@ server:
   port: 7700 # set to 0 to let the OS assign an ephemeral port
   job_workers: 1 # daemon job-queue workers; jobs for the same store never run concurrently
   # abuse_limits:   # limits on the public, unauthenticated auth routes (see below)
-  #   enable: true                  # loopback callers are always exempt from the rate limit
+  #   enable: true                  # a direct loopback peer not itself a trusted proxy is exempt
   #   max_dynamic_clients: 1000     # POST /register cap; the built-in localdb-cli client is exempt
   #   unused_client_ttl_secs: 86400 # how long an unused registration may sit before it's prunable
   #   requests_per_second: 5        # per-client-IP token bucket across the public auth routes
@@ -196,14 +196,14 @@ Limits on the daemon's public, unauthenticated auth routes (`/authorize`, `/join
 `/revoke`, `/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`) — the
 `/.well-known/*` discovery documents are never limited.
 
-| Field                    | Default | Notes                                                                                                                                                                      |
-| ------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enable`                 | `true`  | Master switch for this whole section — registration cap/TTL/eviction and the rate limit alike. Loopback callers are always exempt from the rate limit regardless.          |
-| `max_dynamic_clients`    | `1000`  | Cap on dynamically registered OAuth2 clients (`POST /register`). The built-in `localdb-cli` client never counts.                                                           |
-| `unused_client_ttl_secs` | `86400` | How long an unused registration (no authorization ever completed) may sit before it becomes eligible for pruning/eviction (must be between `1` and `315360000`, 10 years). |
-| `requests_per_second`    | `5`     | Per-client-address sustained request rate across the limited routes (integer; must be `>= 1`)                                                                              |
-| `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                                                             |
-| `trusted_proxies`        | `[]`    | IP addresses/CIDR ranges this daemon forwards from — see below. Each entry must parse as an address or CIDR range.                                                         |
+| Field                    | Default | Notes                                                                                                                                                                                                                                   |
+| ------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enable`                 | `true`  | Master switch for this whole section — registration cap/TTL/eviction and the rate limit alike. A direct loopback peer that is not itself a trusted proxy is exempt from the rate limit regardless; see below for what counts as exempt. |
+| `max_dynamic_clients`    | `1000`  | Cap on dynamically registered OAuth2 clients (`POST /register`). The built-in `localdb-cli` client never counts.                                                                                                                        |
+| `unused_client_ttl_secs` | `86400` | How long an unused registration (no authorization ever completed) may sit before it becomes eligible for pruning/eviction (must be between `1` and `315360000`, 10 years).                                                              |
+| `requests_per_second`    | `5`     | Per-client-address sustained request rate across the limited routes (integer; must be `>= 1`)                                                                                                                                           |
+| `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                                                                                                                          |
+| `trusted_proxies`        | `[]`    | IP addresses/CIDR ranges this daemon forwards from — see below. Each entry must parse as an address or CIDR range.                                                                                                                      |
 
 At the registration cap, `POST /register` evicts the oldest dynamically registered client that has
 never completed an authorization, rather than refusing outright, so a registration flood can't lock
@@ -231,7 +231,10 @@ correctly append `X-Forwarded-For` lets any client spoof its own address — onl
 control and that set the header correctly.** The trust/loopback checks and the limiter's bucket key
 both normalize IPv4-mapped IPv6 addresses to their IPv4 form first; a genuine (non-mapped) IPv6
 address is additionally keyed on its /64 network prefix (not the full address), since an ISP
-commonly delegates an entire /64 to one customer. See
+commonly delegates an entire /64 to one customer. Because of that normalization, `trusted_proxies`
+rejects an IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`, bare or as a CIDR range) at load time — write
+the plain IPv4 form instead, since the mapped form could never match the normalized peer address
+anyway. See
 [specs/05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication)
 for the full behavior.
 

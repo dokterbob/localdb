@@ -12,7 +12,7 @@
 //! force past a running daemon.
 
 use localdb_core::{
-    auth::{AuthStore as _, InviteMode},
+    auth::{AuthStore as _, InviteMode, MAX_RFC3339_DELTA_SECS},
     Error,
 };
 use serde_json::json;
@@ -43,6 +43,15 @@ fn parse_invite_mode_arg(ctx: &CliContext, s: &str) -> InviteMode {
         ),
     }
 }
+
+/// Upper bound on a parsed expiry duration (`localdb invite create
+/// --expires`), in seconds — the same bound `core::auth::rfc3339_from_now`
+/// clamps to. Rejecting here with a clear error, rather than letting an
+/// absurd user-supplied value (or a server-supplied `expires_in` elsewhere
+/// in the CLI) silently saturate to this bound deep inside `chrono`
+/// arithmetic, keeps `invite create`'s behavior legible: an invite's
+/// `expires_at` either reflects what was asked for, or the command refuses.
+const MAX_EXPIRY_SECS: u64 = MAX_RFC3339_DELTA_SECS as u64;
 
 /// Parse a human-readable duration (`7d`, `24h`, `30m`, `3600s`, or a bare
 /// number of seconds) into seconds. Extends
@@ -79,6 +88,12 @@ pub(crate) fn parse_expiry_duration(s: &str) -> Result<u64, Error> {
         Some(0) => Err(Error::InvalidRequest {
             message: format!(
                 "invalid expiry duration '{trimmed}': duration must be greater than zero"
+            ),
+        }),
+        Some(n) if n > MAX_EXPIRY_SECS => Err(Error::InvalidRequest {
+            message: format!(
+                "invalid expiry duration '{trimmed}': must not exceed 100 years \
+                 ({MAX_EXPIRY_SECS} seconds)"
             ),
         }),
         Some(n) => Ok(n),

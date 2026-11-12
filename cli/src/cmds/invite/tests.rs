@@ -45,6 +45,22 @@ fn parse_expiry_duration_rejects_zero_and_garbage() {
     assert!(parse_expiry_duration("").is_err());
 }
 
+#[test]
+fn parse_expiry_duration_accepts_the_100_year_bound() {
+    assert_eq!(
+        parse_expiry_duration("36500d").unwrap(),
+        localdb_core::auth::MAX_RFC3339_DELTA_SECS as u64
+    );
+}
+
+/// A duration past the clamp `core::auth::rfc3339_from_now` applies must be
+/// a clear error, not an invite that silently saturates to that bound.
+#[test]
+fn parse_expiry_duration_rejects_a_duration_beyond_100_years() {
+    let err = parse_expiry_duration("36501d").unwrap_err();
+    assert!(matches!(err, localdb_core::Error::InvalidRequest { .. }));
+}
+
 #[tokio::test]
 async fn create_invite_direct_db_then_list_and_revoke() {
     let dir = TempDir::new().unwrap();

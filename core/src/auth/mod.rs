@@ -39,5 +39,5 @@ pub use store::{
 pub use token::{
     expires_within, generate_pkce_pair, hash_secret, is_expired, mint_secret, rfc3339_from_now,
     valid_pkce_challenge, verify_pkce_s256, verify_secret, MintedSecret, ACCESS_TOKEN_TTL_SECS,
-    AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS, TOKEN_PREFIX,
+    AUTH_CODE_TTL_SECS, MAX_RFC3339_DELTA_SECS, REFRESH_TOKEN_TTL_SECS, TOKEN_PREFIX,
 };

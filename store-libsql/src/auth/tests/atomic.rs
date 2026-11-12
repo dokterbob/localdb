@@ -475,13 +475,13 @@ async fn redeem_open_invite_and_issue_code_refuses_an_evicted_client_and_commits
 #[tokio::test]
 async fn redeem_open_invite_and_issue_code_revoked_or_expired_is_not_eligible() {
     let (_dir, _backend, store) = make_store().await;
+    let user = make_user("u1", "alice", Role::Member);
+
     let mut revoked = make_invite("i1", "h1", InviteMode::Open);
     revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
     store.create_invite(&revoked).await.unwrap();
-    let user = make_user("u1", "alice", Role::Member);
     let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
     let code = make_auth_code(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
-
     let outcome = store
         .redeem_open_invite_and_issue_code(
             "i1",
@@ -490,6 +490,25 @@ async fn redeem_open_invite_and_issue_code_revoked_or_expired_is_not_eligible() 
             &credential,
             LOCALDB_CLI_CLIENT_ID,
             &code,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+
+    let mut expired = make_invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    let credential2 = make_token("t2", "u1", TokenKind::ApiKey, "hash-cred-2");
+    let code2 = make_auth_code(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash-2");
+    let outcome = store
+        .redeem_open_invite_and_issue_code(
+            "i2",
+            &user,
+            &[],
+            &credential2,
+            LOCALDB_CLI_CLIENT_ID,
+            &code2,
         )
         .await
         .unwrap();

@@ -206,7 +206,7 @@ async fn server_future(listener: TcpListener, router: Router) {
     // does not expose it otherwise (see `log_rejected_responses`'s doc
     // comment, which explains why that function logs `Host` instead). The
     // rate-limit middleware (`auth::rate_limit::limit_abuse`) is the only
-    // consumer today.
+    // consumer.
     let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, make_service).await {
         error!("server error: {}", e);

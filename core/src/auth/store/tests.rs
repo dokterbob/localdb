@@ -955,15 +955,27 @@ async fn redeem_open_invite_and_issue_code_refuses_an_unknown_client_and_commits
 #[tokio::test]
 async fn redeem_open_invite_and_issue_code_revoked_or_expired_is_not_eligible() {
     let store = FakeAuthStore::new();
+    let u = user("u1", "alice");
+
     let mut revoked = invite("i1", "h1", InviteMode::Open);
     revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
     store.create_invite(&revoked).await.unwrap();
-    let u = user("u1", "alice");
     let cred = credential("t1", "u1", "hash-cred");
     let code = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
-
     let outcome = store
         .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+
+    let mut expired = invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    let cred2 = credential("t2", "u1", "hash-cred-2");
+    let code2 = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash-2");
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i2", &u, &[], &cred2, LOCALDB_CLI_CLIENT_ID, &code2)
         .await
         .unwrap();
     assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);

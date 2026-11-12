@@ -333,16 +333,18 @@ pub(super) async fn redeem_open_invite_and_issue_code(
     // that increment and burn the invite's use for a redemption that is
     // refused. `NotEligible`, by contrast, is reached only when that same
     // UPDATE affected zero rows (its own WHERE clause rejected it), so
-    // there is nothing to roll back and committing the no-op is harmless —
-    // the same convention `redeem_open_invite`/`redeem_closed_invite`
-    // already rely on for their own `Ok(false)`.
+    // there is nothing in this transaction to undo — but it rolls back
+    // anyway, alongside `UnknownClient`, rather than relying on that fact:
+    // only `Issued` commits, so no future addition to the `Ok` branch above
+    // can turn into a partial write here by falling through to a commit it
+    // was never checked against.
     match result {
-        Ok(RedeemAndIssueCodeOutcome::UnknownClient) => {
-            tx.rollback().await?;
-            Ok(RedeemAndIssueCodeOutcome::UnknownClient)
+        Ok(RedeemAndIssueCodeOutcome::Issued) => {
+            tx.commit().await?;
+            Ok(RedeemAndIssueCodeOutcome::Issued)
         }
         Ok(outcome) => {
-            tx.commit().await?;
+            tx.rollback().await?;
             Ok(outcome)
         }
         Err(error) => {

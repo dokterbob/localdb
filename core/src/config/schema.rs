@@ -141,10 +141,15 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AbuseLimitsConfig {
-    /// Master switch for every limit in this section. Loopback callers are
-    /// always exempt from the rate limit regardless of this setting (a local
-    /// daemon must never throttle its own user) — this switch only affects
-    /// non-loopback callers and the registration cap/TTL.
+    /// Master switch for every limit in this section. A direct loopback TCP
+    /// peer that is not itself listed in `trusted_proxies` is exempt from
+    /// the rate limit regardless of this setting (a local daemon must never
+    /// throttle its own user); a client address taken from
+    /// `X-Forwarded-For` is always rate-limited even when it is itself a
+    /// loopback address, since nothing authenticates the header's content,
+    /// and a trusted proxy whose header yields no usable client address is
+    /// rate-limited under the proxy's own address — this switch only
+    /// affects those non-exempt callers and the registration cap/TTL.
     #[serde(default = "default_abuse_limits_enable")]
     pub enable: bool,
 
@@ -186,25 +191,37 @@ pub struct AbuseLimitsConfig {
     /// trusted, so every request is limited and exempted by its own TCP
     /// peer address and `X-Forwarded-For` is never consulted. When the TCP
     /// peer address falls inside one of these ranges, the client address
-    /// used for the rate limit and the loopback exemption is instead taken
-    /// from `X-Forwarded-For` (walked right to left, skipping entries that
-    /// are themselves trusted proxies) — see
+    /// used for the rate limit is instead taken from `X-Forwarded-For`
+    /// (walked right to left, skipping entries that are themselves trusted
+    /// proxies) — never exempt as loopback, even when the resulting address
+    /// is itself loopback, and never the proxy's own address unless the
+    /// header yields nothing usable, in which case the request is
+    /// rate-limited under that address instead — see
     /// [05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication).
     /// Listing a proxy here that does not itself overwrite or correctly
     /// append to `X-Forwarded-For` lets any client spoof its own address —
     /// only list proxies you control and that set the header correctly.
     /// `validate_config` rejects any entry that does not parse as an
-    /// address or CIDR range.
+    /// address or CIDR range, and rejects an IPv4-mapped IPv6 entry
+    /// (`::ffff:a.b.c.d`, or a CIDR range whose address is written in that
+    /// form) outright — write the plain IPv4 form instead, since the
+    /// resolved peer address is itself normalized to IPv4 before matching,
+    /// so the mapped form could never match anyway.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }
 
 /// Parse a `server.abuse_limits.trusted_proxies` entry: a single IPv4/IPv6
 /// address, or that address with a `/<prefix-len>` suffix. No suffix means
-/// the address's own full width (`/32` for IPv4, `/128` for IPv6). Used both
-/// by `validate_config` (to reject a malformed entry at load time) and by
-/// `server`'s trusted-proxy matching (to build its runtime CIDR list from
-/// the same, already-validated strings).
+/// the address's own full width (`/32` for IPv4, `/128` for IPv6). Rejects an
+/// IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) outright, naming the plain
+/// IPv4 form to use instead: `server::auth::trusted_proxy::unmap_ipv4`
+/// normalizes the resolved peer address to IPv4 before matching it against
+/// this list, so a mapped entry here could never match that normalized
+/// address — accepting it would silently configure a proxy entry that can
+/// never take effect. Used both by `validate_config` (to reject a malformed
+/// entry at load time) and by `server`'s trusted-proxy matching (to build
+/// its runtime CIDR list from the same, already-validated strings).
 pub fn parse_ip_cidr(input: &str) -> Result<(IpAddr, u8), String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -217,6 +234,14 @@ pub fn parse_ip_cidr(input: &str) -> Result<(IpAddr, u8), String> {
     let addr: IpAddr = addr_part
         .parse()
         .map_err(|_| format!("'{trimmed}' is not a valid IP address or CIDR range"))?;
+    if let IpAddr::V6(v6) = addr {
+        if let Some(mapped) = v6.to_ipv4_mapped() {
+            return Err(format!(
+                "'{trimmed}' is an IPv4-mapped IPv6 address; use the IPv4 form instead (e.g. \
+                 \"{mapped}\")"
+            ));
+        }
+    }
     let max_prefix: u8 = match addr {
         IpAddr::V4(_) => 32,
         IpAddr::V6(_) => 128,

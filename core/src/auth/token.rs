@@ -124,22 +124,23 @@ fn base64url_encode(bytes: &[u8]) -> String {
 /// crate-wide under test. Token expiry tests need small positive/negative
 /// offsets from "now", not a single frozen instant.
 ///
-/// Every caller in this codebase passes a small, fixed constant
-/// (`ACCESS_TOKEN_TTL_SECS` and friends) or a config-sourced value already
-/// bounded at load time (`server.abuse_limits.unused_client_ttl_secs`,
-/// `core::config::loader::validate_config`) — but this is still the one
-/// place a config value reaches `chrono` arithmetic that panics by default
-/// on overflow (`Duration::seconds`, `DateTime + Duration`), so `delta_secs`
-/// is clamped to [`SATURATED_DELTA_SECS`] before either is used, rather
-/// than trusting every caller's own bound to hold forever. The clamp is
-/// generous enough (100 years) that no real caller ever reaches it, and
-/// tight enough that the result stays a normal 4-digit-year
-/// `YYYY-MM-DDTHH:MM:SSZ` string — unlike saturating to `chrono`'s absolute
-/// `DateTime::<Utc>::MIN_UTC`/`MAX_UTC`, whose signed/extended year would
-/// break the fixed-width, lexicographically-ordered shape `is_expired`/
-/// `expires_within` and the SQL boundaries in `store-libsql` depend on.
+/// `delta_secs` is clamped to ±[`MAX_RFC3339_DELTA_SECS`] before it reaches
+/// `chrono` arithmetic (`Duration::seconds`, `DateTime + Duration`, which
+/// both panic on overflow by default): a delta past that bound saturates
+/// rather than panicking. Not every caller's delta is already bounded —
+/// `cli::cmds::invite::parse_expiry_duration` passes a duration straight
+/// from `localdb invite create --expires`, and the CLI's credential cache
+/// stores an expiry derived from a server-supplied `expires_in` — so this
+/// clamp is the function's own backstop, not a convenience for callers that
+/// already bound their input elsewhere. The bound is generous enough
+/// (100 years) that no real caller is ever clamped, and tight enough that
+/// the result stays a normal 4-digit-year `YYYY-MM-DDTHH:MM:SSZ` string —
+/// unlike saturating to `chrono`'s absolute `DateTime::<Utc>::MIN_UTC`/
+/// `MAX_UTC`, whose signed/extended year would break the fixed-width,
+/// lexicographically-ordered shape `is_expired`/`expires_within` and the
+/// SQL boundaries in `store-libsql` depend on.
 pub fn rfc3339_from_now(delta_secs: i64) -> String {
-    let clamped = delta_secs.clamp(-SATURATED_DELTA_SECS, SATURATED_DELTA_SECS);
+    let clamped = delta_secs.clamp(-MAX_RFC3339_DELTA_SECS, MAX_RFC3339_DELTA_SECS);
     (Utc::now() + Duration::seconds(clamped)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
@@ -147,8 +148,11 @@ pub fn rfc3339_from_now(delta_secs: i64) -> String {
 /// comfortably within `chrono`'s representable range and far enough from
 /// "now" that no real caller's delta is ever clamped, but small enough
 /// that `Duration::seconds`/`DateTime + Duration` can never overflow or
-/// produce a non-4-digit year.
-const SATURATED_DELTA_SECS: i64 = 100 * 365 * 24 * 60 * 60;
+/// produce a non-4-digit year. Public so a caller that would rather reject
+/// an out-of-range delta with its own error than let it silently saturate
+/// here can validate against this same bound
+/// (`cli::cmds::invite::parse_expiry_duration`).
+pub const MAX_RFC3339_DELTA_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 
 /// Is the given RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) in the past
 /// relative to now?

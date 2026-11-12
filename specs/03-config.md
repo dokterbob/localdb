@@ -23,7 +23,7 @@ server:
   #   without credentials, query, or fragment; optional path prefixes are allowed.
   job_workers: 1 # daemon job-queue workers; see §5
   abuse_limits: # limits on the public, unauthenticated auth routes (05-surfaces.md §3.1)
-    enable: true # loopback callers are always exempt from the rate limit regardless
+    enable: true # a direct loopback peer not itself a trusted proxy is exempt from the rate limit
     max_dynamic_clients: 1000 # POST /register cap; the built-in localdb-cli client is exempt
     unused_client_ttl_secs: 86400 # how long an unused registration may sit before pruning/eviction
     requests_per_second: 5 # per-client-address token bucket across the limited public auth routes
@@ -194,7 +194,10 @@ path; `paths.*` in config override the rest.
   `trusted_proxies` (`Vec<String>`, default empty) is validated entry-by-entry: each must parse as a
   single IPv4/IPv6 address or that address with a `/<prefix-len>` CIDR suffix (prefix length in
   range for the address's family — 0-32 for IPv4, 0-128 for IPv6); a malformed entry is rejected
-  with a path-precise message naming its index (`server.abuse_limits.trusted_proxies[0]: ...`).
+  with a path-precise message naming its index (`server.abuse_limits.trusted_proxies[0]: ...`). An
+  IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`, bare or as a CIDR range) is rejected the same way,
+  naming the plain IPv4 form to use instead — the resolved peer address is normalized to IPv4 before
+  matching (`server::auth::trusted_proxy::unmap_ipv4`), so a mapped entry could never match it.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the
