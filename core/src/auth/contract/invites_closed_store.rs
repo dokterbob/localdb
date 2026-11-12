@@ -101,6 +101,16 @@ async fn seed_approved_request<S: AuthStore>(
         approved,
         "test setup: approving the fresh request must succeed"
     );
+    let reloaded = store
+        .find_access_request(&request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.resulting_user_id.as_deref(),
+        Some(user.id.as_str()),
+        "test setup: the approved request must link to its resulting user"
+    );
     (request, user)
 }
 
@@ -354,6 +364,15 @@ pub async fn approve_access_request_direct_on_non_pending_request_is_false<S: Au
         .unwrap();
     assert!(!ok);
     assert!(store.get_user(&user.id).await.unwrap().is_none());
+    let reloaded = store
+        .find_access_request(&request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reloaded.resulting_user_id.is_none(),
+        "a refused approve on an already-decided request must not set a resulting user"
+    );
 }
 
 pub async fn collect_access_request_on_pending_request_is_false<S: AuthStore>(store: Arc<S>) {
@@ -455,17 +474,19 @@ pub async fn collect_access_request_unknown_id_is_false<S: AuthStore>(store: Arc
 
 /// `collect_access_request` called twice in sequence against the same
 /// approved request: the first call succeeds, the second observes the
-/// documented not-collectable outcome, and only the first credential is
-/// ever persisted.
+/// documented not-collectable outcome, and only the first credential and
+/// `collected_at` are ever persisted — the refused second call must not
+/// overwrite either.
 pub async fn collect_access_request_direct_twice_sequential_succeeds_then_refuses<S: AuthStore>(
     store: Arc<S>,
 ) {
     let (request, user) =
         seed_approved_request(&*store, "invites-closed-store-collect-twice").await;
 
+    let first_collected_at = "2026-03-01T00:00:10Z".to_string();
     let first_credential = credential_for(&user.id);
     let first = store
-        .collect_access_request(&request.id, &rfc3339_from_now(0), &first_credential)
+        .collect_access_request(&request.id, &first_collected_at, &first_credential)
         .await
         .unwrap();
     assert!(
@@ -473,9 +494,10 @@ pub async fn collect_access_request_direct_twice_sequential_succeeds_then_refuse
         "the first collect of a freshly approved request must succeed"
     );
 
+    let second_collected_at = "2026-03-01T00:05:00Z".to_string();
     let second_credential = credential_for(&user.id);
     let second = store
-        .collect_access_request(&request.id, &rfc3339_from_now(0), &second_credential)
+        .collect_access_request(&request.id, &second_collected_at, &second_credential)
         .await
         .unwrap();
     assert!(
@@ -483,6 +505,16 @@ pub async fn collect_access_request_direct_twice_sequential_succeeds_then_refuse
         "a second collect of an already-collected request must refuse"
     );
 
+    let reloaded = store
+        .find_access_request(&request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.collected_at,
+        Some(first_collected_at),
+        "a refused second collect must not overwrite the first call's collected_at"
+    );
     assert!(store
         .find_token(&first_credential.id)
         .await
@@ -520,51 +552,68 @@ pub async fn collect_access_request_direct_concurrent_collect_yields_one_credent
 
     let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS));
     let mut handles = Vec::new();
-    let mut credential_ids = Vec::new();
-    for _ in 0..CONTENDERS {
+    let mut prepared = Vec::new();
+    for i in 0..CONTENDERS {
         let store = store.clone();
         let request_id = request.id.clone();
         let barrier = barrier.clone();
         let credential = credential_for(&user.id);
-        credential_ids.push(credential.id.clone());
+        let credential_id = credential.id.clone();
+        // Distinct, well-separated, fixed timestamps per contender — so the
+        // persisted `collected_at` can be pinned to whichever contender
+        // actually won, rather than accepting any non-null value.
+        let collected_at = format!("2026-04-01T00:00:{:02}Z", 10 + i * 5);
+        prepared.push((credential_id, collected_at.clone()));
         handles.push(tokio::spawn(async move {
-            let collected_at = rfc3339_from_now(0);
             barrier.wait().await;
-            store
+            let result = store
                 .collect_access_request(&request_id, &collected_at, &credential)
-                .await
+                .await;
+            (result, credential.id, collected_at)
         }));
     }
     let mut successes = 0u32;
+    let mut winner: Option<(String, String)> = None;
     for h in handles {
-        match h.await.unwrap() {
-            Ok(true) => successes += 1,
+        let (result, credential_id, collected_at) = h.await.unwrap();
+        match result {
+            Ok(true) => {
+                successes += 1;
+                winner = Some((credential_id, collected_at));
+            }
             Ok(false) => {}
             Err(e) => panic!("unexpected error racing collect_access_request: {e:?}"),
         }
     }
     assert_eq!(successes, 1, "exactly one concurrent collect must succeed");
+    let (winning_credential_id, winning_collected_at) =
+        winner.expect("the single success must have recorded its credential and timestamp");
 
     let reloaded = store
         .find_access_request(&request.id)
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        reloaded.collected_at.is_some(),
-        "the request must end up collected regardless of which contender won"
+    assert_eq!(
+        reloaded.collected_at,
+        Some(winning_collected_at),
+        "the persisted collected_at must be the winning contender's own prepared timestamp"
     );
 
-    let mut existing = 0u32;
-    for id in &credential_ids {
-        if store.find_token(id).await.unwrap().is_some() {
-            existing += 1;
+    for (credential_id, _) in &prepared {
+        let exists = store.find_token(credential_id).await.unwrap().is_some();
+        if *credential_id == winning_credential_id {
+            assert!(
+                exists,
+                "the single winning contender's credential must be the one persisted"
+            );
+        } else {
+            assert!(
+                !exists,
+                "a losing contender's prepared credential must never be persisted"
+            );
         }
     }
-    assert_eq!(
-        existing, 1,
-        "exactly one of the prepared credential rows must exist — the winner's"
-    );
     assert_eq!(
         store.list_tokens_for_user(&user.id).await.unwrap().len(),
         1,
@@ -790,17 +839,23 @@ pub async fn approve_vs_deny_direct_concurrent_yields_one_decision<S: AuthStore>
         .unwrap();
     if approve_won {
         assert_eq!(reloaded.state, AccessRequestState::Approved);
+        assert_eq!(
+            reloaded.resulting_user_id.as_deref(),
+            Some(user.id.as_str()),
+            "the winning approve's user must be linked from the request"
+        );
         assert!(store.get_user(&user.id).await.unwrap().is_some());
-        assert!(
-            !store
-                .list_grants_for_user(&user.id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "the winning approve's grants must have been applied"
+        assert_eq!(
+            store.list_grants_for_user(&user.id).await.unwrap(),
+            grants,
+            "the winning approve's grants must have been applied exactly as prepared"
         );
     } else {
         assert_eq!(reloaded.state, AccessRequestState::Denied);
+        assert!(
+            reloaded.resulting_user_id.is_none(),
+            "a losing approve must leave no resulting user on the request"
+        );
         assert!(
             store.get_user(&user.id).await.unwrap().is_none(),
             "a losing approve must not create its user"
