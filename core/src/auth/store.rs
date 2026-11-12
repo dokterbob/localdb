@@ -473,3 +473,8 @@ pub use fake::FakeAuthStore;
 
 #[cfg(test)]
 mod tests;
+
+/// Runs the shared `AuthStore` contract suite (`crate::auth::contract`)
+/// against `FakeAuthStore` — see that module's doc comment.
+#[cfg(test)]
+mod contract_tests;

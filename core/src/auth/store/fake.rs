@@ -118,13 +118,13 @@ impl Default for FakeAuthStore {
 }
 
 /// Delete `id` from `inner.users` and cascade the cleanup the real schema
-/// performs via FK constraints (`store-libsql/src/schema.rs`): tokens and
-/// store grants are `ON DELETE CASCADE` (removed outright), and
-/// `access_requests.resulting_user_id` is `ON DELETE SET NULL`. Shared by
-/// the plain `delete_user` and the guarded `try_delete_user_unless_last_admin`
-/// so both report the same cascaded state to callers relying on it (e.g. the
-/// compensating deletes in `AuthService::approve_request`/
-/// `mint_open_invite_redemption`).
+/// performs via FK constraints (`store-libsql/src/schema.rs`): tokens,
+/// store grants, and OAuth authorization codes are all `ON DELETE CASCADE`
+/// (removed outright), and `access_requests.resulting_user_id` is
+/// `ON DELETE SET NULL`. Shared by the plain `delete_user` and the guarded
+/// `try_delete_user_unless_last_admin` so both report the same cascaded
+/// state to callers relying on it (e.g. the compensating deletes in
+/// `AuthService::approve_request`/`mint_open_invite_redemption`).
 /// Whether any user already holds `name` — the UNIQUE-name check shared by
 /// every mutation that creates or renames a user (`begin_bootstrap`,
 /// `create_user`, `approve_access_request`, `redeem_open_invite`).
@@ -154,6 +154,7 @@ fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
         }
         inner.tokens.retain(|t| t.user_id != id);
         inner.grants.retain(|g| g.user_id != id);
+        inner.auth_codes.retain(|c| c.user_id != id);
         for r in inner.access_requests.iter_mut() {
             if r.resulting_user_id.as_deref() == Some(id) {
                 r.resulting_user_id = None;

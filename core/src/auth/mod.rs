@@ -11,6 +11,8 @@
 //! enforce it).
 
 mod client;
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract;
 mod principal;
 mod service;
 mod store;

@@ -26,6 +26,12 @@ mod users;
 #[cfg(test)]
 mod tests;
 
+/// Runs the shared `AuthStore` contract suite
+/// (`localdb_core::auth::contract`) against `LibsqlAuthStore` — see that
+/// module's doc comment.
+#[cfg(test)]
+mod contract_tests;
+
 /// The libsql implementation of `core::auth::AuthStore`.
 ///
 /// Shares the same underlying `LibsqlDb` connection as `SqliteBackend`'s

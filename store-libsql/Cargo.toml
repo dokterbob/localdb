@@ -33,3 +33,10 @@ blake3 = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 chrono = { workspace = true }
+# `test-support` feature on our own already-normal dependency: unlocks
+# `localdb_core::auth::contract` and the `auth_store_contract_tests!` macro
+# (core/src/auth/contract/mod.rs) for `store-libsql/src/auth/contract_tests.rs`,
+# which runs the same behavioral contract against `LibsqlAuthStore` that
+# `core` runs against `FakeAuthStore`. Mirrors `server/Cargo.toml`'s
+# identical pattern for `localdb-store-libsql`'s own `test-support` feature.
+localdb-core = { path = "../core", features = ["test-support"] }
