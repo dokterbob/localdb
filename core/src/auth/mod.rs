@@ -20,24 +20,24 @@ pub use client::{
     is_known_client, registration_client_name_within_bounds,
     registration_redirect_uris_within_bounds, validate_redirect_uri,
     validate_registration_redirect_uri, validate_registration_request, RegistrationError,
-    LOCALDB_CLI_CLIENT_ID, MAX_REGISTRATION_CLIENT_NAME_LEN, MAX_REGISTRATION_REDIRECT_URIS,
-    MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI, SUPPORTED_GRANT_TYPES,
-    SUPPORTED_RESPONSE_TYPES,
+    RegistrationPolicy, LOCALDB_CLI_CLIENT_ID, MAX_REGISTRATION_CLIENT_NAME_LEN,
+    MAX_REGISTRATION_REDIRECT_URIS, MAX_REGISTRATION_REDIRECT_URI_LEN, OOB_REDIRECT_URI,
+    SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES,
 };
 pub use principal::{Principal, Role, SessionOrigin, StoreAccess};
 pub use service::{
-    AuthService, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome, RedeemOutcome,
-    RegisterClientError,
+    AuthService, AuthorizeInviteOutcome, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome,
+    RedeemOutcome, RegisterClientError,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeAuthStore;
 pub use store::{
     first_unused_name, AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow,
-    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RotateOutcome, StoreGrantRow, TokenKind,
-    UserRow,
+    DemoteOutcome, InviteMode, InviteRow, OAuthClientRow, RedeemAndIssueCodeOutcome,
+    RegisterClientOutcome, RotateOutcome, StoreGrantRow, TokenKind, UserRow,
 };
 pub use token::{
     expires_within, generate_pkce_pair, hash_secret, is_expired, mint_secret, rfc3339_from_now,
     valid_pkce_challenge, verify_pkce_s256, verify_secret, MintedSecret, ACCESS_TOKEN_TTL_SECS,
-    AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS, TOKEN_PREFIX,
+    AUTH_CODE_TTL_SECS, MAX_RFC3339_DELTA_SECS, REFRESH_TOKEN_TTL_SECS, TOKEN_PREFIX,
 };

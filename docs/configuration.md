@@ -71,6 +71,12 @@ server:
   bind: 127.0.0.1 # loopback only; set to 0.0.0.0 to listen on all interfaces
   port: 7700 # set to 0 to let the OS assign an ephemeral port
   job_workers: 1 # daemon job-queue workers; jobs for the same store never run concurrently
+  # abuse_limits:   # limits on the public, unauthenticated auth routes (see below)
+  #   enable: true                  # a direct loopback peer not itself a trusted proxy is exempt
+  #   max_dynamic_clients: 1000     # POST /register cap; the built-in localdb-cli client is exempt
+  #   unused_client_ttl_secs: 86400 # how long an unused registration may sit before it's prunable
+  #   requests_per_second: 5        # per-client-IP token bucket across the public auth routes
+  #   burst: 20
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:
@@ -165,6 +171,13 @@ server:
   bind: 127.0.0.1 # interface to listen on (default: 127.0.0.1)
   port: 7700 # port (default: 7700)
   job_workers: 1 # daemon job-queue workers (default: 1)
+  abuse_limits:
+    enable: true # master switch for every limit in this section (default: true)
+    max_dynamic_clients: 1000 # POST /register cap (default: 1000)
+    unused_client_ttl_secs: 86400 # unused-registration prune/eviction threshold, seconds (default: 24h)
+    requests_per_second: 5 # per-client-address token bucket (default: 5)
+    burst: 20 # token-bucket burst capacity (default: 20)
+    trusted_proxies: [] # peers whose X-Forwarded-For is honored (default: none)
 ```
 
 | Field         | Default     | Notes                                                                                                                                                 |
@@ -176,6 +189,61 @@ server:
 > **Experimental:** the HTTP daemon is an early preview. It opens the same unified database
 > (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible, and `POST /v1/jobs` runs
 > real ingestion through an async job queue. See [Daemon limitations](#daemon-limitations).
+
+#### `server.abuse_limits`
+
+Limits on the daemon's public, unauthenticated auth routes (`/authorize`, `/join`, `/token`,
+`/revoke`, `/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`) — the
+`/.well-known/*` discovery documents are never limited.
+
+| Field                    | Default | Notes                                                                                                                                                                                                                                   |
+| ------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enable`                 | `true`  | Master switch for this whole section — registration cap/TTL/eviction and the rate limit alike. A direct loopback peer that is not itself a trusted proxy is exempt from the rate limit regardless; see below for what counts as exempt. |
+| `max_dynamic_clients`    | `1000`  | Cap on dynamically registered OAuth2 clients (`POST /register`). The built-in `localdb-cli` client never counts.                                                                                                                        |
+| `unused_client_ttl_secs` | `86400` | How long an unused registration (no authorization ever completed) may sit before it becomes eligible for pruning/eviction (must be between `1` and `315360000`, 10 years).                                                              |
+| `requests_per_second`    | `5`     | Per-client-address sustained request rate across the limited routes (integer; must be `>= 1`)                                                                                                                                           |
+| `burst`                  | `20`    | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                                                                                                                          |
+| `trusted_proxies`        | `[]`    | IP addresses/CIDR ranges this daemon forwards from — see below. Each entry must parse as an address or CIDR range.                                                                                                                      |
+
+At or past the registration cap, `POST /register` evicts exactly as many of the oldest dynamically
+registered clients that have never completed an authorization as it takes to land the table at the
+cap once the new registration is inserted, rather than refusing outright, so a registration flood
+can't lock out every other registration by filling every slot. If fewer unused clients exist than
+that — every remaining slot is held by a client with a completed authorization — it refuses instead
+of evicting anything at all. Trade-off: a client that registered but hasn't yet started
+authorization can be evicted this way and must register again.
+
+Over the limit: `429` with `Retry-After`. `/token` and `/register` keep their existing OAuth-style
+error body (`error: "temporarily_unavailable"` for both); every other limited route uses the
+daemon's standard `{"code", "message"}` shape.
+
+**Address resolution and `trusted_proxies`:** the rate limiter keys on the real TCP peer address,
+unless that peer is listed in `trusted_proxies`, in which case the client address is instead taken
+from the `X-Forwarded-For` header (only this header — RFC 7239's `Forwarded: for=` is not accepted),
+walked right to left and skipping any entry that is itself a trusted proxy. The **loopback exemption
+applies only to a direct peer that is not itself a trusted proxy** — an address `X-Forwarded-For`
+names is rate-limited like any other client even if it happens to be `127.0.0.1`, and a trusted
+proxy whose header resolves to nothing usable (missing, empty, non-UTF-8, every hop malformed, or an
+entirely-trusted chain) is rate-limited under the proxy's own address rather than treated as exempt.
+A hop that doesn't parse as a bare IP address ends resolution outright — it is never skipped past in
+favor of an earlier, possibly attacker-controlled hop; no `ip:port`/`[ipv6]:port` normalization is
+attempted. Without a configured trusted proxy, every client behind a reverse proxy shares the
+proxy's own address, exactly as before. **Listing a proxy that does not itself overwrite or
+correctly append `X-Forwarded-For` lets any client spoof its own address — only list proxies you
+control and that set the header correctly.** The trust/loopback checks and the limiter's bucket key
+both normalize IPv4-mapped IPv6 addresses to their IPv4 form first; a genuine (non-mapped) IPv6
+address is additionally keyed on its /64 network prefix (not the full address), since an ISP
+commonly delegates an entire /64 to one customer. Because of that normalization, `trusted_proxies`
+rejects an IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`, bare or as a CIDR range) at load time — write
+the plain IPv4 form instead, since the mapped form could never match the normalized peer address
+anyway. **An IPv4 range never matches an IPv6 peer, and an IPv6 range never matches an IPv4 peer** —
+`::/0` does not cover an IPv4 peer, and `0.0.0.0/0` does not cover an IPv6 one. An operator who
+means "trust every peer" must list both `0.0.0.0/0` and `::/0` — listing only one silently leaves
+every peer of the other family untrusted. A proxy of that family then resolves as a direct peer
+instead of a trusted one: if it runs on loopback it is exempt from the rate limit, its
+`X-Forwarded-For` is never consulted, and everything it forwards is exempt along with it. See
+[specs/05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication)
+for the full behavior.
 
 ---
 

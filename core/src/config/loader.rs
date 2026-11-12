@@ -12,7 +12,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    config::{platform::PlatformPaths, schema::RawConfig},
+    config::{
+        platform::PlatformPaths,
+        schema::{parse_ip_cidr, RawConfig, MAX_UNUSED_CLIENT_TTL_SECS},
+    },
     Error,
 };
 
@@ -204,6 +207,51 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         return Err(Error::InvalidConfig {
             message: "http.rate_limit.burst must be greater than zero".to_string(),
         });
+    }
+
+    if config.server.abuse_limits.max_dynamic_clients < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.max_dynamic_clients must be greater than zero"
+                .to_string(),
+        });
+    }
+
+    if config.server.abuse_limits.unused_client_ttl_secs < 1
+        || config.server.abuse_limits.unused_client_ttl_secs > MAX_UNUSED_CLIENT_TTL_SECS
+    {
+        return Err(Error::InvalidConfig {
+            message: format!(
+                "server.abuse_limits.unused_client_ttl_secs must be between 1 and \
+                 {MAX_UNUSED_CLIENT_TTL_SECS} (10 years)"
+            ),
+        });
+    }
+
+    if config.server.abuse_limits.requests_per_second < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.requests_per_second must be greater than zero"
+                .to_string(),
+        });
+    }
+
+    if config.server.abuse_limits.burst < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.abuse_limits.burst must be greater than zero".to_string(),
+        });
+    }
+
+    for (i, entry) in config
+        .server
+        .abuse_limits
+        .trusted_proxies
+        .iter()
+        .enumerate()
+    {
+        if let Err(reason) = parse_ip_cidr(entry) {
+            return Err(Error::InvalidConfig {
+                message: format!("server.abuse_limits.trusted_proxies[{i}]: {reason}"),
+            });
+        }
     }
 
     // Rejected here rather than at first use: `user_agent` is handed to

@@ -1,6 +1,33 @@
 use super::*;
-use localdb_core::auth::{AuthService, RedeemOutcome};
+use localdb_core::auth::{
+    AuthService, RedeemAndIssueCodeOutcome, RedeemOutcome, LOCALDB_CLI_CLIENT_ID,
+};
 use std::sync::Arc;
+
+fn make_oauth_client(id: &str) -> localdb_core::auth::OAuthClientRow {
+    localdb_core::auth::OAuthClientRow {
+        id: id.to_string(),
+        client_name: None,
+        redirect_uris: vec!["https://app.example.com/cb".to_string()],
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+    }
+}
+
+fn make_auth_code(client_id: &str, user_id: &str, code_hash: &str) -> AuthCodeRow {
+    AuthCodeRow {
+        id: format!("code-{code_hash}"),
+        client_id: client_id.to_string(),
+        user_id: user_id.to_string(),
+        code_hash: code_hash.to_string(),
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        code_challenge_method: "S256".to_string(),
+        redirect_uri: "https://app.example.com/cb".to_string(),
+        expires_at: "2099-01-01T00:00:00Z".to_string(),
+        consumed_at: None,
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+        minted_by_family: None,
+    }
+}
 
 #[tokio::test]
 async fn bootstrap_is_atomic_resumable_and_never_reopens_established_admin() {
@@ -274,6 +301,219 @@ async fn redeem_open_invite_refuses_a_credential_minted_by_a_compromised_family(
         .await
         .unwrap()
         .is_none());
+}
+
+// -----------------------------------------------------------------
+// `redeem_open_invite_and_issue_code` (specs/05-surfaces.md §3.1): the
+// OAuth consent page's invite branch only — the mint and the first
+// authorization code commit as one transaction, confirming `client_id`
+// still exists inside it.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_succeeds_with_a_registered_client() {
+    let (_dir, backend, store) = make_store().await;
+    insert_store_row(&backend, "docs").await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&make_oauth_client("client-1"))
+        .await
+        .unwrap();
+    let user = make_user("u1", "newbie", Role::Member);
+    let grant = StoreGrantRow {
+        store_name: "docs".to_string(),
+        user_id: "u1".to_string(),
+        granted_by: "admin".to_string(),
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+    };
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    let code = make_auth_code("client-1", "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code(
+            "i1",
+            &user,
+            &[grant],
+            &credential,
+            LOCALDB_CLI_CLIENT_ID,
+            &code,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::Issued);
+
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 1);
+    assert!(store.get_user("u1").await.unwrap().is_some());
+    assert_eq!(store.list_grants_for_store("docs").await.unwrap().len(), 1);
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .find_auth_code_by_hash("code-hash")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// The built-in client is never a row in `oauth_clients` — the existence
+/// check must not refuse it.
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_succeeds_with_the_builtin_client() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let user = make_user("u1", "newbie", Role::Member);
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    let code = make_auth_code(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code(
+            "i1",
+            &user,
+            &[],
+            &credential,
+            LOCALDB_CLI_CLIENT_ID,
+            &code,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::Issued);
+}
+
+/// The core regression this closes: a `client_id` with no row in
+/// `oauth_clients` — here, evicted by a registration at the cap between
+/// this invite redemption's own earlier validation and this call — must
+/// refuse atomically. Nothing commits: not the invite's use, not the user,
+/// not the grant, not the credential, not the code.
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_refuses_an_evicted_client_and_commits_nothing() {
+    let (_dir, backend, store) = make_store().await;
+    insert_store_row(&backend, "docs").await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    // Register "client-a" alone, under a cap of 1, so it is the only
+    // dynamic client — then register "client-b" past that same cap, which
+    // evicts "client-a" (never authorized) to make room.
+    store
+        .prune_and_create_oauth_client(
+            &make_oauth_client("client-a"),
+            LOCALDB_CLI_CLIENT_ID,
+            "2000-01-01T00:00:00Z",
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .prune_and_create_oauth_client(
+            &make_oauth_client("client-b"),
+            LOCALDB_CLI_CLIENT_ID,
+            "2000-01-01T00:00:00Z",
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.find_oauth_client("client-a").await.unwrap().is_none(),
+        "client-a must have been evicted to make room for client-b"
+    );
+
+    let user = make_user("u1", "newbie", Role::Member);
+    let grant = StoreGrantRow {
+        store_name: "docs".to_string(),
+        user_id: "u1".to_string(),
+        granted_by: "admin".to_string(),
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+    };
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    let code = make_auth_code("client-a", "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code(
+            "i1",
+            &user,
+            &[grant],
+            &credential,
+            LOCALDB_CLI_CLIENT_ID,
+            &code,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::UnknownClient);
+
+    assert_eq!(
+        store.find_invite("i1").await.unwrap().unwrap().uses,
+        0,
+        "an unknown client must not burn the invite's use"
+    );
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store
+        .list_grants_for_store("docs")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .find_token_by_hash("hash-cred")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .find_auth_code_by_hash("code-hash")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_revoked_or_expired_is_not_eligible() {
+    let (_dir, _backend, store) = make_store().await;
+    let user = make_user("u1", "alice", Role::Member);
+
+    let mut revoked = make_invite("i1", "h1", InviteMode::Open);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    let credential = make_token("t1", "u1", TokenKind::ApiKey, "hash-cred");
+    let code = make_auth_code(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
+    let outcome = store
+        .redeem_open_invite_and_issue_code(
+            "i1",
+            &user,
+            &[],
+            &credential,
+            LOCALDB_CLI_CLIENT_ID,
+            &code,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+
+    let mut expired = make_invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    let credential2 = make_token("t2", "u1", TokenKind::ApiKey, "hash-cred-2");
+    let code2 = make_auth_code(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash-2");
+    let outcome = store
+        .redeem_open_invite_and_issue_code(
+            "i2",
+            &user,
+            &[],
+            &credential2,
+            LOCALDB_CLI_CLIENT_ID,
+            &code2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
 }
 
 /// Direct-store counterpart of `collect_access_request_refuses_a_credential_minted_by_a_compromised_family`

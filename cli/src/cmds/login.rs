@@ -363,11 +363,32 @@ async fn perform_invite_login(
     Err(crate::daemon_client::daemon_response_error(status, &body))
 }
 
+/// Upper bound on how long a single `Retry-After`-driven wait may stretch
+/// this poll loop, regardless of what value the header carries — a
+/// hostile or merely broken daemon must not be able to stall `login`
+/// indefinitely with one absurd value (e.g. `Retry-After: 315360000`).
+const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many consecutive `429`s this loop tolerates before giving up.
+/// Waiting for a human's approval is legitimately open-ended, so this loop
+/// has no overall deadline on `pending` — but a `429` means this loop
+/// itself is being throttled, not that the request is still undecided, and
+/// repeated `429`s must not be able to extend the wait without bound
+/// either (a `Retry-After: 0`, honored literally, would otherwise hot-loop
+/// forever just as easily as a huge one stalls forever). After this many
+/// in a row — each one waited out in full — the loop gives up with a
+/// clear, retryable error instead of continuing forever.
+const MAX_CONSECUTIVE_RATE_LIMITS: u32 = 20;
+
 /// Poll `POST /v1/invites/requests/{id}/poll` every `poll_interval` until
 /// the request is decided. Returns the credential on approval; `denied` is
 /// a terminal `Unauthorized` with a clear message, per specs/05-surfaces.md
 /// §2. The secret is sent in the JSON body, never the URL — see
 /// `server::handlers::invites::poll_request`'s doc comment for why.
+///
+/// Delegates the actual loop to [`poll_loop`], supplying the real HTTP
+/// request and `tokio::time::sleep` as its two effects — see that
+/// function's doc comment for why the loop itself lives there.
 async fn poll_until_decided(
     client: &reqwest::Client,
     base_url: &str,
@@ -376,21 +397,106 @@ async fn poll_until_decided(
     poll_interval: std::time::Duration,
 ) -> Result<String, Error> {
     let encoded_id = encode_path_segment(request_id);
+    poll_loop(
+        poll_interval,
+        || async {
+            let resp = client
+                .post(format!("{base_url}/v1/invites/requests/{encoded_id}/poll"))
+                .json(&json!({ "secret": request_secret }))
+                .send()
+                .await
+                .map_err(|_| Error::DaemonUnreachable)?;
+            let status = resp.status();
+            let retry_after = retry_after_duration(resp.headers());
+            let body = if poll_response_needs_body(status) {
+                resp.json().await.unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            };
+            Ok(PollResponse {
+                status,
+                retry_after,
+                body,
+            })
+        },
+        |wait| tokio::time::sleep(wait),
+    )
+    .await
+}
+
+/// One real poll request's full outcome: status, the parsed `Retry-After`
+/// header, and the response body (parsed as JSON; `Value::Null` if parsing
+/// fails). Bundling the whole response as a single value — rather than
+/// fetching the body only once the status has been examined — is what lets
+/// a test script a sequence of these directly, with no socket.
+struct PollResponse {
+    status: reqwest::StatusCode,
+    retry_after: Option<std::time::Duration>,
+    body: serde_json::Value,
+}
+
+/// `poll_until_decided`'s state machine, taking the two effects it needs —
+/// "perform one poll request" (`poll_one`) and "sleep for a duration"
+/// (`sleep`) — as parameters instead of calling a real socket and
+/// `tokio::time::sleep` directly. This is what makes the loop's own
+/// behavior unit-testable with no socket and no real time: that the
+/// consecutive-429 counter carries across iterations, resets on a non-429
+/// response, and the exact number of requests and sleeps before giving up
+/// (`cli::cmds::login::rate_limit_tests`). The production caller
+/// (`poll_until_decided`) passes the real HTTP call and
+/// `tokio::time::sleep`; this function has no knowledge of either.
+async fn poll_loop<PollFut, SleepFut>(
+    poll_interval: std::time::Duration,
+    mut poll_one: impl FnMut() -> PollFut,
+    mut sleep: impl FnMut(std::time::Duration) -> SleepFut,
+) -> Result<String, Error>
+where
+    PollFut: std::future::Future<Output = Result<PollResponse, Error>>,
+    SleepFut: std::future::Future<Output = ()>,
+{
+    let mut consecutive_rate_limits = 0u32;
     loop {
-        let resp = client
-            .post(format!("{base_url}/v1/invites/requests/{encoded_id}/poll"))
-            .json(&json!({ "secret": request_secret }))
-            .send()
-            .await
-            .map_err(|_| Error::DaemonUnreachable)?;
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        if !status.is_success() {
-            return Err(crate::daemon_client::daemon_response_error(status, &body));
+        let resp = poll_one().await?;
+        // A 429 from the daemon's per-IP rate limiter (specs/05-surfaces.md
+        // §3.1) is not a decision failure — it means this poll loop itself
+        // is the thing being throttled (e.g. several concurrent logins
+        // sharing one IP behind NAT). Wait the suggested delay, clamped to
+        // a sane range, and keep polling rather than surfacing an error for
+        // a condition this loop caused and can resolve by itself — unless
+        // it keeps happening (see `MAX_CONSECUTIVE_RATE_LIMITS`).
+        match next_poll_step(
+            resp.status,
+            resp.retry_after,
+            poll_interval,
+            consecutive_rate_limits,
+        ) {
+            PollStep::GiveUp => {
+                return Err(Error::RateLimited {
+                    message: format!(
+                        "the daemon rate-limited this poll {MAX_CONSECUTIVE_RATE_LIMITS} times \
+                         in a row; retry login later"
+                    ),
+                });
+            }
+            PollStep::WaitAndRetry { wait, new_count } => {
+                consecutive_rate_limits = new_count;
+                sleep(wait).await;
+                continue;
+            }
+            PollStep::Proceed => {
+                consecutive_rate_limits = 0;
+            }
         }
-        match body.get("state").and_then(|v| v.as_str()) {
+        if !resp.status.is_success() {
+            return Err(crate::daemon_client::daemon_response_error(
+                resp.status,
+                &resp.body,
+            ));
+        }
+        match resp.body.get("state").and_then(|v| v.as_str()) {
             Some("approved") => {
-                return body
+                return resp
+                    .body
                     .get("api_key")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
@@ -412,7 +518,7 @@ async fn poll_until_decided(
                     correlation_id: "login_invite_poll_already_collected".to_string(),
                 });
             }
-            Some("pending") => tokio::time::sleep(poll_interval).await,
+            Some("pending") => sleep(poll_interval).await,
             _ => {
                 return Err(Error::Internal {
                     message: "invalid approval response".into(),
@@ -421,6 +527,74 @@ async fn poll_until_decided(
             }
         }
     }
+}
+
+/// Parse a `Retry-After` header as a plain integer number of seconds (the
+/// only form this daemon's rate limiter sends — `server::auth::rate_limit`).
+/// `None` for a missing or unparseable header, so the caller can fall back
+/// to its own poll interval rather than fail outright on a header shape
+/// this server never actually sends. The returned duration is not yet
+/// clamped — callers apply their own bound (see `MAX_RATE_LIMIT_WAIT`).
+fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+}
+
+/// Whether a poll response's body is worth reading at all. A `429`'s body
+/// is never inspected — `next_poll_step` decides purely from `status` and
+/// `Retry-After` — so the caller skips reading it: a proxy that returns the
+/// `429` status and headers promptly but stalls the body can otherwise hold
+/// up a retry for as long as the request timeout, every time it happens.
+fn poll_response_needs_body(status: reqwest::StatusCode) -> bool {
+    status != reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// What `poll_until_decided`'s loop does next for one poll response. Pure
+/// (no I/O, no clock), so the decision — clamping, the give-up threshold,
+/// the counter reset on a non-429 — is unit-testable without a socket or
+/// paused time.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+enum PollStep {
+    /// Sleep `wait`, then poll again; the loop's consecutive-429 counter
+    /// becomes `new_count`.
+    WaitAndRetry {
+        wait: std::time::Duration,
+        new_count: u32,
+    },
+    /// Too many consecutive `429`s — give up.
+    GiveUp,
+    /// Not rate-limited: interpret the response body; the counter resets.
+    Proceed,
+}
+
+/// Decide the next `PollStep` for a poll response with the given `status`
+/// and parsed `Retry-After` (`retry_after`), given the poll loop's
+/// `poll_interval` and how many `429`s it has already seen in a row
+/// (`consecutive_rate_limits`, before this response).
+fn next_poll_step(
+    status: reqwest::StatusCode,
+    retry_after: Option<std::time::Duration>,
+    poll_interval: std::time::Duration,
+    consecutive_rate_limits: u32,
+) -> PollStep {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return PollStep::Proceed;
+    }
+    let new_count = consecutive_rate_limits + 1;
+    if new_count >= MAX_CONSECUTIVE_RATE_LIMITS {
+        return PollStep::GiveUp;
+    }
+    // The minimum is `poll_interval` itself (never busy-loop faster than
+    // this login would poll anyway, even on `Retry-After: 0` or a missing
+    // header); the maximum is `MAX_RATE_LIMIT_WAIT` (never one absurd value
+    // away from a login that looks hung).
+    let wait = retry_after
+        .unwrap_or(poll_interval)
+        .clamp(poll_interval, MAX_RATE_LIMIT_WAIT);
+    PollStep::WaitAndRetry { wait, new_count }
 }
 
 /// Persist a redeemed invite's API key into `credentials.json` under the
@@ -743,5 +917,7 @@ fn classify_token_error(status: reqwest::StatusCode, message: String) -> Error {
     }
 }
 
+#[cfg(test)]
+mod rate_limit_tests;
 #[cfg(test)]
 mod tests;

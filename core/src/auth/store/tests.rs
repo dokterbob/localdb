@@ -555,3 +555,514 @@ async fn collect_access_request_refuses_a_credential_minted_by_a_compromised_fam
     );
     assert!(store.find_token("t1").await.unwrap().is_none());
 }
+
+// -----------------------------------------------------------------
+// `prune_and_create_oauth_client` (specs/05-surfaces.md §3.1): the
+// `FakeAuthStore` counterpart to `store-libsql`'s atomic prune-then-insert
+// tests — same behavior, verified against the in-memory implementation.
+// -----------------------------------------------------------------
+
+use crate::auth::client::LOCALDB_CLI_CLIENT_ID;
+
+const OLD_CREATED_AT: &str = "2000-01-01T00:00:00Z";
+const CUTOFF_AFTER_OLD: &str = "2010-01-01T00:00:00Z";
+const CUTOFF_BEFORE_OLD: &str = "1990-01-01T00:00:00Z";
+
+fn oauth_client(id: &str, created_at: &str) -> OAuthClientRow {
+    OAuthClientRow {
+        id: id.to_string(),
+        client_name: Some("Test Client".to_string()),
+        redirect_uris: vec!["https://app.example.com/cb".to_string()],
+        created_at: created_at.to_string(),
+    }
+}
+
+fn auth_code_for(client_id: &str) -> AuthCodeRow {
+    AuthCodeRow {
+        id: format!("code-for-{client_id}"),
+        client_id: client_id.to_string(),
+        user_id: "user-1".to_string(),
+        code_hash: format!("hash-{client_id}"),
+        code_challenge: "challenge".to_string(),
+        code_challenge_method: "S256".to_string(),
+        redirect_uri: "https://app.example.com/cb".to_string(),
+        expires_at: "2099-01-01T00:00:00Z".to_string(),
+        consumed_at: None,
+        created_at: OLD_CREATED_AT.to_string(),
+        minted_by_family: None,
+    }
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_inserts_when_under_cap() {
+    let store = FakeAuthStore::new();
+    let client = oauth_client("new-client", "2026-07-08T00:00:00Z");
+
+    let outcome = store
+        .prune_and_create_oauth_client(&client, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 5)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(store
+        .find_oauth_client("new-client")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_refuses_when_cap_reached_by_used_clients() {
+    let store = FakeAuthStore::new();
+    for id in ["used-1", "used-2"] {
+        store
+            .create_oauth_client(&oauth_client(id, OLD_CREATED_AT))
+            .await
+            .unwrap();
+        store.create_auth_code(&auth_code_for(id)).await.unwrap();
+    }
+
+    let candidate = oauth_client("candidate", "2026-07-08T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::CapReached);
+    assert!(store.find_oauth_client("used-1").await.unwrap().is_some());
+    assert!(store.find_oauth_client("used-2").await.unwrap().is_some());
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_prunes_unused_old_clients_then_succeeds() {
+    let store = FakeAuthStore::new();
+    for id in ["stale-1", "stale-2"] {
+        store
+            .create_oauth_client(&oauth_client(id, OLD_CREATED_AT))
+            .await
+            .unwrap();
+    }
+
+    let candidate = oauth_client("fresh", "2026-07-08T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(store.find_oauth_client("stale-1").await.unwrap().is_none());
+    assert!(store.find_oauth_client("stale-2").await.unwrap().is_none());
+    assert!(store.find_oauth_client("fresh").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_never_prunes_the_builtin_client() {
+    let store = FakeAuthStore::new();
+    store
+        .create_oauth_client(&oauth_client(LOCALDB_CLI_CLIENT_ID, "1970-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let client = oauth_client("new-client", "2026-07-08T00:00:00Z");
+
+    store
+        .prune_and_create_oauth_client(&client, LOCALDB_CLI_CLIENT_ID, "2099-01-01T00:00:00Z", 5)
+        .await
+        .unwrap();
+
+    assert!(store
+        .find_oauth_client(LOCALDB_CLI_CLIENT_ID)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+// -----------------------------------------------------------------
+// Eviction at the cap: a registration flood of fresh, unused clients must
+// not be able to lock everyone else out until those rows age past the TTL
+// on their own — the oldest unused client is evicted instead of refusing.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn fake_prune_and_create_evicts_the_oldest_unused_client_at_cap() {
+    let store = FakeAuthStore::new();
+    // None of these are old enough to be pruned by TTL (the cutoff below is
+    // before all of them), and none has an auth code — cap-reached eviction
+    // is the only way to make room.
+    store
+        .create_oauth_client(&oauth_client("oldest", "2026-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("middle", "2026-02-01T00:00:00Z"))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("newest", "2026-03-01T00:00:00Z"))
+        .await
+        .unwrap();
+
+    let candidate = oauth_client("candidate", "2026-04-01T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 3)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(
+        store.find_oauth_client("oldest").await.unwrap().is_none(),
+        "the oldest unused client must be evicted to free the slot"
+    );
+    assert!(store.find_oauth_client("middle").await.unwrap().is_some());
+    assert!(store.find_oauth_client("newest").await.unwrap().is_some());
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_evicts_as_many_as_needed_to_reach_the_cap() {
+    let store = FakeAuthStore::new();
+    // Five unused dynamic clients already past a cap of two: the eviction
+    // must remove enough of the oldest that the table lands exactly at the
+    // cap once the candidate is inserted — not just the single oldest.
+    for (id, created_at) in [
+        ("c1", "2026-01-01T00:00:00Z"),
+        ("c2", "2026-01-02T00:00:00Z"),
+        ("c3", "2026-01-03T00:00:00Z"),
+        ("c4", "2026-01-04T00:00:00Z"),
+        ("c5", "2026-01-05T00:00:00Z"),
+    ] {
+        store
+            .create_oauth_client(&oauth_client(id, created_at))
+            .await
+            .unwrap();
+    }
+
+    let candidate = oauth_client("candidate", "2026-01-06T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    for id in ["c1", "c2", "c3", "c4"] {
+        assert!(
+            store.find_oauth_client(id).await.unwrap().is_none(),
+            "{id} should have been evicted to reach the cap"
+        );
+    }
+    assert!(
+        store.find_oauth_client("c5").await.unwrap().is_some(),
+        "the newest survivor must remain"
+    );
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_some());
+
+    let mut remaining = 0;
+    for id in ["c1", "c2", "c3", "c4", "c5", "candidate"] {
+        if store.find_oauth_client(id).await.unwrap().is_some() {
+            remaining += 1;
+        }
+    }
+    assert_eq!(remaining, 2, "the table must land exactly at the cap");
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_refuses_without_evicting_when_used_clients_alone_exceed_the_cap() {
+    let store = FakeAuthStore::new();
+    // Three used clients already over a cap of two: there is no unused
+    // client to evict, so the registration must refuse without deleting
+    // anything already registered.
+    for id in ["used-1", "used-2", "used-3"] {
+        store
+            .create_oauth_client(&oauth_client(id, OLD_CREATED_AT))
+            .await
+            .unwrap();
+        store.create_auth_code(&auth_code_for(id)).await.unwrap();
+    }
+
+    let candidate = oauth_client("candidate", "2026-07-08T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::CapReached);
+    for id in ["used-1", "used-2", "used-3"] {
+        assert!(
+            store.find_oauth_client(id).await.unwrap().is_some(),
+            "{id} must not be evicted"
+        );
+    }
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_never_evicts_a_used_client_even_at_cap() {
+    let store = FakeAuthStore::new();
+    let used = oauth_client("used", "2026-01-01T00:00:00Z");
+    store.create_oauth_client(&used).await.unwrap();
+    store
+        .create_auth_code(&auth_code_for("used"))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("unused", "2026-02-01T00:00:00Z"))
+        .await
+        .unwrap();
+
+    let candidate = oauth_client("candidate", "2026-03-01T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(
+        store.find_oauth_client("used").await.unwrap().is_some(),
+        "a used client must never be evicted, even though it is the oldest"
+    );
+    assert!(
+        store.find_oauth_client("unused").await.unwrap().is_none(),
+        "the only evictable (unused) client must be the one freed"
+    );
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_never_evicts_the_builtin_client() {
+    let store = FakeAuthStore::new();
+    // The built-in client's epoch `created_at` would make it the oldest
+    // candidate for eviction by age alone if it were not excluded by id.
+    store
+        .create_oauth_client(&oauth_client(LOCALDB_CLI_CLIENT_ID, "1970-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let used = oauth_client("used", "2026-01-01T00:00:00Z");
+    store.create_oauth_client(&used).await.unwrap();
+    store
+        .create_auth_code(&auth_code_for("used"))
+        .await
+        .unwrap();
+
+    // Cap=1 counts only dynamic clients, so "used" alone already fills it;
+    // with no unused dynamic client to evict, this must refuse.
+    let candidate = oauth_client("candidate", "2026-02-01T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::CapReached);
+    assert!(store
+        .find_oauth_client(LOCALDB_CLI_CLIENT_ID)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store.find_oauth_client("used").await.unwrap().is_some());
+}
+
+// -----------------------------------------------------------------
+// Deleting a user cascades to their `auth_codes` (mirrors the real schema's
+// `ON DELETE CASCADE`) — a client whose only completed authorization
+// belonged to a deleted user becomes unused again, and therefore prunable/
+// evictable. See `store-libsql/src/auth/tests/clients.rs`'s identical test
+// for the libsql-backed store.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn deleting_a_user_cascades_their_auth_codes_so_the_client_they_used_becomes_evictable() {
+    let store = FakeAuthStore::new();
+    store.create_user(&user("user-1", "alice")).await.unwrap();
+    let used = oauth_client("used", OLD_CREATED_AT);
+    store.create_oauth_client(&used).await.unwrap();
+    store
+        .create_auth_code(&auth_code_for("used"))
+        .await
+        .unwrap();
+
+    // While "used" is still used, it alone fills a cap of 1 and there is no
+    // unused dynamic client to evict.
+    let candidate_1 = oauth_client("candidate-1", "2026-05-01T00:00:00Z");
+    let outcome_1 = store
+        .prune_and_create_oauth_client(&candidate_1, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 1)
+        .await
+        .unwrap();
+    assert_eq!(outcome_1, RegisterClientOutcome::CapReached);
+
+    assert!(store.delete_user("user-1").await.unwrap());
+
+    // The auth code (and with it, "used"'s used-ness) is gone, so it is now
+    // the oldest unused dynamic client and gets evicted to make room.
+    let candidate_2 = oauth_client("candidate-2", "2026-05-02T00:00:00Z");
+    let outcome_2 = store
+        .prune_and_create_oauth_client(&candidate_2, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 1)
+        .await
+        .unwrap();
+    assert_eq!(outcome_2, RegisterClientOutcome::Created);
+    assert!(
+        store.find_oauth_client("used").await.unwrap().is_none(),
+        "the client's only auth code was deleted along with its user"
+    );
+    assert!(store
+        .find_oauth_client("candidate-2")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+// -----------------------------------------------------------------
+// `redeem_open_invite_and_issue_code` (specs/05-surfaces.md §3.1): the
+// `FakeAuthStore` counterpart to `store-libsql`'s equivalent tests — the
+// OAuth consent page's invite branch only, mint plus first authorization
+// code as one transaction, checking `client_id` still exists inside it.
+// -----------------------------------------------------------------
+
+fn auth_code_for_client_and_user(client_id: &str, user_id: &str, code_hash: &str) -> AuthCodeRow {
+    AuthCodeRow {
+        id: format!("code-{code_hash}"),
+        client_id: client_id.to_string(),
+        user_id: user_id.to_string(),
+        code_hash: code_hash.to_string(),
+        code_challenge: "challenge".to_string(),
+        code_challenge_method: "S256".to_string(),
+        redirect_uri: "https://app.example.com/cb".to_string(),
+        expires_at: "2099-01-01T00:00:00Z".to_string(),
+        consumed_at: None,
+        created_at: "2026-06-10T12:00:00Z".to_string(),
+        minted_by_family: None,
+    }
+}
+
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_succeeds_with_a_registered_client() {
+    let store = FakeAuthStore::new();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("client-1", "2026-06-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let u = user("u1", "newbie");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user("client-1", "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::Issued);
+    assert_eq!(store.find_invite("i1").await.unwrap().unwrap().uses, 1);
+    assert!(store.get_user("u1").await.unwrap().is_some());
+    assert!(store.find_token("t1").await.unwrap().is_some());
+    assert!(store
+        .find_auth_code_by_hash("code-hash")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// The built-in client is never a row in `oauth_clients` — the existence
+/// check must not refuse it.
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_succeeds_with_the_builtin_client() {
+    let store = FakeAuthStore::new();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let u = user("u1", "newbie");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::Issued);
+}
+
+/// The core regression this closes: a `client_id` with no row in
+/// `oauth_clients` — evicted, or (as here) simply never registered — must
+/// refuse atomically. Nothing commits: not the invite's use, not the user,
+/// not the credential, not the code.
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_refuses_an_unknown_client_and_commits_nothing() {
+    let store = FakeAuthStore::new();
+    store
+        .create_invite(&invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+    let u = user("u1", "newbie");
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user("evicted-client", "u1", "code-hash");
+
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::UnknownClient);
+
+    assert_eq!(
+        store.find_invite("i1").await.unwrap().unwrap().uses,
+        0,
+        "an unknown client must not burn the invite's use"
+    );
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store.find_token("t1").await.unwrap().is_none());
+    assert!(store
+        .find_auth_code_by_hash("code-hash")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn redeem_open_invite_and_issue_code_revoked_or_expired_is_not_eligible() {
+    let store = FakeAuthStore::new();
+    let u = user("u1", "alice");
+
+    let mut revoked = invite("i1", "h1", InviteMode::Open);
+    revoked.revoked_at = Some("2026-06-10T12:00:00Z".to_string());
+    store.create_invite(&revoked).await.unwrap();
+    let cred = credential("t1", "u1", "hash-cred");
+    let code = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash");
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i1", &u, &[], &cred, LOCALDB_CLI_CLIENT_ID, &code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+
+    let mut expired = invite("i2", "h2", InviteMode::Open);
+    expired.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+    store.create_invite(&expired).await.unwrap();
+    let cred2 = credential("t2", "u1", "hash-cred-2");
+    let code2 = auth_code_for_client_and_user(LOCALDB_CLI_CLIENT_ID, "u1", "code-hash-2");
+    let outcome = store
+        .redeem_open_invite_and_issue_code("i2", &u, &[], &cred2, LOCALDB_CLI_CLIENT_ID, &code2)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RedeemAndIssueCodeOutcome::NotEligible);
+    assert!(store.get_user("u1").await.unwrap().is_none());
+}

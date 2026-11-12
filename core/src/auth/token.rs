@@ -123,9 +123,37 @@ fn base64url_encode(bytes: &[u8]) -> String {
 /// `crate::ingestion::now_rfc3339`, which freezes to a fixed string
 /// crate-wide under test. Token expiry tests need small positive/negative
 /// offsets from "now", not a single frozen instant.
+///
+/// `delta_secs` is clamped to ±[`MAX_RFC3339_DELTA_SECS`] before it reaches
+/// `chrono` arithmetic (`Duration::seconds`, `DateTime + Duration`, which
+/// both panic on overflow by default): a delta past that bound saturates
+/// rather than panicking. Not every caller's delta is already bounded —
+/// the CLI's credential cache stores an expiry derived from a
+/// server-supplied `expires_in`, which this function has no control over —
+/// so this clamp is the function's own backstop, not a convenience for
+/// callers that already bound their input elsewhere (e.g.
+/// `cli::cmds::invite::parse_expiry_duration`, which rejects anything past
+/// this same bound before it ever reaches here). The bound is generous enough
+/// (100 years) that no real caller is ever clamped, and tight enough that
+/// the result stays a normal 4-digit-year `YYYY-MM-DDTHH:MM:SSZ` string —
+/// unlike saturating to `chrono`'s absolute `DateTime::<Utc>::MIN_UTC`/
+/// `MAX_UTC`, whose signed/extended year would break the fixed-width,
+/// lexicographically-ordered shape `is_expired`/`expires_within` and the
+/// SQL boundaries in `store-libsql` depend on.
 pub fn rfc3339_from_now(delta_secs: i64) -> String {
-    (Utc::now() + Duration::seconds(delta_secs)).to_rfc3339_opts(SecondsFormat::Secs, true)
+    let clamped = delta_secs.clamp(-MAX_RFC3339_DELTA_SECS, MAX_RFC3339_DELTA_SECS);
+    (Utc::now() + Duration::seconds(clamped)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
+
+/// The most extreme delta [`rfc3339_from_now`] will actually apply —
+/// comfortably within `chrono`'s representable range and far enough from
+/// "now" that no real caller's delta is ever clamped, but small enough
+/// that `Duration::seconds`/`DateTime + Duration` can never overflow or
+/// produce a non-4-digit year. Public so a caller that would rather reject
+/// an out-of-range delta with its own error than let it silently saturate
+/// here can validate against this same bound
+/// (`cli::cmds::invite::parse_expiry_duration`).
+pub const MAX_RFC3339_DELTA_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 
 /// Is the given RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) in the past
 /// relative to now?

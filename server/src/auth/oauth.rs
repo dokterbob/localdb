@@ -22,7 +22,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use localdb_core::auth::{self, RedeemOutcome};
+use localdb_core::auth::{self, AuthorizeInviteOutcome};
 use localdb_core::Error as CoreError;
 
 use crate::state::AppState;
@@ -413,19 +413,37 @@ async fn handle_invite_authorize(
         return render_consent_page(params, "", Some(invite_token), Some("Enter your name."))
             .into_response();
     }
+    // `redeem_invite_for_authorize`, not the plain `redeem_invite` +
+    // `issue_code_and_continue` pair `resolve_credential`'s branch uses: an
+    // `open`-mode redemption's mint and its first authorization code must
+    // commit as one transaction, or a registration that evicts
+    // `params.client_id` between this call starting and the code insert
+    // could burn the invite's use and create a user for an authorization
+    // that can never complete. See `AuthService::
+    // redeem_invite_for_authorize`'s doc comment.
     match state
         .auth()
-        .redeem_invite(invite_token, requested_name)
+        .redeem_invite_for_authorize(
+            invite_token,
+            requested_name,
+            &params.client_id,
+            &params.redirect_uri,
+            &params.code_challenge,
+        )
         .await
     {
-        Ok(RedeemOutcome::Open { user, .. }) => {
-            // An invite mints a fresh, untainted user — no session ancestry.
-            issue_code_and_continue(state, params, &user.id, None).await
-        }
-        Ok(RedeemOutcome::Closed {
+        Ok(AuthorizeInviteOutcome::Issued { issued, .. }) => continue_with_code(params, *issued),
+        Ok(AuthorizeInviteOutcome::Closed {
             request_id,
             request_secret,
         }) => render_request_submitted_page(params, &request_id, &request_secret).into_response(),
+        // `client_id` vanished between `validate_authorize_params`'s check
+        // and this commit — the same error an unknown client gets there,
+        // not the consent-form inline error the other failures below use:
+        // this isn't something retrying with a different name fixes.
+        Ok(AuthorizeInviteOutcome::UnknownClient) => {
+            oauth_error_page(OAuthError::new("unauthorized_client", "unknown client_id"))
+        }
         Err(e) => render_consent_page(params, "", Some(invite_token), Some(&e.to_string()))
             .into_response(),
     }
@@ -462,7 +480,14 @@ async fn issue_code_and_continue(
             return oauth_error_page(OAuthError::new("server_error", e.to_string()));
         }
     };
+    continue_with_code(params, issued)
+}
 
+/// Shared tail of `issue_code_and_continue` and the invite branch
+/// (`handle_invite_authorize`), once an authorization code already exists:
+/// redirect to `redirect_uri` with it, or (the `--no-browser` oob sentinel)
+/// render it inline for copy/paste.
+fn continue_with_code(params: &ValidParams, issued: auth::IssuedAuthCode) -> Response {
     if params.redirect_uri == auth::OOB_REDIRECT_URI {
         // No listener to redirect to (`localdb login --no-browser`): render
         // the code inline for the operator to copy and paste back into the

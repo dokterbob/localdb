@@ -171,6 +171,36 @@ pub struct OAuthClientRow {
     pub created_at: String,
 }
 
+/// Outcome of `AuthStore::prune_and_create_oauth_client`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterClientOutcome {
+    /// Room was found — by TTL pruning, by evicting the oldest unused
+    /// dynamically registered client, or because there was already room —
+    /// and `client` was inserted.
+    Created,
+    /// Every slot is held by a client with a completed authorization (or
+    /// the built-in client, which never counts); nothing was inserted. Any
+    /// pruning/eviction that did run still committed.
+    CapReached,
+}
+
+/// Outcome of `AuthStore::redeem_open_invite_and_issue_code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedeemAndIssueCodeOutcome {
+    /// The invite's use was reserved, the user/grants/credential were
+    /// created, `client_id` was confirmed to still exist, and `auth_code`
+    /// was inserted — all in the same transaction.
+    Issued,
+    /// The invite was not eligible (exhausted, revoked, or expired as of
+    /// this call) — mirrors `redeem_open_invite`'s `false`. Nothing
+    /// committed.
+    NotEligible,
+    /// `client_id` is not `builtin_client_id` and has no row in
+    /// `oauth_clients` — evicted, or never registered. Nothing committed:
+    /// not even the invite's use.
+    UnknownClient,
+}
+
 /// A store-name/user-id grant (D7). Normalized: one row per grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreGrantRow {
@@ -366,6 +396,44 @@ pub trait AuthStore: Send + Sync + 'static {
     // ------------------------------------------------------------------
     async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error>;
     async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error>;
+    /// Make room for `client` and insert it, in one transaction so
+    /// concurrent registrations can never together exceed
+    /// `max_dynamic_clients` (specs/05-surfaces.md §3.1):
+    ///
+    /// 1. Prune dynamically registered clients that have never completed an
+    ///    authorization — no row in `auth_codes` names them as `client_id`,
+    ///    the earliest point in the OAuth2 flow this schema records client
+    ///    activity at, earlier than a token ever being minted — and were
+    ///    registered before `unused_before` (RFC 3339).
+    /// 2. If the number of dynamically registered clients (every
+    ///    `oauth_clients` row except `builtin_client_id`) is still at or
+    ///    past `max_dynamic_clients`, evict exactly as many of the oldest
+    ///    dynamically registered clients that have never completed an
+    ///    authorization (ties broken by `id`) as it takes for the table to
+    ///    land at `max_dynamic_clients` once the insert below adds one back
+    ///    — regardless of their age. An unauthenticated caller that fills
+    ///    every slot with fresh registrations must not be able to lock out
+    ///    every other registration attempt until those rows age past
+    ///    `unused_before` on their own. A client that registered but has
+    ///    not yet started authorization can be evicted this way and must
+    ///    register again.
+    /// 3. If fewer unused dynamically registered clients exist than the
+    ///    number needed, every remaining slot is held by a client with a
+    ///    completed authorization (or the built-in client, which never
+    ///    counts and is never pruned or evicted) — refusing after
+    ///    destroying some of those registrations would be worse than
+    ///    refusing outright, so this evicts nothing at all and returns
+    ///    [`RegisterClientOutcome::CapReached`] without inserting anything.
+    ///
+    /// Steps 1-3 commit as one transaction. Pruning and eviction commit even
+    /// when the outcome is still `CapReached`.
+    async fn prune_and_create_oauth_client(
+        &self,
+        client: &OAuthClientRow,
+        builtin_client_id: &str,
+        unused_before: &str,
+        max_dynamic_clients: u64,
+    ) -> Result<RegisterClientOutcome, Error>;
 
     // ------------------------------------------------------------------
     // Grants
@@ -399,6 +467,31 @@ pub trait AuthStore: Send + Sync + 'static {
         grants: &[StoreGrantRow],
         credential: &AuthTokenRow,
     ) -> Result<bool, Error>;
+    /// Like `redeem_open_invite`, but for the OAuth consent page's invite
+    /// branch (`server::auth::oauth::handle_invite_authorize`) only:
+    /// additionally confirms `client_id` still names a row in
+    /// `oauth_clients` (exempting `builtin_client_id`, which never has one)
+    /// and inserts `auth_code` — all as one transaction with the mint.
+    ///
+    /// This closes a race a separate `redeem_open_invite` call followed by
+    /// a separate authorization-code insert cannot: a concurrent
+    /// registration at the dynamic-client cap
+    /// (`prune_and_create_oauth_client`'s eviction) can remove `client_id`
+    /// between those two calls, after the mint already committed — burning
+    /// the invite's use and creating the user for an authorization that can
+    /// never complete, since the code insert then fails its own foreign
+    /// key. Checking the client's existence inside the same transaction as
+    /// the mint closes that window: either both commit together or neither
+    /// does.
+    async fn redeem_open_invite_and_issue_code(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+        builtin_client_id: &str,
+        auth_code: &AuthCodeRow,
+    ) -> Result<RedeemAndIssueCodeOutcome, Error>;
     /// The `closed`-mode counterpart to `redeem_open_invite`: atomically
     /// reserves a use and files `request` together. Returns `false` under
     /// the same eligibility conditions.

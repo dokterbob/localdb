@@ -16,7 +16,8 @@ use super::client;
 use super::principal::{Principal, Role, SessionOrigin, StoreAccess};
 use super::store::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
-    InviteMode, InviteRow, OAuthClientRow, RotateOutcome, StoreGrantRow, TokenKind, UserRow,
+    InviteMode, InviteRow, OAuthClientRow, RedeemAndIssueCodeOutcome, RegisterClientOutcome,
+    RotateOutcome, StoreGrantRow, TokenKind, UserRow,
 };
 use super::token::{
     hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256, verify_secret,
@@ -81,6 +82,11 @@ pub enum RegisterClientError {
     Validation(client::RegistrationError),
     /// A store-layer failure persisting the validated client.
     Store(Error),
+    /// `RegistrationPolicy::max_dynamic_clients` is still reached after
+    /// pruning unused, expired registrations and evicting the oldest unused
+    /// one — every slot is held by a client with a completed authorization
+    /// (specs/05-surfaces.md §3.1).
+    CapReached,
 }
 
 impl From<Error> for RegisterClientError {
@@ -94,6 +100,10 @@ impl std::fmt::Display for RegisterClientError {
         match self {
             Self::Validation(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
+            Self::CapReached => write!(
+                f,
+                "the server is not accepting new client registrations right now; retry later"
+            ),
         }
     }
 }
@@ -609,6 +619,18 @@ impl<S: AuthStore> AuthService<S> {
     /// post_register` performs no validation of its own, only mapping each
     /// [`client::RegistrationError`] variant onto its RFC 7591 §3.2.2 error
     /// code.
+    ///
+    /// `policy: RegistrationPolicy::Limited` prunes dynamically registered
+    /// clients older than `unused_client_ttl_secs` that have never
+    /// completed an authorization before inserting; if
+    /// `max_dynamic_clients` is still reached, evicts the single oldest
+    /// remaining unused client to make room, and only refuses with
+    /// [`RegisterClientError::CapReached`] if every slot is held by a
+    /// client with a completed authorization — see [`AuthStore::
+    /// prune_and_create_oauth_client`] for why this runs as one transaction
+    /// with the insert. `policy: RegistrationPolicy::Disabled` (used when
+    /// `server.abuse_limits.enable` is `false`) skips all of that: a plain
+    /// insert that can never prune, evict, or refuse.
     pub async fn register_client(
         &self,
         redirect_uris: Vec<String>,
@@ -616,6 +638,7 @@ impl<S: AuthStore> AuthService<S> {
         token_endpoint_auth_method: Option<&str>,
         grant_types: Option<&[String]>,
         response_types: Option<&[String]>,
+        policy: &client::RegistrationPolicy,
     ) -> Result<OAuthClientRow, RegisterClientError> {
         client::validate_registration_request(
             &redirect_uris,
@@ -625,14 +648,44 @@ impl<S: AuthStore> AuthService<S> {
             response_types,
         )
         .map_err(RegisterClientError::Validation)?;
+        // `rfc3339_from_now(0)`, not `now_rfc3339()`: the latter is frozen
+        // under `#[cfg(test)]` (deterministic document/resource fixtures),
+        // which would make this row's `created_at` incomparable against
+        // `unused_before` below — both must come from the same clock so the
+        // string comparison `prune_and_create_oauth_client` does stays
+        // meaningful in tests, not just in production (where the two
+        // functions agree anyway).
         let row = OAuthClientRow {
             id: new_ulid(),
             client_name,
             redirect_uris,
-            created_at: now_rfc3339(),
+            created_at: rfc3339_from_now(0),
         };
-        self.store.create_oauth_client(&row).await?;
-        Ok(row)
+        match policy {
+            client::RegistrationPolicy::Disabled => {
+                self.store.create_oauth_client(&row).await?;
+                Ok(row)
+            }
+            client::RegistrationPolicy::Limited {
+                max_dynamic_clients,
+                unused_client_ttl_secs,
+            } => {
+                let unused_before = rfc3339_from_now(-unused_client_ttl_secs);
+                match self
+                    .store
+                    .prune_and_create_oauth_client(
+                        &row,
+                        client::LOCALDB_CLI_CLIENT_ID,
+                        &unused_before,
+                        *max_dynamic_clients,
+                    )
+                    .await?
+                {
+                    RegisterClientOutcome::Created => Ok(row),
+                    RegisterClientOutcome::CapReached => Err(RegisterClientError::CapReached),
+                }
+            }
+        }
     }
 
     /// Redeem an authorization code for the user it was issued to (RFC 6749
@@ -874,6 +927,36 @@ pub enum RedeemOutcome {
         request_id: String,
         request_secret: String,
     },
+}
+
+/// Outcome of `AuthService::redeem_invite_for_authorize` — the OAuth
+/// consent page's invite branch only (`server::auth::oauth::
+/// handle_invite_authorize`); `AuthService::redeem_invite`'s own
+/// `RedeemOutcome` is unaffected and keeps its existing behavior for
+/// `POST /v1/invites/redeem` and `/join`.
+#[derive(Debug, Clone)]
+pub enum AuthorizeInviteOutcome {
+    /// `open`-mode invite: the new user, its store grants (echoed back for
+    /// display), and the first authorization code issued to it, minted
+    /// together with the redemption as one transaction.
+    Issued {
+        user: UserRow,
+        grants: Vec<String>,
+        issued: Box<IssuedAuthCode>,
+    },
+    /// `closed`-mode invite: identical to `RedeemOutcome::Closed` — a
+    /// pending access request was filed; no code is issued until an admin
+    /// later approves it.
+    Closed {
+        request_id: String,
+        request_secret: String,
+    },
+    /// `client_id` is not the built-in client and has no row in
+    /// `oauth_clients` — evicted (by a concurrent registration at the
+    /// dynamic-client cap) or never registered. Nothing committed: not the
+    /// mint, not the invite's use. The caller should treat this exactly
+    /// like an unknown `client_id` at `/authorize` validation time.
+    UnknownClient,
 }
 
 /// Outcome of `AuthService::poll_request`: invites redeem without a bearer

@@ -200,7 +200,15 @@ fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
 }
 
 async fn server_future(listener: TcpListener, router: Router) {
-    if let Err(e) = axum::serve(listener, router).await {
+    // `into_make_service_with_connect_info` rather than passing `router`
+    // straight to `axum::serve`: it's what makes the real TCP peer address
+    // available to extractors (`ConnectInfo<SocketAddr>`) at all — axum
+    // does not expose it otherwise (see `log_rejected_responses`'s doc
+    // comment, which explains why that function logs `Host` instead). The
+    // rate-limit middleware (`auth::rate_limit::limit_abuse`) is the only
+    // consumer.
+    let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
+    if let Err(e) = axum::serve(listener, make_service).await {
         error!("server error: {}", e);
     }
 }
@@ -318,15 +326,11 @@ pub fn build_router(
             state.clone(),
             auth::middleware::require_auth,
         ));
-    let public = Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(handlers::oauth_protected_resource),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(handlers::oauth_authorization_server),
-        )
+    // Rate-limited (specs/05-surfaces.md §3.1, `auth::rate_limit::limit_abuse`):
+    // every public route that *is* the auth flow or accepts a secret.
+    // `.well-known/*` is deliberately excluded from this sub-router — see
+    // the `discovery` router below for why.
+    let rate_limited_auth = Router::new()
         .route(
             "/authorize",
             get(auth::oauth::get_authorize).post(auth::oauth::post_authorize),
@@ -343,6 +347,23 @@ pub fn build_router(
             "/v1/invites/requests/{id}/poll",
             post(handlers::poll_access_request),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::rate_limit::limit_abuse,
+        ));
+    // Never rate-limited: static, cheap to serve, and a client needs these
+    // to even discover the routes above.
+    let discovery = Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(handlers::oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(handlers::oauth_authorization_server),
+        );
+    let public = discovery
+        .merge(rate_limited_auth)
         .layer(middleware::from_fn(auth::middleware::protect_auth_response))
         .with_state(state);
 
@@ -363,8 +384,12 @@ pub fn build_router(
 /// actually drives rejection in the one case this was hardest to diagnose
 /// without it — rmcp's DNS-rebinding check on `/mcp` (see
 /// `mcp_allowed_hosts`'s doc comment) — and it's already present on every
-/// HTTP request at no extra cost, unlike the TCP peer address, which axum
-/// does not expose to middleware without opting into `into_make_service_with_connect_info`.
+/// HTTP request at no extra cost. `server_future` now opts into
+/// `into_make_service_with_connect_info` for the rate limiter
+/// (`auth::rate_limit::limit_abuse`), but logging the peer address here too
+/// would add little: it's meaningless behind a reverse proxy (every client
+/// shares the proxy's address) in exactly the deployment this log line is
+/// most useful for.
 async fn log_rejected_responses(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();

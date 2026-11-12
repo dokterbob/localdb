@@ -19,6 +19,16 @@ server:
   bind: 127.0.0.1   # loopback only; set to 0.0.0.0 to listen on all interfaces
   port: 7700        # set to 0 to let the OS assign an ephemeral port
   job_workers: 1    # daemon job-queue workers; jobs for the same store never run concurrently
+  # abuse_limits:   # limits on the public, unauthenticated auth routes (§3.1)
+  #   enable: true                  # a direct loopback peer not itself a trusted proxy is exempt
+  #   max_dynamic_clients: 1000     # POST /register cap; the built-in localdb-cli client is exempt
+  #   unused_client_ttl_secs: 86400 # how long an unused registration may sit before it's prunable
+  #   requests_per_second: 5        # per-client-IP token bucket across the public auth routes
+  #   burst: 20
+  #   trusted_proxies: []           # peers whose X-Forwarded-For is honored; e.g. [127.0.0.1, ::1];
+  #                                 # IPv4-mapped entries (::ffff:a.b.c.d) are rejected — write a.b.c.d
+  #                                 # IPv4 and IPv6 ranges never cover each other's family — to trust
+  #                                 # every peer, list 0.0.0.0/0 AND ::/0, not just one of the two
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:

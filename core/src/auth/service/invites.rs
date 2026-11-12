@@ -118,6 +118,128 @@ impl<S: AuthStore> AuthService<S> {
         token_secret: &str,
         requested_name: &str,
     ) -> Result<RedeemOutcome, Error> {
+        let invite = self
+            .resolve_live_invite(token_secret, requested_name)
+            .await?;
+        match invite.mode {
+            InviteMode::Open => {
+                self.mint_open_invite_redemption(&invite, requested_name)
+                    .await
+            }
+            InviteMode::Closed => {
+                self.mint_closed_invite_redemption(&invite, requested_name)
+                    .await
+            }
+        }
+    }
+
+    /// Like `redeem_invite`, but for the OAuth consent page's invite branch
+    /// (`server::auth::oauth::handle_invite_authorize`) only: an
+    /// `open`-mode redemption's mint and its first authorization code
+    /// commit as one transaction (`AuthStore::
+    /// redeem_open_invite_and_issue_code`), closing the race a separate
+    /// `redeem_invite` call followed by a separate `issue_auth_code` call
+    /// leaves open — see that store method's doc comment. A `closed`-mode
+    /// redemption behaves exactly like `redeem_invite`: no code is issued
+    /// until an admin later approves the request.
+    ///
+    /// `client_id`/`redirect_uri`/`code_challenge` are the same
+    /// `/authorize` parameters `AuthService::issue_auth_code` would
+    /// otherwise be called with for this user — the caller has already
+    /// validated them (`server::auth::oauth::validate_authorize_params`)
+    /// before reaching this invite branch at all.
+    pub async fn redeem_invite_for_authorize(
+        &self,
+        token_secret: &str,
+        requested_name: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+    ) -> Result<AuthorizeInviteOutcome, Error> {
+        let invite = self
+            .resolve_live_invite(token_secret, requested_name)
+            .await?;
+        match invite.mode {
+            InviteMode::Closed => match self
+                .mint_closed_invite_redemption(&invite, requested_name)
+                .await?
+            {
+                RedeemOutcome::Closed {
+                    request_id,
+                    request_secret,
+                } => Ok(AuthorizeInviteOutcome::Closed {
+                    request_id,
+                    request_secret,
+                }),
+                RedeemOutcome::Open { .. } => unreachable!(
+                    "mint_closed_invite_redemption on a Closed-mode invite never returns Open"
+                ),
+            },
+            InviteMode::Open => {
+                let user = UserRow {
+                    id: new_ulid(),
+                    name: requested_name.to_string(),
+                    role: Role::Member,
+                    created_at: now_rfc3339(),
+                };
+                let grants = Self::invite_grants(&invite, &user.id);
+                let credential =
+                    Self::prepare_token(&user.id, TokenKind::ApiKey, None, None, None, None);
+                let minted = mint_secret();
+                let auth_code = AuthCodeRow {
+                    id: new_ulid(),
+                    client_id: client_id.to_string(),
+                    user_id: user.id.clone(),
+                    code_hash: minted.hash,
+                    code_challenge: code_challenge.to_string(),
+                    code_challenge_method: "S256".to_string(),
+                    redirect_uri: redirect_uri.to_string(),
+                    expires_at: rfc3339_from_now(AUTH_CODE_TTL_SECS),
+                    consumed_at: None,
+                    created_at: now_rfc3339(),
+                    minted_by_family: None,
+                };
+                match self
+                    .store
+                    .redeem_open_invite_and_issue_code(
+                        &invite.id,
+                        &user,
+                        &grants,
+                        &credential.row,
+                        client::LOCALDB_CLI_CLIENT_ID,
+                        &auth_code,
+                    )
+                    .await?
+                {
+                    RedeemAndIssueCodeOutcome::Issued => Ok(AuthorizeInviteOutcome::Issued {
+                        user,
+                        grants: invite.store_grants.clone(),
+                        issued: Box::new(IssuedAuthCode {
+                            row: auth_code,
+                            secret: minted.secret,
+                        }),
+                    }),
+                    RedeemAndIssueCodeOutcome::NotEligible => Err(Error::Unauthorized {
+                        message: "invite has no remaining uses".to_string(),
+                    }),
+                    RedeemAndIssueCodeOutcome::UnknownClient => {
+                        Ok(AuthorizeInviteOutcome::UnknownClient)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shared preamble of `redeem_invite`/`redeem_invite_for_authorize`:
+    /// resolve the presented secret to a still-live `InviteRow` (known,
+    /// not revoked, not expired). `uses < max_uses` is not checked here —
+    /// it is part of the same atomic reservation each caller's own mint
+    /// performs.
+    async fn resolve_live_invite(
+        &self,
+        token_secret: &str,
+        requested_name: &str,
+    ) -> Result<InviteRow, Error> {
         if requested_name.trim().is_empty() {
             return Err(Error::InvalidRequest {
                 message: "requested name must not be empty".to_string(),
@@ -144,17 +266,7 @@ impl<S: AuthStore> AuthService<S> {
                 });
             }
         }
-
-        match invite.mode {
-            InviteMode::Open => {
-                self.mint_open_invite_redemption(&invite, requested_name)
-                    .await
-            }
-            InviteMode::Closed => {
-                self.mint_closed_invite_redemption(&invite, requested_name)
-                    .await
-            }
-        }
+        Ok(invite)
     }
 
     /// `open`-mode mint half of `redeem_invite`: reserve a use, create the

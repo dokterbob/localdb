@@ -1,8 +1,12 @@
 //! Auth mutations whose invariants span multiple rows. Policy stays in core.
-use localdb_core::auth::{AccessRequestRow, AuthTokenRow, RotateOutcome, StoreGrantRow, UserRow};
+use localdb_core::auth::{
+    AccessRequestRow, AuthCodeRow, AuthTokenRow, RedeemAndIssueCodeOutcome, RotateOutcome,
+    StoreGrantRow, UserRow,
+};
 use localdb_core::Error;
 
 use super::{
+    auth_codes::create_auth_code_on,
     grants::grant_store_on,
     invites::{create_access_request_on, mark_access_request_collected_on, reserve_invite_use_on},
     sql::row_to_user,
@@ -270,6 +274,84 @@ pub(super) async fn redeem_open_invite(
     }
     .await;
     finish(tx, result).await
+}
+
+/// Commit an `open`-mode invite redemption's mint together with the first
+/// authorization code issued to the user it creates — used only by the
+/// OAuth consent page's invite branch. Confirms `auth_code.client_id` still
+/// names a row in `oauth_clients` (unless it is `builtin_client_id`, which
+/// never does) inside the same transaction as the mint, so a registration
+/// that evicts that client between validation and this commit can never
+/// leave a burned invite use, a created user, and an authorization code
+/// that references a client that no longer exists — see
+/// `AuthStore::redeem_open_invite_and_issue_code`'s doc comment.
+pub(super) async fn redeem_open_invite_and_issue_code(
+    db: &LibsqlDb,
+    invite_id: &str,
+    user: &UserRow,
+    grants: &[StoreGrantRow],
+    credential: &AuthTokenRow,
+    builtin_client_id: &str,
+    auth_code: &AuthCodeRow,
+) -> Result<RedeemAndIssueCodeOutcome, Error> {
+    let tx = db.write_tx().await?;
+    let result = async {
+        let now = localdb_core::auth::rfc3339_from_now(0);
+        if !reserve_invite_use_on(&tx, invite_id, &now).await? {
+            return Ok(RedeemAndIssueCodeOutcome::NotEligible);
+        }
+        if auth_code.client_id != builtin_client_id {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM oauth_clients WHERE id = ?",
+                    libsql::params![auth_code.client_id.clone()],
+                )
+                .await
+                .map_err(map_libsql_err)?;
+            if rows.next().await.map_err(map_libsql_err)?.is_none() {
+                return Ok(RedeemAndIssueCodeOutcome::UnknownClient);
+            }
+        }
+        create_user_on(&tx, user).await?;
+        for grant in grants {
+            grant_store_on(&tx, grant).await?;
+        }
+        if !insert_token_on(&tx, credential).await? {
+            return Err(Error::Unauthorized {
+                message: "session revoked".to_string(),
+            });
+        }
+        create_auth_code_on(&tx, auth_code).await?;
+        Ok(RedeemAndIssueCodeOutcome::Issued)
+    }
+    .await;
+    // Not a plain `finish(tx, result)`: unlike every other `Ok` this
+    // function can return, `UnknownClient` is reached *after*
+    // `reserve_invite_use_on`'s UPDATE already incremented `uses` — the
+    // reservation succeeded, so there is something to undo. `finish`
+    // commits on every `Ok` regardless of which one, which would commit
+    // that increment and burn the invite's use for a redemption that is
+    // refused. `NotEligible`, by contrast, is reached only when that same
+    // UPDATE affected zero rows (its own WHERE clause rejected it), so
+    // there is nothing in this transaction to undo — but it rolls back
+    // anyway, alongside `UnknownClient`, rather than relying on that fact:
+    // only `Issued` commits, so no future addition to the `Ok` branch above
+    // can turn into a partial write here by falling through to a commit it
+    // was never checked against.
+    match result {
+        Ok(RedeemAndIssueCodeOutcome::Issued) => {
+            tx.commit().await?;
+            Ok(RedeemAndIssueCodeOutcome::Issued)
+        }
+        Ok(outcome) => {
+            tx.rollback().await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 /// The `closed`-mode counterpart to `redeem_open_invite`: reserve a use and

@@ -154,6 +154,13 @@ fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
         }
         inner.tokens.retain(|t| t.user_id != id);
         inner.grants.retain(|g| g.user_id != id);
+        // Mirrors the real schema's `auth_codes.user_id ... ON DELETE
+        // CASCADE`: a code issued to the deleted user is removed outright,
+        // not left behind as a dangling "used" marker for whatever client
+        // it named — `prune_and_create_oauth_client`'s eviction depends on
+        // `auth_codes` to decide which clients are unused, so leaving these
+        // rows behind would make a client prunable in libsql but not here.
+        inner.auth_codes.retain(|c| c.user_id != id);
         for r in inner.access_requests.iter_mut() {
             if r.resulting_user_id.as_deref() == Some(id) {
                 r.resulting_user_id = None;
@@ -560,6 +567,62 @@ impl AuthStore for FakeAuthStore {
         Ok(inner.oauth_clients.iter().find(|c| c.id == id).cloned())
     }
 
+    async fn prune_and_create_oauth_client(
+        &self,
+        client: &OAuthClientRow,
+        builtin_client_id: &str,
+        unused_before: &str,
+        max_dynamic_clients: u64,
+    ) -> Result<RegisterClientOutcome, Error> {
+        let mut inner = self.inner.write().await;
+        // Held across the prune, the eviction, and the cap check/insert
+        // below, the same atomicity a real transaction gives the libsql
+        // store.
+        let used_client_ids: std::collections::HashSet<String> = inner
+            .auth_codes
+            .iter()
+            .map(|c| c.client_id.clone())
+            .collect();
+        inner.oauth_clients.retain(|c| {
+            c.id == builtin_client_id
+                || used_client_ids.contains(&c.id)
+                || c.created_at.as_str() >= unused_before
+        });
+        let dynamic_count = inner
+            .oauth_clients
+            .iter()
+            .filter(|c| c.id != builtin_client_id)
+            .count() as u64;
+        if dynamic_count >= max_dynamic_clients {
+            // Exactly how many of the oldest unused dynamic clients (ties
+            // broken by id, matching the libsql store's `ORDER BY
+            // created_at ASC, id ASC`) must go for the table to land at
+            // the cap once the insert below adds one back. If fewer
+            // unused clients exist than that, every remaining slot is held
+            // by a client with a completed authorization (or the built-in
+            // client, excluded above) — refuse instead, evicting nothing.
+            let needed = dynamic_count - (max_dynamic_clients - 1);
+            let mut unused: Vec<(&str, &str)> = inner
+                .oauth_clients
+                .iter()
+                .filter(|c| c.id != builtin_client_id && !used_client_ids.contains(&c.id))
+                .map(|c| (c.created_at.as_str(), c.id.as_str()))
+                .collect();
+            if (unused.len() as u64) < needed {
+                return Ok(RegisterClientOutcome::CapReached);
+            }
+            unused.sort_unstable();
+            let victims: std::collections::HashSet<String> = unused
+                .into_iter()
+                .take(needed as usize)
+                .map(|(_, id)| id.to_string())
+                .collect();
+            inner.oauth_clients.retain(|c| !victims.contains(&c.id));
+        }
+        inner.oauth_clients.push(client.clone());
+        Ok(RegisterClientOutcome::Created)
+    }
+
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
         inner
@@ -687,6 +750,59 @@ impl AuthStore for FakeAuthStore {
         inner.grants.extend_from_slice(grants);
         inner.tokens.push(credential.clone());
         Ok(true)
+    }
+
+    async fn redeem_open_invite_and_issue_code(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+        builtin_client_id: &str,
+        auth_code: &AuthCodeRow,
+    ) -> Result<RedeemAndIssueCodeOutcome, Error> {
+        let mut inner = self.inner.write().await;
+        let Some(index) = invite_use_index_if_eligible(&inner.invites, invite_id) else {
+            return Ok(RedeemAndIssueCodeOutcome::NotEligible);
+        };
+        // The built-in client is never a row in `oauth_clients` to begin
+        // with — mirrors `prune_and_create_oauth_client`'s own exemption.
+        if auth_code.client_id != builtin_client_id
+            && !inner
+                .oauth_clients
+                .iter()
+                .any(|c| c.id == auth_code.client_id)
+        {
+            return Ok(RedeemAndIssueCodeOutcome::UnknownClient);
+        }
+        if name_taken(&inner.users, &user.name) {
+            return Err(Error::InvalidRequest {
+                message: format!("user '{}' already exists", user.name),
+            });
+        }
+        if inner.poison_next_insert_token {
+            inner.poison_next_insert_token = false;
+            return Err(Error::Internal {
+                message: "simulated token insert failure".into(),
+                correlation_id: "fake_redeem_open_invite_and_issue_code".into(),
+            });
+        }
+        if let Some(parent) = &credential.minted_by_family {
+            if inner.compromised_families.contains(parent) {
+                return Err(Error::Unauthorized {
+                    message: "session revoked".to_string(),
+                });
+            }
+        }
+        // Every check above ran before touching any state, so a
+        // `NotEligible`/`UnknownClient`/`Err` return here never leaves a
+        // partial mutation behind.
+        inner.invites[index].uses += 1;
+        inner.users.push(user.clone());
+        inner.grants.extend_from_slice(grants);
+        inner.tokens.push(credential.clone());
+        inner.auth_codes.push(auth_code.clone());
+        Ok(RedeemAndIssueCodeOutcome::Issued)
     }
 
     async fn redeem_closed_invite(

@@ -7,6 +7,16 @@ fn service() -> AuthService<FakeAuthStore> {
     AuthService::new(Arc::new(FakeAuthStore::new()))
 }
 
+/// A permissive `RegistrationPolicy` for tests that aren't themselves
+/// exercising the cap/TTL behavior — high enough cap, long enough TTL that
+/// ordinary registration tests never trip it.
+fn test_registration_policy() -> crate::auth::client::RegistrationPolicy {
+    crate::auth::client::RegistrationPolicy::Limited {
+        max_dynamic_clients: 1000,
+        unused_client_ttl_secs: 86400,
+    }
+}
+
 async fn make_open_invite(svc: &AuthService<FakeAuthStore>, max_uses: u32) -> IssuedInvite {
     svc.create_invite(
         InviteMode::Open,

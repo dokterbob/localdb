@@ -1,4 +1,5 @@
 use super::*;
+use axum::response::IntoResponse;
 use localdb_core::auth::{AccessRequestState, AuthStore as _, Role};
 use localdb_core::config::schema::{
     DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, RawConfig,
@@ -711,6 +712,160 @@ async fn poll_until_decided_sends_the_secret_in_the_json_body_not_the_url() {
 
     server.abort();
 }
+
+/// A `429` from the daemon's per-IP rate limiter (specs/05-surfaces.md
+/// §3.1) must not end the poll loop as a failure — `poll_until_decided`
+/// sleeps the given `Retry-After` and keeps polling, so a login that
+/// happens to collide with another concurrent login sharing the same IP
+/// still completes.
+#[tokio::test]
+async fn poll_until_decided_survives_a_429_and_keeps_polling() {
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1/invites/requests/{id}/poll",
+        axum::routing::post(move |_body: axum::body::Bytes| {
+            let call_count = call_count_clone.clone();
+            async move {
+                let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "0")],
+                        axum::Json(serde_json::json!({
+                            "code": "rate_limited",
+                            "message": "too many requests"
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(serde_json::json!({ "state": "approved", "api_key": "ldb_minted" }))
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        poll_until_decided(
+            &reqwest::Client::new(),
+            &base,
+            "req-id",
+            "ldb_topsecret",
+            std::time::Duration::from_millis(1),
+        ),
+    )
+    .await
+    .expect("poll must terminate");
+
+    assert_eq!(
+        result.unwrap(),
+        "ldb_minted",
+        "the loop must survive the 429 and collect the key on the next poll"
+    );
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly one 429 then one success"
+    );
+
+    server.abort();
+}
+
+/// A proxy can send a `429`'s status line and headers promptly while the
+/// body itself stalls indefinitely (e.g. a broken upstream it is still
+/// waiting on). `poll_until_decided` must not read that body — the decision
+/// to wait and retry comes from the status and `Retry-After` alone — so the
+/// loop moves on to the next request instead of hanging on it. This runs on
+/// real time against a real socket (no `start_paused`, no elapsed-time
+/// equality assertion): the outer `timeout` is a generous hang guard, not a
+/// timing assertion, and only fires if the regression this test pins comes
+/// back.
+#[tokio::test]
+async fn poll_until_decided_does_not_wait_on_a_stalled_429_body() {
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1/invites/requests/{id}/poll",
+        axum::routing::post(move |_body: axum::body::Bytes| {
+            let call_count = call_count_clone.clone();
+            async move {
+                let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // Headers (status + Retry-After) go out immediately;
+                    // the body is a stream that never yields and never
+                    // ends, standing in for a proxy whose body never
+                    // arrives.
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                        .header("retry-after", "0")
+                        .body(axum::body::Body::from_stream(futures::stream::pending::<
+                            Result<axum::body::Bytes, std::io::Error>,
+                        >()))
+                        .unwrap()
+                } else {
+                    axum::Json(serde_json::json!({ "state": "approved", "api_key": "ldb_minted" }))
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        poll_until_decided(
+            &reqwest::Client::new(),
+            &base,
+            "req-id",
+            "ldb_topsecret",
+            std::time::Duration::from_millis(1),
+        ),
+    )
+    .await
+    .expect(
+        "the poll must move on to the next request promptly, not hang reading the stalled \
+         429 body",
+    );
+
+    assert_eq!(
+        result.unwrap(),
+        "ldb_minted",
+        "the loop must survive the stalled 429 and collect the key on the next poll"
+    );
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly one stalled 429 then one success"
+    );
+
+    server.abort();
+}
+
+// -----------------------------------------------------------------
+// Bounding `poll_until_decided`'s handling of a `429`'s `Retry-After` (a
+// hostile or merely broken value must not stall login indefinitely, nor
+// hot-loop, and repeated `429`s must eventually give up) is covered by the
+// pure, table-driven `next_poll_step`/`retry_after_duration` tests in
+// `rate_limit_tests.rs` — no socket or clock involved there. The end-to-end
+// test just above (`poll_until_decided_survives_a_429_and_keeps_polling`)
+// is the one test of the real HTTP path, on real time with a tiny poll
+// interval and a hang-guard timeout; it asserts on the outcome, not on
+// elapsed time, so it carries no dependence on wall-clock timing or
+// machine load.
+// -----------------------------------------------------------------
 
 // -----------------------------------------------------------------
 // `GET /v1/auth/me` identity fetch (login success reports identity)

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::auth::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, DemoteOutcome,
-    InviteRow, OAuthClientRow, Role, RotateOutcome, StoreGrantRow, UserRow,
+    InviteRow, OAuthClientRow, RedeemAndIssueCodeOutcome, RegisterClientOutcome, Role,
+    RotateOutcome, StoreGrantRow, UserRow,
 };
 use localdb_core::Error;
 
@@ -165,6 +166,23 @@ impl AuthStore for LibsqlAuthStore {
         clients::find_oauth_client(&self.conn, id).await
     }
 
+    async fn prune_and_create_oauth_client(
+        &self,
+        client: &OAuthClientRow,
+        builtin_client_id: &str,
+        unused_before: &str,
+        max_dynamic_clients: u64,
+    ) -> Result<RegisterClientOutcome, Error> {
+        clients::prune_and_create_oauth_client(
+            &self.conn,
+            client,
+            builtin_client_id,
+            unused_before,
+            max_dynamic_clients,
+        )
+        .await
+    }
+
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {
         grants::grant_store(&self.conn, grant).await
     }
@@ -210,6 +228,27 @@ impl AuthStore for LibsqlAuthStore {
         credential: &AuthTokenRow,
     ) -> Result<bool, Error> {
         atomic::redeem_open_invite(&self.conn, invite_id, user, grants, credential).await
+    }
+
+    async fn redeem_open_invite_and_issue_code(
+        &self,
+        invite_id: &str,
+        user: &UserRow,
+        grants: &[StoreGrantRow],
+        credential: &AuthTokenRow,
+        builtin_client_id: &str,
+        auth_code: &AuthCodeRow,
+    ) -> Result<RedeemAndIssueCodeOutcome, Error> {
+        atomic::redeem_open_invite_and_issue_code(
+            &self.conn,
+            invite_id,
+            user,
+            grants,
+            credential,
+            builtin_client_id,
+            auth_code,
+        )
+        .await
     }
 
     async fn redeem_closed_invite(

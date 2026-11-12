@@ -1,6 +1,15 @@
 use super::*;
-use localdb_core::auth::{AuthService, FakeAuthStore};
+use localdb_core::auth::{AuthService, FakeAuthStore, RegistrationPolicy};
 use std::sync::Arc;
+
+/// A permissive policy for tests that aren't exercising the registration
+/// cap/TTL behavior themselves.
+fn test_registration_policy() -> RegistrationPolicy {
+    RegistrationPolicy::Limited {
+        max_dynamic_clients: 1000,
+        unused_client_ttl_secs: 86400,
+    }
+}
 
 /// A fresh in-memory `AuthService` — recognizes the built-in
 /// `localdb-cli` client purely (no DB row needed) plus whatever
@@ -350,6 +359,7 @@ async fn validate_authorize_params_accepts_registered_client_exact_redirect() {
             None,
             None,
             None,
+            &test_registration_policy(),
         )
         .await
         .unwrap();
@@ -377,6 +387,7 @@ async fn validate_authorize_params_rejects_registered_client_mismatched_redirect
             None,
             None,
             None,
+            &test_registration_policy(),
         )
         .await
         .unwrap();

@@ -22,6 +22,13 @@ server:
   #   the .well-known responses (05-surfaces.md §3.1). Must be an absolute HTTP(S) URL
   #   without credentials, query, or fragment; optional path prefixes are allowed.
   job_workers: 1 # daemon job-queue workers; see §5
+  abuse_limits: # limits on the public, unauthenticated auth routes (05-surfaces.md §3.1)
+    enable: true # a direct loopback peer not itself a trusted proxy is exempt from the rate limit
+    max_dynamic_clients: 1000 # POST /register cap; the built-in localdb-cli client is exempt
+    unused_client_ttl_secs: 86400 # how long an unused registration may sit before pruning/eviction
+    requests_per_second: 5 # per-client-address token bucket across the limited public auth routes
+    burst: 20
+    trusted_proxies: [] # peers whose X-Forwarded-For is honored; e.g. [127.0.0.1, ::1]; see §1
 
 paths: # all optional; platform defaults in §4
   data: ~ # index data, socket
@@ -175,6 +182,25 @@ path; `paths.*` in config override the rest.
   always serialized via the per-store in-flight guard, regardless of worker count — see
   [05-surfaces.md](05-surfaces.md) §3. Embedded (non-daemon) CLI indexing is unaffected: it always
   runs its own single-worker queue and never reads this key.
+- **`server.abuse_limits`:** `max_dynamic_clients` (`u64`), `unused_client_ttl_secs` (`i64`),
+  `requests_per_second` (`u32`), and `burst` (`u32`) must each be `>= 1`; `0` is rejected with a
+  path-precise message for each key, the same convention as `http.rate_limit`.
+  `unused_client_ttl_secs` additionally has an upper bound of `315360000` (10 years) — a value past
+  it is rejected the same way, since it feeds `chrono` duration arithmetic
+  (`AuthService::register_client`'s negated-delta call to `rfc3339_from_now`) that would otherwise
+  overflow; that helper also saturates rather than panicking as a second line of defense. `enable`
+  (`bool`, default `true`) is the master switch for this whole section — see
+  [05-surfaces.md](05-surfaces.md) §3.1 for what each limit bounds and the loopback exemption.
+  `trusted_proxies` (`Vec<String>`, default empty) is validated entry-by-entry: each must parse as a
+  single IPv4/IPv6 address or that address with a `/<prefix-len>` CIDR suffix (prefix length in
+  range for the address's family — 0-32 for IPv4, 0-128 for IPv6); a malformed entry is rejected
+  with a path-precise message naming its index (`server.abuse_limits.trusted_proxies[0]: ...`). An
+  IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`, bare or as a CIDR range) is rejected the same way,
+  naming the plain IPv4 form to use instead — the resolved peer address is normalized to IPv4 before
+  matching (`server::auth::trusted_proxy::unmap_ipv4`), so a mapped entry could never match it. An
+  IPv4 range never matches an IPv6 peer and vice versa — `::/0` does not cover an IPv4 peer, and
+  `0.0.0.0/0` does not cover an IPv6 one — so an operator who means "trust every peer" must list
+  both `0.0.0.0/0` and `::/0`, not just one of the two.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the
