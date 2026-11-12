@@ -117,7 +117,7 @@ JavaScript; no CLI operation is needed by the invited user. OAuth and invite res
 | Routes                                                                                                                                                                                                                                                   | Auth                                                                                                                                                                     |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `GET\|POST /join`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `POST /v1/invites/requests/{id}/poll` | **Public** — no bearer token, even when auth is enforced. These routes _are_ the auth flow (OAuth discovery, DCR, and the code+PKCE/invite-redemption flows themselves). |
-| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp`                                                                                                       | Bearer token required once enforced. Results are scoped by the principal's store access (admins: everything; members: granted `shared` stores only).                     |
+| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `GET /v1/stores/{name}/documents`, `GET /v1/status`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp`                                                  | Bearer token required once enforced. Results are scoped by the principal's store access (admins: everything; members: granted `shared` stores only).                     |
 | `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `POST/GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/config`                                                                                                  | Bearer token **and** `role = admin`.                                                                                                                                     |
 | `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}`                                                                    | Bearer token **and** `role = admin` — except `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key for themselves.                                  |
 | `GET/POST /v1/invites`, `DELETE /v1/invites/{id}`, `GET /v1/invites/requests`, `POST /v1/invites/requests/{id}/approve\|deny`                                                                                                                            | Bearer token **and** `role = admin`.                                                                                                                                     |
@@ -625,6 +625,580 @@ curl -s http://127.0.0.1:7700/v1/config
 `effective_stores` lists all stores registered via `localdb store add` (or `POST /v1/stores`). The
 DB is the single source of truth — there is no YAML store declaration. Config schema details are in
 [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
+
+---
+
+### `GET /v1/auth/me`
+
+Returns the caller's resolved identity. Requires a bearer token once auth is enforced — the same
+tier as the plain retrieval routes (`GET /v1/stores`, `POST /v1/search`, …). In open mode (no auth
+enforced, see [Trust model and authentication](#trust-model-and-authentication)) this returns the
+implicit local-trust admin identity, `user_id: "local"`.
+
+```
+curl -s http://127.0.0.1:7700/v1/auth/me \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+{
+  "user_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "name": "alice",
+  "role": "member",
+  "store_access": { "granted": { "stores": ["docs"] } }
+}
+```
+
+An admin, or the implicit local-trust principal in open mode, gets `"store_access": "all"` instead
+of a `granted` object. `role` is `"admin"` or `"member"`.
+
+Returns `401 unauthorized` for a missing or invalid bearer token once auth is enforced (the
+`require_auth` middleware rejects the request before this handler runs).
+
+---
+
+### `GET /v1/users`
+
+Admin-only. Lists every user account.
+
+```
+curl -s http://127.0.0.1:7700/v1/users \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+[
+  {
+    "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "name": "alice",
+    "role": "member",
+    "created_at": "2026-06-10T12:00:00Z"
+  }
+]
+```
+
+Unlike the store/source/document list routes, this is a bare JSON array — there is no pagination
+envelope. Never carries credential material; see [`GET /v1/users/{id}/keys`](#get-v1usersidkeys) for
+API keys.
+
+Returns `403 forbidden` for a non-admin bearer, `401 unauthorized` for a missing or invalid one.
+
+---
+
+### `POST /v1/users`
+
+Admin-only. Creates a user account. There are no passwords (identity is proven solely by bearer
+secrets) — mint an API key for the new user afterwards via
+[`POST /v1/users/{id}/keys`](#post-v1usersidkeys).
+
+**Request body:**
+
+| Field  | Type   | Required | Description                             |
+| ------ | ------ | -------- | --------------------------------------- |
+| `name` | string | yes      | User name; must be non-empty and unique |
+| `role` | string | yes      | `"admin"` or `"member"`                 |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/users \
+  -H 'Authorization: Bearer ldb_...' -H 'Content-Type: application/json' \
+  -d '{"name":"alice","role":"member"}'
+```
+
+Returns `201`:
+
+```json
+{
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "name": "alice",
+  "role": "member",
+  "created_at": "2026-06-10T12:00:00Z"
+}
+```
+
+`invalid_request`, 400, for an empty `name`, a `name` that already exists, or an unrecognized `role`
+value. `403 forbidden` for a non-admin bearer.
+
+A missing or wrong-typed field in the body — e.g. no `role` at all — does **not** get the
+`invalid_request` envelope above: this route (and every other body-carrying route in this section,
+except `POST /v1/invites/redeem` and `POST /v1/invites/requests/{id}/poll`) extracts its body with
+axum's plain `Json<T>`, not the `ApiJson` wrapper `POST /v1/jobs` uses. A missing/mistyped field is
+axum's own plain-text `422 Unprocessable Entity`, invalid JSON syntax is plain-text `400`, and a
+missing or wrong `Content-Type` is plain-text `415` — none of the three carry a `code`/`message`
+body.
+
+---
+
+### `PATCH /v1/users/{id}`
+
+Admin-only. Sets the user's role.
+
+**Request body:**
+
+| Field  | Type   | Required | Description             |
+| ------ | ------ | -------- | ----------------------- |
+| `role` | string | yes      | `"admin"` or `"member"` |
+
+```
+curl -s -X PATCH http://127.0.0.1:7700/v1/users/01ARZ3NDEKTSV4RRFFQ69G5FAV \
+  -H 'Authorization: Bearer ldb_...' -H 'Content-Type: application/json' \
+  -d '{"role":"admin"}'
+```
+
+```json
+{
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "name": "alice",
+  "role": "admin",
+  "created_at": "2026-06-10T12:00:00Z"
+}
+```
+
+`invalid_request`, 400, for an unrecognized `role` value, an unknown `id`, or an attempt to demote
+the sole remaining admin to `member` — this last-admin lockout guard applies generically, so it also
+catches an admin demoting the _other_ admin down to zero, not only a self-demote. `403 forbidden`
+for a non-admin bearer. Same malformed-body caveat as [`POST /v1/users`](#post-v1users).
+
+---
+
+### `DELETE /v1/users/{id}`
+
+Admin-only. Deletes a user. Cascades to that user's API keys and store grants at the schema level —
+deleting a user also revokes every key it owns and every grant it held.
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/users/01ARZ3NDEKTSV4RRFFQ69G5FAV \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+Returns `204 No Content` (empty body) on success. `invalid_request`, 400, for an unknown `id` or an
+attempt to delete the sole remaining admin (same last-admin guard as
+[`PATCH /v1/users/{id}`](#patch-v1usersid)). `403 forbidden` for a non-admin bearer.
+
+---
+
+### `GET /v1/users/{id}/keys`
+
+Admin-only. Lists the named user's API keys — metadata only, never a secret: a key's plaintext is
+shown exactly once, in the response of [`POST /v1/users/{id}/keys`](#post-v1usersidkeys) itself, and
+is not retrievable again after that.
+
+```
+curl -s http://127.0.0.1:7700/v1/users/01ARZ3NDEKTSV4RRFFQ69G5FAV/keys \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+[
+  {
+    "id": "01ARZ3NDEKTSV4RRFFQ69G5KEY",
+    "created_at": "2026-06-10T12:00:00Z",
+    "last_used_at": null,
+    "expires_at": null,
+    "revoked_at": null
+  }
+]
+```
+
+Only `kind = api_key` tokens are listed here — OAuth access/refresh session tokens are an
+implementation detail of the login flow, not something a caller manages through this route.
+`invalid_request`, 400, for an unknown `id` — not `404`; this route, like every other route in this
+section that looks up a user or key by id, reports a bad id as `invalid_request` rather than the
+`*_not_found` shape stores/sources/jobs use. `403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/users/{id}/keys`
+
+Mints a new API key for the named user. Admin-only for another user, with one carve-out: a caller
+may always mint a key **for themselves** (`id` equal to the caller's own `user_id`) — the one
+self-service exception among the admin-only management routes in this section.
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/users/01ARZ3NDEKTSV4RRFFQ69G5FAV/keys \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+Returns `201`:
+
+```json
+{
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5KEY",
+  "secret": "ldb_7XqN2vLp9KbMjT3hYsFcW1oGdZaRie4ntJ8uBxDkQyA"
+}
+```
+
+`secret` is the plaintext bearer secret (`ldb_`-prefixed) — **shown exactly once, in this
+response**. It is never persisted in retrievable form (only its blake3 hash is stored) and cannot be
+recovered later; losing it means revoking the key ([`DELETE /v1/keys/{id}`](#delete-v1keysid)) and
+minting a new one. This route takes no request body — only the `{id}` path segment.
+`invalid_request`, 400, for an unknown `id` (same 400-not-404 shape as above). `403 forbidden` if
+the caller is neither an admin nor minting a key for themselves.
+
+If the caller is authenticated by an OAuth login session (rather than an existing API key), the
+minted key inherits that session's family: reuse-detected revocation of the session also revokes any
+key minted under it, including one an admin mints for another user from that session.
+
+---
+
+### `DELETE /v1/keys/{id}`
+
+Admin-only. Revokes any token by its own `id` (not its secret) — lets an admin revoke a lost or
+compromised API key without needing the plaintext secret itself.
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/keys/01ARZ3NDEKTSV4RRFFQ69G5KEY \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+Returns `204 No Content` (empty body) on success. `invalid_request`, 400, for an unknown `id` (same
+400-not-404 shape as above). `403 forbidden` for a non-admin bearer.
+
+---
+
+### `GET /v1/stores/{name}/grants`
+
+Admin-only. Lists every D7 store grant on the named store, with each grantee's user name resolved
+alongside its id.
+
+```
+curl -s http://127.0.0.1:7700/v1/stores/docs/grants \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+[
+  {
+    "store_name": "docs",
+    "user_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "user_name": "alice",
+    "granted_by": "01ARZ3NDEKTSV4RRFFQ69G5ADM",
+    "created_at": "2026-06-10T12:00:00Z"
+  }
+]
+```
+
+`granted_by` is the `user_id` of the admin who created the grant. `store_not_found`, 404, if the
+named store does not exist. `403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/stores/{name}/grants`
+
+Admin-only. Grants a member read access to a `shared` store (D7).
+
+**Request body:**
+
+| Field  | Type   | Required | Description                         |
+| ------ | ------ | -------- | ----------------------------------- |
+| `user` | string | yes      | The grantee, by user name **or** id |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/stores/docs/grants \
+  -H 'Authorization: Bearer ldb_...' -H 'Content-Type: application/json' \
+  -d '{"user":"alice"}'
+```
+
+Returns `201`:
+
+```json
+{
+  "store_name": "docs",
+  "user_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "user_name": "alice",
+  "granted_by": "01ARZ3NDEKTSV4RRFFQ69G5ADM",
+  "created_at": "2026-06-10T12:00:00Z"
+}
+```
+
+Granting the same user the same store again updates the existing row (`granted_by`/`created_at`
+refreshed) rather than erroring or duplicating it. `store_not_found`, 404, for an unknown store
+name. `forbidden`, 403, if the named store is `private` — only `shared` stores are grantable (this
+is a different 403 than the one a non-admin bearer gets). `invalid_request`, 400, if `user` names
+neither an existing user name nor id. Same malformed-body caveat as
+[`POST /v1/users`](#post-v1users).
+
+---
+
+### `DELETE /v1/stores/{name}/grants/{user}`
+
+Admin-only. Revokes `user`'s (name or id) grant on `store_name`.
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/stores/docs/grants/alice \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+Returns `204 No Content` (empty body) on success. `invalid_request`, 400, if `user` names neither an
+existing user name nor id, **or** if that user holds no grant on `store_name` — unlike
+[`GET`](#get-v1storesnamegrants) and [`POST .../grants`](#post-v1storesnamegrants) above, this route
+does not check that the named store exists first: an unknown store name and "no such grant" both
+collapse to the same `invalid_request`/400, never `store_not_found`/404. `403 forbidden` for a
+non-admin bearer.
+
+---
+
+### `GET /v1/invites`
+
+Admin-only. Lists every invite — no secrets (the plaintext token is shown exactly once, at creation,
+in [`POST /v1/invites`](#post-v1invites)'s response).
+
+```
+curl -s http://127.0.0.1:7700/v1/invites \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+[
+  {
+    "id": "01ARZ3NDEKTSV4RRFFQ69G5NVT",
+    "mode": "open",
+    "store_grants": ["docs"],
+    "max_uses": 1,
+    "uses": 0,
+    "expires_at": null,
+    "revoked_at": null,
+    "created_by": "01ARZ3NDEKTSV4RRFFQ69G5ADM",
+    "created_at": "2026-06-10T12:00:00Z"
+  }
+]
+```
+
+`403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/invites`
+
+Admin-only. Creates an invite (D9). See
+[Trust model and authentication](#trust-model-and-authentication) for how an invite's `consent_url`
+is used from a browser.
+
+**Request body:**
+
+| Field        | Type     | Required | Description                                                                                                                      |
+| ------------ | -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`       | string   | yes      | `"open"` (redemption creates the user immediately) or `"closed"` (redemption files a pending request that an admin must approve) |
+| `stores`     | string[] | no       | Store names granted to the resulting user on redemption; default `[]`. Any named store that is `private` is rejected             |
+| `max_uses`   | int      | no       | Default `1`; `0` is rejected                                                                                                     |
+| `expires_at` | string   | no       | RFC 3339 expiry; default `null` (never expires)                                                                                  |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/invites \
+  -H 'Authorization: Bearer ldb_...' -H 'Content-Type: application/json' \
+  -d '{"mode":"open","stores":["docs"],"max_uses":1}'
+```
+
+Returns `201`:
+
+```json
+{
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5NVT",
+  "mode": "open",
+  "store_grants": ["docs"],
+  "max_uses": 1,
+  "expires_at": null,
+  "created_at": "2026-06-10T12:00:00Z",
+  "token": "ldb_9WzK4mYtB2cRpL7vJhN8qFgE3xSoVnTdAk6uXiM1fPw",
+  "consent_url": "http://127.0.0.1:7700/join?invite=ldb_9WzK4mYtB2cRpL7vJhN8qFgE3xSoVnTdAk6uXiM1fPw"
+}
+```
+
+`token` is the plaintext invite secret — **shown exactly once, in this response** (blake3-hashed at
+rest; not recoverable afterward). `consent_url` is a ready-made link to the standalone
+`GET /join?invite=<token>` join page for a browser invitee with no CLI and no OAuth client, built
+from `server.public_url` if configured, else the request's own `Host` header.
+
+`invalid_request`, 400, for an unrecognized `mode` or `max_uses: 0`. `store_not_found`, 404, for an
+unknown store name in `stores`. `forbidden`, 403, if any named store in `stores` is `private` — only
+`shared` stores can be granted via invite (a different 403 than the one a non-admin bearer gets).
+`invalid_request`, 400, if `server.public_url` is not configured and the request's `Host` header is
+missing or malformed — there is then no base URL to build `consent_url` from, so the invite is never
+created. Same malformed-body caveat as [`POST /v1/users`](#post-v1users).
+
+---
+
+### `DELETE /v1/invites/{id}`
+
+Admin-only. Revokes an invite — a revoked invite can no longer be redeemed, but this does not affect
+users already created by earlier redemptions.
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/invites/01ARZ3NDEKTSV4RRFFQ69G5NVT \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+Returns `204 No Content` (empty body) on success. `invalid_request`, 400, for an unknown `id` or one
+already revoked. `403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/invites/redeem`
+
+**Public — no bearer token, even when auth is enforced.** This route, together with
+[`POST /v1/invites/requests/{id}/poll`](#post-v1invitesrequestsidpoll) below, _is_ the
+invite-redemption flow — see [Trust model and authentication](#trust-model-and-authentication).
+
+**Request body:**
+
+| Field            | Type   | Required | Description                   |
+| ---------------- | ------ | -------- | ----------------------------- |
+| `token`          | string | yes      | The invite's plaintext secret |
+| `requested_name` | string | yes      | The requested new user's name |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/invites/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"ldb_9WzK4mYtB2cRpL7vJhN8qFgE3xSoVnTdAk6uXiM1fPw","requested_name":"alice"}'
+```
+
+`open`-mode invite → `201`, the user, its granted stores, and a show-once API key, all created
+immediately:
+
+```json
+{
+  "user": { "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "name": "alice", "role": "member" },
+  "granted_stores": ["docs"],
+  "api_key": "ldb_7XqN2vLp9KbMjT3hYsFcW1oGdZaRie4ntJ8uBxDkQyA"
+}
+```
+
+`closed`-mode invite → `202`, a pending access request is filed instead:
+
+```json
+{
+  "request_id": "01ARZ3NDEKTSV4RRFFQ69G5REQ",
+  "request_secret": "ldb_2LqD5mTbC8vRpN3yJhW1qSgA4xZoKnTeAl6uViM9fOj",
+  "poll": "/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/poll"
+}
+```
+
+`api_key` and `request_secret` are both **shown exactly once**, in this response, and are never
+retrievable again afterward — a lost `request_secret` means the request can never be polled (there
+is no way to recover or re-request it short of redeeming the invite again, which consumes another
+use if `max_uses` allows it). An empty `token` or `requested_name` is `invalid_request`, 400. A
+`requested_name` that collides with an existing user name is the same `invalid_request`/400
+duplicate-name shape [`POST /v1/users`](#post-v1users) gets. An unknown, revoked, expired, **or
+exhausted** (`max_uses` already reached) invite is `unauthorized`, 401 — deliberately
+indistinguishable from each other, so a caller cannot use the response to probe which condition
+failed.
+
+---
+
+### `GET /v1/invites/requests`
+
+Admin-only. Lists every access request across every invite — pending, approved, and denied alike; no
+pagination (this is a small admin-facing surface).
+
+```
+curl -s http://127.0.0.1:7700/v1/invites/requests \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+[
+  {
+    "id": "01ARZ3NDEKTSV4RRFFQ69G5REQ",
+    "invite_id": "01ARZ3NDEKTSV4RRFFQ69G5NVT",
+    "requested_name": "bob",
+    "state": "pending",
+    "resulting_user_id": null,
+    "created_at": "2026-06-10T12:00:00Z",
+    "decided_at": null
+  }
+]
+```
+
+`state` is `"pending"`, `"approved"`, or `"denied"`. The requester's own secret is never included
+here — it was shown once, in [`POST /v1/invites/redeem`](#post-v1invitesredeem)'s `closed`-mode
+response. `403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/invites/requests/{id}/approve`
+
+Admin-only. Approves a pending access request: creates the user and applies the invite's store
+grants. No credential is minted here — a fresh API key is minted only when the requester's own next
+[poll](#post-v1invitesrequestsidpoll) collects it.
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/approve \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+```json
+{ "id": "01ARZ3NDEKTSV4RRFFQ69G5B0B", "name": "bob", "role": "member" }
+```
+
+User creation, the invite's store grants, and the approval decision all commit atomically — a
+failure anywhere leaves the request pending rather than partially applied. `invalid_request`, 400,
+for an unknown `id` (not `404`) or a request that is no longer `pending` (already approved or
+denied). `403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/invites/requests/{id}/deny`
+
+Admin-only. Denies a pending access request; the requester's next
+[poll](#post-v1invitesrequestsidpoll) observes `"denied"`.
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/deny \
+  -H 'Authorization: Bearer ldb_...'
+```
+
+Returns `204 No Content` (empty body) on success. `invalid_request`, 400, for an unknown `id` (not
+`404`) or a request that is no longer `pending`. `403 forbidden` for a non-admin bearer.
+
+---
+
+### `POST /v1/invites/requests/{id}/poll`
+
+**Public — no bearer token, even when auth is enforced.** Polls a `closed`-mode access request's
+status; see [`POST /v1/invites/redeem`](#post-v1invitesredeem) above.
+
+The secret travels in the JSON body, not a query parameter or the URL path — a URL is routinely
+recorded in reverse-proxy and access logs, and whoever can read those would otherwise be able to
+poll first and collect the one-time API key ahead of the real requester (the same reasoning as RFC
+8628's device-authorization grant, which sends its device code the same way).
+
+**Request body:**
+
+| Field    | Type   | Required | Description                                   |
+| -------- | ------ | -------- | --------------------------------------------- |
+| `secret` | string | yes      | The `request_secret` from the redeem response |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/invites/requests/01ARZ3NDEKTSV4RRFFQ69G5REQ/poll \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"ldb_2LqD5mTbC8vRpN3yJhW1qSgA4xZoKnTeAl6uViM9fOj"}'
+```
+
+Returns `200` in every case; the body's `state` tells the caller what to do next:
+
+```json
+{ "state": "pending" }
+```
+
+```json
+{ "state": "denied" }
+```
+
+```json
+{ "state": "approved", "api_key": "ldb_7XqN2vLp9KbMjT3hYsFcW1oGdZaRie4ntJ8uBxDkQyA" }
+```
+
+```json
+{ "state": "collected" }
+```
+
+`"approved"` with an `api_key` is returned **exactly once** — on the first poll to observe the
+request's `approved` transition, marking it collected in the same transaction that mints the key.
+Every later poll on the same request answers `"collected"` instead, with no `api_key` field; a poll
+that loses a race against another concurrent poll also gets `"collected"`, never a second key. An
+unknown `id` and a wrong `secret` presented against a real one are **deliberately
+indistinguishable**: `unauthorized`, 401, with an identical message either way — no existence
+oracle. An empty or missing `secret` in the body gets that same `unauthorized`/401 response, not
+`invalid_request`.
 
 ---
 
