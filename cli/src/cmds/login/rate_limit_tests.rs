@@ -149,6 +149,24 @@ fn the_max_consecutive_429_gives_up() {
 }
 
 #[test]
+fn poll_response_needs_body_skips_only_a_429() {
+    assert!(
+        !poll_response_needs_body(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        "a 429's body is never inspected, so it must not be read"
+    );
+    for status in [
+        reqwest::StatusCode::OK,
+        reqwest::StatusCode::NOT_FOUND,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        assert!(
+            poll_response_needs_body(status),
+            "a non-429 status ({status}) must still have its body read"
+        );
+    }
+}
+
+#[test]
 fn a_non_429_response_proceeds_regardless_of_the_prior_streak() {
     let poll_interval = std::time::Duration::from_millis(100);
     for status in [

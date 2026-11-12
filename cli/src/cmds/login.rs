@@ -408,7 +408,11 @@ async fn poll_until_decided(
                 .map_err(|_| Error::DaemonUnreachable)?;
             let status = resp.status();
             let retry_after = retry_after_duration(resp.headers());
-            let body = resp.json().await.unwrap_or(serde_json::Value::Null);
+            let body = if poll_response_needs_body(status) {
+                resp.json().await.unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            };
             Ok(PollResponse {
                 status,
                 retry_after,
@@ -537,6 +541,15 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<std::tim
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
+}
+
+/// Whether a poll response's body is worth reading at all. A `429`'s body
+/// is never inspected — `next_poll_step` decides purely from `status` and
+/// `Retry-After` — so the caller skips reading it: a proxy that returns the
+/// `429` status and headers promptly but stalls the body can otherwise hold
+/// up a retry for as long as the request timeout, every time it happens.
+fn poll_response_needs_body(status: reqwest::StatusCode) -> bool {
+    status != reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 /// What `poll_until_decided`'s loop does next for one poll response. Pure

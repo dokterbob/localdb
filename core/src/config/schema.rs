@@ -212,8 +212,10 @@ pub struct AbuseLimitsConfig {
     /// `::/0` does not cover an IPv4 peer, and `0.0.0.0/0` does not cover an
     /// IPv6 one. An operator who means "trust every peer" must list both
     /// `0.0.0.0/0` and `::/0` rather than either alone; one alone silently
-    /// leaves every peer of the other family untrusted (and, if it is a
-    /// direct loopback peer, not exempt from the rate limit either).
+    /// leaves every peer of the other family untrusted — a proxy of that
+    /// family resolves as a direct peer instead, so if it runs on loopback
+    /// it is exempt from the rate limit and its `X-Forwarded-For` is
+    /// ignored entirely, exempting everything it forwards along with it.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }

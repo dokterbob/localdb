@@ -239,8 +239,9 @@ the plain IPv4 form instead, since the mapped form could never match the normali
 anyway. **An IPv4 range never matches an IPv6 peer, and an IPv6 range never matches an IPv4 peer** —
 `::/0` does not cover an IPv4 peer, and `0.0.0.0/0` does not cover an IPv6 one. An operator who
 means "trust every peer" must list both `0.0.0.0/0` and `::/0` — listing only one silently leaves
-every peer of the other family untrusted (and, if it is a direct loopback peer, not exempt from the
-rate limit either). See
+every peer of the other family untrusted. A proxy of that family then resolves as a direct peer
+instead of a trusted one: if it runs on loopback it is exempt from the rate limit, its
+`X-Forwarded-For` is never consulted, and everything it forwards is exempt along with it. See
 [specs/05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication)
 for the full behavior.
 
