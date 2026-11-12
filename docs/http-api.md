@@ -1116,9 +1116,9 @@ A `requested_name` that collides with an existing user name is rejected at redem
 an `open`-mode invite**. A `closed`-mode invite does not check the name at all: redemption accepts
 it, consumes a use, and returns `202` as normal; the collision only surfaces later, when an admin
 tries to [approve the resulting request](#post-v1invitesrequestsidapprove), which then fails with
-`invalid_request`/400 (`user '<name>' already exists`) and leaves the request `pending`. Since the
-name never changes between attempts, retrying the approval fails the same way every time — the only
-way to clear a request stuck like this is to [deny](#post-v1invitesrequestsiddeny) it.
+`invalid_request`/400 (`user '<name>' already exists`) and leaves the request `pending`. Approval
+keeps failing for as long as the name stays taken. [Deny](#post-v1invitesrequestsiddeny) the request
+to reject it; if the conflicting user is deleted, a later approval can succeed.
 
 ---
 
@@ -1172,9 +1172,9 @@ failure anywhere leaves the request pending rather than partially applied. The m
 is a `requested_name` that now collides with an existing user name — this can only happen for a
 `closed`-mode invite, since an `open`-mode one already checked uniqueness at redemption (see
 [`POST /v1/invites/redeem`](#post-v1invitesredeem)) — which returns `invalid_request`, 400
-(`user '<name>' already exists`), and leaves the request `pending`; since the name doesn't change
-between attempts, retrying the approval fails the same way every time, so a request stuck like this
-can only be cleared by [denying](#post-v1invitesrequestsiddeny) it.
+(`user '<name>' already exists`), and leaves the request `pending`. Approval keeps failing for as
+long as the name stays taken: [deny](#post-v1invitesrequestsiddeny) the request to reject it, or
+delete the conflicting user and approve again.
 
 Approval does not re-check the invite's own state: a pending request can still be approved after its
 invite has been [revoked](#delete-v1invitesid) or has expired. If access should be refused once an
@@ -1227,7 +1227,9 @@ with the fixed message `request body must be a JSON object` (the `SecretJson` ex
 every such rejection to this, never echoing the body back) — distinct from a well-formed body with a
 missing, `null`, or empty `secret`, which is `unauthorized`, 401, as described below.
 
-Otherwise returns `200`; the body's `state` tells the caller what to do next:
+Otherwise returns `200`; the body's `state` tells the caller what to do next. One exception: if the
+user created by the approval is deleted before the key has been collected, the poll returns
+`internal`, 500, and no key is issued.
 
 ```json
 { "state": "pending" }
