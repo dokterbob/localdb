@@ -52,8 +52,8 @@ pub(crate) async fn find_oauth_client(
     }
 }
 
-/// Atomic prune-then-insert for `POST /register` (specs/05-surfaces.md
-/// §3.1). The `DELETE` and the cap-check `COUNT` run inside the same write
+/// Atomic prune/evict-then-insert for `POST /register` (specs/05-surfaces.md
+/// §3.1). The `DELETE`s and the cap-check `COUNT` run inside the same write
 /// transaction as the eventual `INSERT`, so two concurrent registrations can
 /// never both observe room under `max_dynamic_clients` and both insert.
 ///
@@ -62,6 +62,17 @@ pub(crate) async fn find_oauth_client(
 /// (`auth_codes.client_id`) has completed the earliest step of the OAuth2
 /// flow this schema records, strictly before any token is minted from that
 /// code — the earliest reliable signal available without a schema change.
+///
+/// If the TTL prune above leaves the table still at the cap, this evicts
+/// the single oldest unused dynamic client (ties broken by `id`) rather than
+/// refusing outright: an unauthenticated caller that fills every slot with
+/// fresh registrations must not be able to lock out every other
+/// registration attempt until those rows age past `unused_before` on their
+/// own. A client that registered but has not yet started authorization can
+/// be evicted this way and must register again. Only when every remaining
+/// slot is held by a client with a completed authorization (or the built-in
+/// client, which never counts) does this refuse with
+/// [`RegisterClientOutcome::CapReached`].
 pub(crate) async fn prune_and_create_oauth_client(
     db: &LibsqlDb,
     client: &OAuthClientRow,
@@ -94,9 +105,30 @@ pub(crate) async fn prune_and_create_oauth_client(
             None => 0,
         };
         if dynamic_count as u64 >= max_dynamic_clients {
-            // Still commits: whatever the DELETE above pruned stays pruned
-            // even though nothing is inserted this time.
-            return Ok(RegisterClientOutcome::CapReached);
+            // Evict the oldest unused dynamic client to free exactly the
+            // one slot this registration needs. The subquery's `id = NULL`
+            // result when no unused row exists deletes nothing, so
+            // `evicted` distinguishes that case from an actual eviction.
+            let evicted = tx
+                .execute(
+                    "DELETE FROM oauth_clients WHERE id = (\
+                       SELECT id FROM oauth_clients \
+                       WHERE id != ? \
+                         AND NOT EXISTS (\
+                           SELECT 1 FROM auth_codes WHERE auth_codes.client_id = oauth_clients.id\
+                         ) \
+                       ORDER BY created_at ASC, id ASC \
+                       LIMIT 1\
+                     )",
+                    libsql::params![builtin_client_id.to_string()],
+                )
+                .await
+                .map_err(map_libsql_err)?;
+            if evicted == 0 {
+                // Still commits: whatever the TTL prune above removed stays
+                // pruned even though nothing is inserted this time.
+                return Ok(RegisterClientOutcome::CapReached);
+            }
         }
 
         let redirect_uris_json =

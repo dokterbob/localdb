@@ -265,6 +265,60 @@ fn http_rate_limit_valid_values_accepted() {
     assert_eq!(cfg.http.rate_limit.burst, 8);
 }
 
+// --- server.abuse_limits.trusted_proxies validation ---
+
+#[test]
+fn trusted_proxies_accepts_bare_addresses_and_cidr_ranges() {
+    let yaml = "version: 1\nserver:\n  abuse_limits:\n    trusted_proxies:\n      - 127.0.0.1\n      - ::1\n      - 203.0.113.0/24\n      - 2001:db8::/32\n";
+    let cfg = load_config_from_str(yaml).expect("valid trusted_proxies entries should load");
+    assert_eq!(
+        cfg.server.abuse_limits.trusted_proxies,
+        vec!["127.0.0.1", "::1", "203.0.113.0/24", "2001:db8::/32"]
+    );
+}
+
+#[test]
+fn trusted_proxies_defaults_to_empty() {
+    let cfg = load_config_from_str("version: 1\n").expect("minimal config should load");
+    assert!(cfg.server.abuse_limits.trusted_proxies.is_empty());
+}
+
+#[test]
+fn trusted_proxies_rejects_an_unparseable_entry() {
+    let yaml =
+        "version: 1\nserver:\n  abuse_limits:\n    trusted_proxies:\n      - not-an-address\n";
+    let err = load_config_from_str(yaml).unwrap_err();
+    match err {
+        Error::InvalidConfig { message } => {
+            assert!(
+                message.contains("server.abuse_limits.trusted_proxies[0]"),
+                "error message '{}' should name the offending index",
+                message
+            );
+        }
+        other => panic!("expected InvalidConfig, got {:?}", other),
+    }
+}
+
+#[test]
+fn trusted_proxies_rejects_a_prefix_length_out_of_range() {
+    let yaml =
+        "version: 1\nserver:\n  abuse_limits:\n    trusted_proxies:\n      - 203.0.113.0/33\n";
+    let err = load_config_from_str(yaml).unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidConfig { .. }),
+        "an IPv4 CIDR prefix length over 32 should be rejected: {:?}",
+        err
+    );
+}
+
+#[test]
+fn trusted_proxies_rejects_an_empty_entry() {
+    let yaml = "version: 1\nserver:\n  abuse_limits:\n    trusted_proxies:\n      - \"\"\n";
+    let err = load_config_from_str(yaml).unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig { .. }));
+}
+
 #[test]
 fn load_valid_full_config() {
     let yaml = r#"

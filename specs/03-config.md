@@ -25,9 +25,10 @@ server:
   abuse_limits: # limits on the public, unauthenticated auth routes (05-surfaces.md §3.1)
     enable: true # loopback callers are always exempt from the rate limit regardless
     max_dynamic_clients: 1000 # POST /register cap; the built-in localdb-cli client is exempt
-    unused_client_ttl_secs: 86400 # how long an unused registration may sit before pruning
-    requests_per_second: 5 # per-client-IP token bucket across the limited public auth routes
+    unused_client_ttl_secs: 86400 # how long an unused registration may sit before pruning/eviction
+    requests_per_second: 5 # per-client-address token bucket across the limited public auth routes
     burst: 20
+    trusted_proxies: [] # peers whose X-Forwarded-For is honored; e.g. [127.0.0.1, ::1]; see §1
 
 paths: # all optional; platform defaults in §4
   data: ~ # index data, socket
@@ -185,7 +186,11 @@ path; `paths.*` in config override the rest.
   `requests_per_second` (`u32`), and `burst` (`u32`) must each be `>= 1`; `0` is rejected with a
   path-precise message for each key, the same convention as `http.rate_limit`. `enable` (`bool`,
   default `true`) is the master switch for this whole section — see [05-surfaces.md](05-surfaces.md)
-  §3.1 for what each limit bounds and the loopback exemption.
+  §3.1 for what each limit bounds and the loopback exemption. `trusted_proxies` (`Vec<String>`,
+  default empty) is validated entry-by-entry: each must parse as a single IPv4/IPv6 address or that
+  address with a `/<prefix-len>` CIDR suffix (prefix length in range for the address's family — 0-32
+  for IPv4, 0-128 for IPv6); a malformed entry is rejected with a path-precise message naming its
+  index (`server.abuse_limits.trusted_proxies[0]: ...`).
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the

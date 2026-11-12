@@ -890,22 +890,72 @@ async fn a_rotated_descendant_token_still_carries_the_ancestor_family() {
 // -----------------------------------------------------------------
 
 #[tokio::test]
-async fn register_client_errors_cap_reached_once_the_cap_is_hit() {
+async fn register_client_evicts_the_oldest_unused_client_once_the_cap_is_hit() {
     let svc = service();
     let policy = crate::auth::client::RegistrationPolicy {
         max_dynamic_clients: 1,
         unused_client_ttl_secs: 86400,
     };
-    svc.register_client(
-        vec!["https://app.example.com/cb".to_string()],
+    let first = svc
+        .register_client(
+            vec!["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .expect("first registration should succeed under the cap");
+
+    // The first client never completed an authorization, so the second
+    // registration evicts it to make room rather than being refused.
+    let second = svc
+        .register_client(
+            vec!["https://app2.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .expect("registering past the cap should evict the unused client, not refuse");
+    assert!(!svc.is_known_client(&first.id).await.unwrap());
+    assert!(svc.is_known_client(&second.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn register_client_errors_cap_reached_once_every_slot_is_used() {
+    let svc = service();
+    let user = svc.create_user("alice", Role::Member).await.unwrap();
+    let policy = crate::auth::client::RegistrationPolicy {
+        max_dynamic_clients: 1,
+        unused_client_ttl_secs: 86400,
+    };
+    let first = svc
+        .register_client(
+            vec!["https://app.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .expect("first registration should succeed under the cap");
+    // Give the first client a completed authorization — it is now "used"
+    // and must never be evicted, even though it is the only dynamic client
+    // and the cap is 1.
+    svc.issue_auth_code(
+        &first.id,
+        &user.id,
+        "https://app.example.com/cb",
+        "challenge",
         None,
-        None,
-        None,
-        None,
-        &policy,
     )
     .await
-    .expect("first registration should succeed under the cap");
+    .unwrap();
 
     let err = svc
         .register_client(
@@ -919,6 +969,44 @@ async fn register_client_errors_cap_reached_once_the_cap_is_hit() {
         .await
         .unwrap_err();
     assert!(matches!(err, RegisterClientError::CapReached));
+    assert!(svc.is_known_client(&first.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn register_client_with_the_unlimited_policy_never_prunes_or_caps() {
+    let svc = service();
+    let policy = crate::auth::client::RegistrationPolicy::unlimited();
+
+    let old_client = svc
+        .register_client(
+            vec!["https://app0.example.com/cb".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .expect("registration should succeed");
+
+    // Tiny-cap-worth of further registrations must all succeed too — the
+    // unlimited policy has no cap to hit.
+    for i in 1..5 {
+        svc.register_client(
+            vec![format!("https://app{i}.example.com/cb")],
+            None,
+            None,
+            None,
+            None,
+            &policy,
+        )
+        .await
+        .expect("the unlimited policy must never refuse a registration");
+    }
+
+    // The first client is old and was never used, but the unlimited policy
+    // prunes and evicts nothing.
+    assert!(svc.is_known_client(&old_client.id).await.unwrap());
 }
 
 #[tokio::test]

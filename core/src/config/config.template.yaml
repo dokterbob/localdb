@@ -25,6 +25,7 @@ server:
   #   unused_client_ttl_secs: 86400 # how long an unused registration may sit before it's prunable
   #   requests_per_second: 5        # per-client-IP token bucket across the public auth routes
   #   burst: 20
+  #   trusted_proxies: []           # peers whose X-Forwarded-For is honored; e.g. [127.0.0.1, ::1]
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:

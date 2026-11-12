@@ -116,7 +116,26 @@ pub(crate) async fn request_from(
     body: Option<Value>,
     peer: std::net::SocketAddr,
 ) -> axum::response::Response {
+    request_from_with_headers(app, method, uri, body, peer, &[]).await
+}
+
+/// Like `request_from`, additionally attaching each `(name, value)` header
+/// — used to send `X-Forwarded-For` for the trusted-proxy tests
+/// (`server/tests/abuse_limits.rs`). A header may be given more than once
+/// (repeated `X-Forwarded-For` lines are concatenated by
+/// `server::auth::rate_limit::forwarded_for_header_values`).
+pub(crate) async fn request_from_with_headers(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    peer: std::net::SocketAddr,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
     let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
     let request_body = match body {
         Some(value) => {
             builder = builder.header("content-type", "application/json");

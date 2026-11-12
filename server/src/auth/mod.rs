@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod oauth;
 pub mod rate_limit;
 pub mod register;
+pub mod trusted_proxy;
 
 use axum::response::Html;
 

@@ -9,6 +9,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 // ---------------------------------------------------------------------------
 // Top-level raw config (before validation)
@@ -176,6 +177,63 @@ pub struct AbuseLimitsConfig {
     #[schemars(range(min = 1))]
     #[serde(default = "default_abuse_burst")]
     pub burst: u32,
+
+    /// Peer addresses this daemon forwards from, each a single IPv4/IPv6
+    /// address or that address with a CIDR prefix length (`203.0.113.5`,
+    /// `203.0.113.0/24`, `::1`, `2001:db8::/32`). Default empty: no peer is
+    /// trusted, so every request is limited and exempted by its own TCP
+    /// peer address and `X-Forwarded-For` is never consulted. When the TCP
+    /// peer address falls inside one of these ranges, the client address
+    /// used for the rate limit and the loopback exemption is instead taken
+    /// from `X-Forwarded-For` (walked right to left, skipping entries that
+    /// are themselves trusted proxies) — see
+    /// [05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication).
+    /// Listing a proxy here that does not itself overwrite or correctly
+    /// append to `X-Forwarded-For` lets any client spoof its own address —
+    /// only list proxies you control and that set the header correctly.
+    /// `validate_config` rejects any entry that does not parse as an
+    /// address or CIDR range.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+/// Parse a `server.abuse_limits.trusted_proxies` entry: a single IPv4/IPv6
+/// address, or that address with a `/<prefix-len>` suffix. No suffix means
+/// the address's own full width (`/32` for IPv4, `/128` for IPv6). Used both
+/// by `validate_config` (to reject a malformed entry at load time) and by
+/// `server`'s trusted-proxy matching (to build its runtime CIDR list from
+/// the same, already-validated strings).
+pub fn parse_ip_cidr(input: &str) -> Result<(IpAddr, u8), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    let (addr_part, prefix_part) = match trimmed.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (trimmed, None),
+    };
+    let addr: IpAddr = addr_part
+        .parse()
+        .map_err(|_| format!("'{trimmed}' is not a valid IP address or CIDR range"))?;
+    let max_prefix: u8 = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix_len = match prefix_part {
+        None => max_prefix,
+        Some(raw) => {
+            let parsed: u8 = raw
+                .parse()
+                .map_err(|_| format!("'{trimmed}' has an invalid CIDR prefix length"))?;
+            if parsed > max_prefix {
+                return Err(format!(
+                    "'{trimmed}' has a CIDR prefix length greater than {max_prefix}"
+                ));
+            }
+            parsed
+        }
+    };
+    Ok((addr, prefix_len))
 }
 
 impl Default for AbuseLimitsConfig {
@@ -186,6 +244,7 @@ impl Default for AbuseLimitsConfig {
             unused_client_ttl_secs: default_unused_client_ttl_secs(),
             requests_per_second: default_abuse_requests_per_second(),
             burst: default_abuse_burst(),
+            trusted_proxies: Vec::new(),
         }
     }
 }

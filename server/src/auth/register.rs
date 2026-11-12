@@ -190,9 +190,16 @@ pub async fn post_register(
     Json(req): Json<RegisterClientRequest>,
 ) -> Response {
     let limits = &state.yaml_config().server.abuse_limits;
-    let policy = RegistrationPolicy {
-        max_dynamic_clients: limits.max_dynamic_clients,
-        unused_client_ttl_secs: limits.unused_client_ttl_secs,
+    // `enable: false` is the master switch for every limit in this section
+    // (its own doc comment) — registration's cap/TTL/eviction included, not
+    // just the rate limiter.
+    let policy = if limits.enable {
+        RegistrationPolicy {
+            max_dynamic_clients: limits.max_dynamic_clients,
+            unused_client_ttl_secs: limits.unused_client_ttl_secs,
+        }
+    } else {
+        RegistrationPolicy::unlimited()
     };
     let row = match state
         .auth()

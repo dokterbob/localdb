@@ -138,6 +138,50 @@ fn server_public_url_parses() {
     );
 }
 
+// -----------------------------------------------------------------
+// `parse_ip_cidr` — the `server.abuse_limits.trusted_proxies` entry parser,
+// shared by `validate_config` and `server`'s trusted-proxy matching.
+// -----------------------------------------------------------------
+
+#[test]
+fn parse_ip_cidr_accepts_bare_addresses_with_their_full_width() {
+    assert_eq!(
+        parse_ip_cidr("127.0.0.1").unwrap(),
+        ("127.0.0.1".parse().unwrap(), 32)
+    );
+    assert_eq!(parse_ip_cidr("::1").unwrap(), ("::1".parse().unwrap(), 128));
+}
+
+#[test]
+fn parse_ip_cidr_accepts_an_explicit_prefix_length() {
+    assert_eq!(
+        parse_ip_cidr("203.0.113.0/24").unwrap(),
+        ("203.0.113.0".parse().unwrap(), 24)
+    );
+    assert_eq!(
+        parse_ip_cidr("2001:db8::/32").unwrap(),
+        ("2001:db8::".parse().unwrap(), 32)
+    );
+}
+
+#[test]
+fn parse_ip_cidr_rejects_an_unparseable_address() {
+    assert!(parse_ip_cidr("not-an-address").is_err());
+    assert!(parse_ip_cidr("").is_err());
+    assert!(parse_ip_cidr("   ").is_err());
+}
+
+#[test]
+fn parse_ip_cidr_rejects_a_prefix_length_out_of_range() {
+    assert!(parse_ip_cidr("203.0.113.0/33").is_err());
+    assert!(parse_ip_cidr("::1/129").is_err());
+}
+
+#[test]
+fn parse_ip_cidr_rejects_a_non_numeric_prefix_length() {
+    assert!(parse_ip_cidr("203.0.113.0/abc").is_err());
+}
+
 /// This list is duplicated in `extract::registry::default_parser_ids`
 /// (core cannot depend on extract). The two must stay byte-for-byte
 /// identical: the order feeds the policy-version hash and the chain's

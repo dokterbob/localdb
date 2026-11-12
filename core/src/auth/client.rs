@@ -155,6 +155,26 @@ pub struct RegistrationPolicy {
     pub unused_client_ttl_secs: i64,
 }
 
+/// A TTL large enough that [`RegistrationPolicy::unlimited`]'s pruning
+/// condition (`created_at < now - unused_client_ttl_secs`) can never match a
+/// real row, while staying well inside the range `rfc3339_from_now` can
+/// format without overflow (unlike `i64::MAX`, which would).
+const UNLIMITED_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
+
+impl RegistrationPolicy {
+    /// No pruning, no eviction, no cap: every registration is accepted and
+    /// nothing already registered is ever removed. Used for
+    /// `server.abuse_limits.enable: false` — that switch turns off every
+    /// limit in its section, registration included, rather than only the
+    /// rate limiter.
+    pub const fn unlimited() -> Self {
+        Self {
+            max_dynamic_clients: u64::MAX,
+            unused_client_ttl_secs: UNLIMITED_TTL_SECS,
+        }
+    }
+}
+
 /// A `POST /register` request that fails this server's DCR validation policy
 /// — the single typed outcome [`validate_registration_request`] returns,
 /// enforced by `AuthService::register_client`. `server::auth::register::

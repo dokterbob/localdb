@@ -680,3 +680,166 @@ async fn fake_prune_and_create_never_prunes_the_builtin_client() {
         .unwrap()
         .is_some());
 }
+
+// -----------------------------------------------------------------
+// Eviction at the cap: a registration flood of fresh, unused clients must
+// not be able to lock everyone else out until those rows age past the TTL
+// on their own — the oldest unused client is evicted instead of refusing.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn fake_prune_and_create_evicts_the_oldest_unused_client_at_cap() {
+    let store = FakeAuthStore::new();
+    // None of these are old enough to be pruned by TTL (the cutoff below is
+    // before all of them), and none has an auth code — cap-reached eviction
+    // is the only way to make room.
+    store
+        .create_oauth_client(&oauth_client("oldest", "2026-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("middle", "2026-02-01T00:00:00Z"))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("newest", "2026-03-01T00:00:00Z"))
+        .await
+        .unwrap();
+
+    let candidate = oauth_client("candidate", "2026-04-01T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 3)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(
+        store.find_oauth_client("oldest").await.unwrap().is_none(),
+        "the oldest unused client must be evicted to free the slot"
+    );
+    assert!(store.find_oauth_client("middle").await.unwrap().is_some());
+    assert!(store.find_oauth_client("newest").await.unwrap().is_some());
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_never_evicts_a_used_client_even_at_cap() {
+    let store = FakeAuthStore::new();
+    let used = oauth_client("used", "2026-01-01T00:00:00Z");
+    store.create_oauth_client(&used).await.unwrap();
+    store
+        .create_auth_code(&auth_code_for("used"))
+        .await
+        .unwrap();
+    store
+        .create_oauth_client(&oauth_client("unused", "2026-02-01T00:00:00Z"))
+        .await
+        .unwrap();
+
+    let candidate = oauth_client("candidate", "2026-03-01T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::Created);
+    assert!(
+        store.find_oauth_client("used").await.unwrap().is_some(),
+        "a used client must never be evicted, even though it is the oldest"
+    );
+    assert!(
+        store.find_oauth_client("unused").await.unwrap().is_none(),
+        "the only evictable (unused) client must be the one freed"
+    );
+    assert!(store
+        .find_oauth_client("candidate")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn fake_prune_and_create_never_evicts_the_builtin_client() {
+    let store = FakeAuthStore::new();
+    // The built-in client's epoch `created_at` would make it the oldest
+    // candidate for eviction by age alone if it were not excluded by id.
+    store
+        .create_oauth_client(&oauth_client(LOCALDB_CLI_CLIENT_ID, "1970-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let used = oauth_client("used", "2026-01-01T00:00:00Z");
+    store.create_oauth_client(&used).await.unwrap();
+    store
+        .create_auth_code(&auth_code_for("used"))
+        .await
+        .unwrap();
+
+    // Cap=1 counts only dynamic clients, so "used" alone already fills it;
+    // with no unused dynamic client to evict, this must refuse.
+    let candidate = oauth_client("candidate", "2026-02-01T00:00:00Z");
+    let outcome = store
+        .prune_and_create_oauth_client(&candidate, LOCALDB_CLI_CLIENT_ID, CUTOFF_BEFORE_OLD, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, RegisterClientOutcome::CapReached);
+    assert!(store
+        .find_oauth_client(LOCALDB_CLI_CLIENT_ID)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store.find_oauth_client("used").await.unwrap().is_some());
+}
+
+// -----------------------------------------------------------------
+// Deleting a user cascades to their `auth_codes` (mirrors the real schema's
+// `ON DELETE CASCADE`) — a client whose only completed authorization
+// belonged to a deleted user becomes unused again, and therefore prunable/
+// evictable. See `store-libsql/src/auth/tests/clients.rs`'s identical test
+// for the libsql-backed store.
+// -----------------------------------------------------------------
+
+#[tokio::test]
+async fn deleting_a_user_cascades_their_auth_codes_so_the_client_they_used_becomes_evictable() {
+    let store = FakeAuthStore::new();
+    store.create_user(&user("user-1", "alice")).await.unwrap();
+    let used = oauth_client("used", OLD_CREATED_AT);
+    store.create_oauth_client(&used).await.unwrap();
+    store
+        .create_auth_code(&auth_code_for("used"))
+        .await
+        .unwrap();
+
+    // While "used" is still used, it alone fills a cap of 1 and there is no
+    // unused dynamic client to evict.
+    let candidate_1 = oauth_client("candidate-1", "2026-05-01T00:00:00Z");
+    let outcome_1 = store
+        .prune_and_create_oauth_client(&candidate_1, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 1)
+        .await
+        .unwrap();
+    assert_eq!(outcome_1, RegisterClientOutcome::CapReached);
+
+    assert!(store.delete_user("user-1").await.unwrap());
+
+    // The auth code (and with it, "used"'s used-ness) is gone, so it is now
+    // the oldest unused dynamic client and gets evicted to make room.
+    let candidate_2 = oauth_client("candidate-2", "2026-05-02T00:00:00Z");
+    let outcome_2 = store
+        .prune_and_create_oauth_client(&candidate_2, LOCALDB_CLI_CLIENT_ID, CUTOFF_AFTER_OLD, 1)
+        .await
+        .unwrap();
+    assert_eq!(outcome_2, RegisterClientOutcome::Created);
+    assert!(
+        store.find_oauth_client("used").await.unwrap().is_none(),
+        "the client's only auth code was deleted along with its user"
+    );
+    assert!(store
+        .find_oauth_client("candidate-2")
+        .await
+        .unwrap()
+        .is_some());
+}

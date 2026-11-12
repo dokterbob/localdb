@@ -8,6 +8,7 @@ fn cfg(enable: bool, rps: u32, burst: u32) -> AbuseLimitsConfig {
         unused_client_ttl_secs: 86400,
         requests_per_second: rps,
         burst,
+        trusted_proxies: Vec::new(),
     }
 }
 
@@ -69,6 +70,47 @@ fn disabled_helper_never_limits() {
 }
 
 // -----------------------------------------------------------------
+// `AbuseLimiter::resolve_client_addr` — the glue between config and
+// `trusted_proxy::resolve_client_addr`; the resolution logic itself is
+// table-tested in `trusted_proxy::tests`.
+// -----------------------------------------------------------------
+
+fn cfg_with_trusted_proxies(trusted_proxies: Vec<String>) -> AbuseLimitsConfig {
+    AbuseLimitsConfig {
+        trusted_proxies,
+        ..cfg(true, 5, 20)
+    }
+}
+
+#[test]
+fn resolve_client_addr_ignores_the_header_from_an_untrusted_peer() {
+    let limiter = AbuseLimiter::new(&cfg_with_trusted_proxies(Vec::new()));
+    let resolved = limiter.resolve_client_addr(ip(7), &["198.51.100.1".to_string()]);
+    assert_eq!(resolved, ip(7));
+}
+
+#[test]
+fn resolve_client_addr_honors_the_header_from_a_trusted_peer() {
+    let limiter = AbuseLimiter::new(&cfg_with_trusted_proxies(vec!["127.0.0.1".to_string()]));
+    let resolved = limiter.resolve_client_addr(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        &["198.51.100.1".to_string()],
+    );
+    assert_eq!(resolved, "198.51.100.1".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+#[should_panic(expected = "should already be validated")]
+fn new_panics_on_an_unvalidated_trusted_proxies_entry() {
+    // Defensive: `validate_config` should already have rejected this, but
+    // `AbuseLimiter::new` must fail loudly, not silently drop the entry,
+    // if that invariant is ever violated.
+    AbuseLimiter::new(&cfg_with_trusted_proxies(
+        vec!["not-an-address".to_string()],
+    ));
+}
+
+// -----------------------------------------------------------------
 // `too_many_requests` — the three response-body shapes.
 // -----------------------------------------------------------------
 
@@ -80,7 +122,7 @@ async fn body_json(response: Response) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn token_route_gets_the_oauth_style_slow_down_body() {
+async fn token_route_gets_the_oauth_style_temporarily_unavailable_body() {
     let response = too_many_requests("/token", Duration::from_secs(5));
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -91,7 +133,10 @@ async fn token_route_gets_the_oauth_style_slow_down_body() {
         "5"
     );
     let json = body_json(response).await;
-    assert_eq!(json["error"], "slow_down");
+    // Not `slow_down`: RFC 8628 §3.5's device-flow code, which this
+    // endpoint (authorization-code and refresh grants only) never
+    // otherwise emits.
+    assert_eq!(json["error"], "temporarily_unavailable");
 }
 
 #[tokio::test]

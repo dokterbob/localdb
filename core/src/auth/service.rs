@@ -83,7 +83,9 @@ pub enum RegisterClientError {
     /// A store-layer failure persisting the validated client.
     Store(Error),
     /// `RegistrationPolicy::max_dynamic_clients` is still reached after
-    /// pruning unused, expired registrations (specs/05-surfaces.md §3.1).
+    /// pruning unused, expired registrations and evicting the oldest unused
+    /// one — every slot is held by a client with a completed authorization
+    /// (specs/05-surfaces.md §3.1).
     CapReached,
 }
 
@@ -620,10 +622,13 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// Before inserting, prunes dynamically registered clients that are
     /// older than `policy.unused_client_ttl_secs` and have never completed
-    /// an authorization, then refuses with [`RegisterClientError::
-    /// CapReached`] if `policy.max_dynamic_clients` is still reached — see
+    /// an authorization; if `policy.max_dynamic_clients` is still reached,
+    /// evicts the single oldest remaining unused client to make room, and
+    /// only refuses with [`RegisterClientError::CapReached`] if every slot
+    /// is held by a client with a completed authorization — see
     /// [`AuthStore::prune_and_create_oauth_client`] for why this runs as one
-    /// transaction with the insert.
+    /// transaction with the insert, and `RegistrationPolicy::unlimited` for
+    /// the policy used when `server.abuse_limits.enable` is `false`.
     pub async fn register_client(
         &self,
         redirect_uris: Vec<String>,

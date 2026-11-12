@@ -1,4 +1,4 @@
-//! Per-client-IP token-bucket rate limiting for the daemon's public,
+//! Per-client-address token-bucket rate limiting for the daemon's public,
 //! unauthenticated auth routes (specs/05-surfaces.md §3.1): `/authorize`,
 //! `/join`, `/token`, `/revoke`, `/register`, `/v1/invites/redeem`, and
 //! `/v1/invites/requests/{id}/poll`. The `/.well-known/*` discovery
@@ -6,16 +6,25 @@
 //!
 //! Mirrors `fetch::http::limiter::HostLimiter`'s governor-based keyed
 //! limiter — same token-bucket construction, same periodic
-//! `retain_recent`/`shrink_to_fit` housekeeping — keyed on the client's peer
-//! IP instead of a destination host, and implemented independently here so
-//! `server` does not pick up `fetch`'s outgoing-HTTP machinery (retry,
-//! destination guards, …) just to reuse one struct.
+//! `retain_recent`/`shrink_to_fit` housekeeping, see
+//! [`PRUNE_EVERY_N_CHECKS`] — keyed on the client's address instead of a
+//! destination host, and implemented independently here so `server` does
+//! not pick up `fetch`'s outgoing-HTTP machinery (retry, destination
+//! guards, …) just to reuse one struct.
 //!
 //! Unlike outbound pacing, inbound rate limiting must never make a request
 //! wait: a blocked HTTP connection holding a client open would itself be a
 //! resource a hostile caller could exhaust. So this checks the bucket
 //! synchronously (`governor::RateLimiter::check_key`) and immediately
 //! rejects with `429` plus `Retry-After` on failure, rather than sleeping.
+//!
+//! The client address a request is limited/exempted on is resolved by
+//! [`trusted_proxy::resolve_client_addr`] — the TCP peer address, unless the
+//! peer is a configured `server.abuse_limits.trusted_proxies` entry, in
+//! which case `X-Forwarded-For` (walked right to left) names the real
+//! client. [`trusted_proxy::limiter_key`] then reduces that address to its
+//! bucket key — unchanged for IPv4, masked to its /64 network prefix for a
+//! genuine IPv6 address (specs/05-surfaces.md §3.1).
 
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
@@ -33,8 +42,9 @@ use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter as GovernorRateLimiter};
 use serde::Serialize;
 
-use localdb_core::config::schema::AbuseLimitsConfig;
+use localdb_core::config::schema::{parse_ip_cidr, AbuseLimitsConfig};
 
+use super::trusted_proxy;
 use crate::error::ErrorResponse;
 use crate::state::AppState;
 
@@ -44,7 +54,17 @@ type GovernorLimiter = GovernorRateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr
 
 /// How many [`AbuseLimiter::check`] calls between housekeeping passes — see
 /// `fetch::http::limiter::PRUNE_EVERY_N_ACQUIRES`'s doc comment for why a
-/// periodic sweep (rather than one on every call) is the right trade-off.
+/// periodic inline sweep (rather than a separate background task, and
+/// rather than one on every call) is the right trade-off. This bounds the
+/// limiter's keyed state to roughly the number of distinct client buckets
+/// seen in the last `PRUNE_EVERY_N_CHECKS` requests, not to any fixed
+/// ceiling — a daemon seeing a wide, sustained spread of distinct
+/// addresses keeps a bucket per address (per /64, for IPv6) between
+/// sweeps. In practice this is bounded by how many distinct callers a
+/// public auth surface sees concurrently, which is small relative to, say,
+/// indexed chunk counts; a daemon under a sustained many-address flood
+/// should lower `requests_per_second`/`burst` rather than rely on this
+/// sweep for memory control.
 const PRUNE_EVERY_N_CHECKS: u64 = 100;
 
 fn nonzero_or(value: u32, fallback: u32) -> NonZeroU32 {
@@ -58,20 +78,42 @@ struct Inner {
     check_count: AtomicU64,
 }
 
-/// A per-client-IP token bucket, or a no-op when `abuse_limits.enable` is
+/// A per-client-address token bucket, or a no-op when `abuse_limits.enable` is
 /// `false`. `Arc`-backed and cheaply `Clone`, built once per `AppState` and
 /// shared across every request.
 #[derive(Clone)]
 pub struct AbuseLimiter {
     inner: Option<Arc<Inner>>,
+    /// Parsed `server.abuse_limits.trusted_proxies`. Kept outside `inner`
+    /// so trusted-proxy resolution is available even when the limiter
+    /// itself is disabled — resolving the address is cheap and keeps
+    /// `limit_abuse`'s logic uniform regardless of `enable`, even though a
+    /// disabled limiter's `check` always allows either way.
+    trusted_proxies: Arc<Vec<(IpAddr, u8)>>,
 }
 
 impl AbuseLimiter {
     /// Build from config. `enable: false` yields a limiter that always
-    /// allows — the middleware stays wired, just inert.
+    /// allows — the middleware stays wired, just inert. `trusted_proxies`
+    /// entries are assumed already validated (`core::config::loader::
+    /// validate_config` runs `parse_ip_cidr` on every entry at config load
+    /// time), so a parse failure here is a bug, not a user-facing error.
     pub fn new(cfg: &AbuseLimitsConfig) -> Self {
+        let trusted_proxies = Arc::new(
+            cfg.trusted_proxies
+                .iter()
+                .map(|entry| {
+                    parse_ip_cidr(entry).unwrap_or_else(|e| {
+                        panic!("server.abuse_limits.trusted_proxies entry '{entry}' should already be validated: {e}")
+                    })
+                })
+                .collect(),
+        );
         if !cfg.enable {
-            return Self { inner: None };
+            return Self {
+                inner: None,
+                trusted_proxies,
+            };
         }
         let quota = Quota::per_second(nonzero_or(cfg.requests_per_second, 1))
             .allow_burst(nonzero_or(cfg.burst, 1));
@@ -85,20 +127,33 @@ impl AbuseLimiter {
                 limiter,
                 check_count: AtomicU64::new(0),
             })),
+            trusted_proxies,
         }
     }
 
-    /// A limiter that always allows — used where no `AbuseLimitsConfig` is
-    /// in scope (tests that don't exercise this behavior).
+    /// A limiter that always allows and trusts no proxy — used where no
+    /// `AbuseLimitsConfig` is in scope (tests that don't exercise this
+    /// behavior).
     #[cfg(test)]
     pub fn disabled() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            trusted_proxies: Arc::new(Vec::new()),
+        }
     }
 
-    /// Check one request from `ip`. `Ok(())` means allowed and consumed a
-    /// token; `Err(wait)` means rejected, with `wait` the time until a token
-    /// would next be available.
-    fn check(&self, ip: IpAddr) -> Result<(), Duration> {
+    /// Resolve the address a request from `peer` carrying `forwarded_for`
+    /// (every `X-Forwarded-For` header line present, in order) should be
+    /// limited/exempted on — see [`trusted_proxy::resolve_client_addr`].
+    fn resolve_client_addr(&self, peer: IpAddr, forwarded_for: &[String]) -> IpAddr {
+        trusted_proxy::resolve_client_addr(peer, &self.trusted_proxies, forwarded_for)
+    }
+
+    /// Check one request keyed on `key` (already resolved and reduced to
+    /// its bucket key — see [`trusted_proxy::limiter_key`]). `Ok(())` means
+    /// allowed and consumed a token; `Err(wait)` means rejected, with
+    /// `wait` the time until a token would next be available.
+    fn check(&self, key: IpAddr) -> Result<(), Duration> {
         let Some(inner) = &self.inner else {
             return Ok(());
         };
@@ -109,7 +164,7 @@ impl AbuseLimiter {
         }
         inner
             .limiter
-            .check_key(&ip)
+            .check_key(&key)
             .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()))
     }
 }
@@ -130,27 +185,18 @@ fn too_many_requests(path: &str, wait: Duration) -> Response {
 
     let mut response = match path {
         // RFC 6749 §5.2 defines no token-endpoint code for "too many
-        // requests"; `slow_down` is RFC 8628 §3.5's registered code for
-        // exactly this ("the client is polling too quickly"), the closest
-        // fit on the books.
-        "/token" => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(OAuthStyleErrorBody {
-                error: "slow_down",
-                error_description: "too many requests; retry after the delay in Retry-After"
-                    .to_string(),
-            }),
-        )
-            .into_response(),
-        // Consistent with `register.rs`'s own cap-reached 429 on this same
-        // route: both describe "this server can't accept this registration
-        // attempt right now".
-        "/register" => (
+        // requests". `slow_down` is tempting (RFC 8628 §3.5's registered
+        // code for "polling too quickly") but belongs to the device-flow
+        // grant this endpoint never implements (authorization-code and
+        // refresh grants only) — emitting it here would be a code this
+        // route otherwise never sends. `temporarily_unavailable` (RFC 6749
+        // §4.1.2.1) fits a generic "can't serve this request right now"
+        // better and matches `/register`'s own 429 below.
+        "/token" | "/register" => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(OAuthStyleErrorBody {
                 error: "temporarily_unavailable",
-                error_description: "too many registration attempts; retry after the delay in \
-                                     Retry-After"
+                error_description: "too many requests; retry after the delay in Retry-After"
                     .to_string(),
             }),
         )
@@ -175,17 +221,26 @@ fn too_many_requests(path: &str, wait: Duration) -> Response {
 }
 
 /// Middleware applied to the public auth-route group in
-/// `daemon::build_router`. Keys on the TCP peer address
-/// (`ConnectInfo<SocketAddr>`, populated by
-/// `into_make_service_with_connect_info`), never `X-Forwarded-For`/
-/// `Forwarded` (untrusted without a configured, trusted reverse proxy, which
-/// this daemon does not yet model — behind a plain reverse proxy every
-/// client shares the proxy's address). Loopback peers are always exempt,
-/// regardless of `abuse_limits.enable` — a local daemon must never throttle
-/// its own user. A request with no `ConnectInfo` at all (a test harness
-/// invoking a handler directly, bypassing the real TCP listener) is also
-/// never limited: there is nothing reliable to key on, the same "don't
-/// limit what you can't identify" rule a non-TCP transport would get if the
+/// `daemon::build_router`. Resolves the client address from the TCP peer
+/// address (`ConnectInfo<SocketAddr>`, populated by
+/// `into_make_service_with_connect_info`) and, only when that peer is a
+/// configured `server.abuse_limits.trusted_proxies` entry,
+/// `X-Forwarded-For` — see [`trusted_proxy::resolve_client_addr`] for the
+/// exact right-to-left walk. Without a configured trusted proxy, every
+/// client behind a reverse proxy shares the proxy's own address, same as
+/// before trusted-proxy support existed.
+///
+/// Loopback peers are always exempt, regardless of `abuse_limits.enable` —
+/// a local daemon must never throttle its own user; the check runs against
+/// the *resolved* address (unmapped but not yet /64-masked), so a direct
+/// loopback peer that is not a trusted proxy stays exempt, while a request
+/// arriving via a trusted loopback proxy is limited by the real client
+/// address `X-Forwarded-For` names instead.
+///
+/// A request with no `ConnectInfo` at all (a test harness invoking a
+/// handler directly, bypassing the real TCP listener) is also never
+/// limited: there is nothing reliable to key on, the same "don't limit
+/// what you can't identify" rule a non-TCP transport would get if the
 /// daemon ever served `/v1` over one — today it does not (the discovery
 /// socket, `server::socket::SocketGuard`, is a liveness probe only, never
 /// an HTTP transport).
@@ -202,13 +257,27 @@ pub async fn limit_abuse(State(state): State<AppState>, req: Request, next: Next
     let Some(ConnectInfo(addr)) = connect_info else {
         return next.run(req).await;
     };
-    if addr.ip().is_loopback() {
+    let forwarded_for = forwarded_for_header_values(&req);
+    let limiter = state.abuse_limiter();
+    let client = limiter.resolve_client_addr(addr.ip(), &forwarded_for);
+    if client.is_loopback() {
         return next.run(req).await;
     }
-    match state.abuse_limiter().check(addr.ip()) {
+    match limiter.check(trusted_proxy::limiter_key(client)) {
         Ok(()) => next.run(req).await,
         Err(wait) => too_many_requests(req.uri().path(), wait),
     }
+}
+
+/// Every `X-Forwarded-For` header line on `req`, in the order they appear.
+/// Only this header is accepted — not RFC 7239's `Forwarded: for=` — see
+/// `trusted_proxy::resolve_client_addr`'s doc comment.
+fn forwarded_for_header_values(req: &Request) -> Vec<String> {
+    req.headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]

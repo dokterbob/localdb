@@ -174,10 +174,13 @@ pub struct OAuthClientRow {
 /// Outcome of `AuthStore::prune_and_create_oauth_client`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterClientOutcome {
-    /// Pruning (if any ran) left room; `client` was inserted.
+    /// Room was found — by TTL pruning, by evicting the oldest unused
+    /// dynamically registered client, or because there was already room —
+    /// and `client` was inserted.
     Created,
-    /// Still at `max_dynamic_clients` after pruning; nothing was inserted.
-    /// Any pruning that did run still committed.
+    /// Every slot is held by a client with a completed authorization (or
+    /// the built-in client, which never counts); nothing was inserted. Any
+    /// pruning/eviction that did run still committed.
     CapReached,
 }
 
@@ -376,17 +379,32 @@ pub trait AuthStore: Send + Sync + 'static {
     // ------------------------------------------------------------------
     async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error>;
     async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error>;
-    /// Atomically prune dynamically registered clients that have never
-    /// completed an authorization — no row in `auth_codes` names them as
-    /// `client_id`, the earliest point in the OAuth2 flow this schema
-    /// records client activity at, earlier than a token ever being minted —
-    /// and were registered before `unused_before` (RFC 3339), then insert
-    /// `client` iff the number of dynamically registered clients (every
-    /// `oauth_clients` row except `builtin_client_id`) is then below
-    /// `max_dynamic_clients`. Prune, cap check, and insert commit as one
-    /// transaction, so concurrent registrations can never together exceed
-    /// the cap (specs/05-surfaces.md §3.1). Pruning commits even when the
-    /// cap is still reached afterward and nothing is inserted.
+    /// Make room for `client` and insert it, in one transaction so
+    /// concurrent registrations can never together exceed
+    /// `max_dynamic_clients` (specs/05-surfaces.md §3.1):
+    ///
+    /// 1. Prune dynamically registered clients that have never completed an
+    ///    authorization — no row in `auth_codes` names them as `client_id`,
+    ///    the earliest point in the OAuth2 flow this schema records client
+    ///    activity at, earlier than a token ever being minted — and were
+    ///    registered before `unused_before` (RFC 3339).
+    /// 2. If the number of dynamically registered clients (every
+    ///    `oauth_clients` row except `builtin_client_id`) is still at
+    ///    `max_dynamic_clients`, evict the single oldest dynamically
+    ///    registered client that has never completed an authorization
+    ///    (ties broken by `id`), regardless of its age — an unauthenticated
+    ///    caller that fills every slot with fresh registrations must not be
+    ///    able to lock out every other registration attempt until those
+    ///    rows age past `unused_before` on their own. A client that
+    ///    registered but has not yet started authorization can be evicted
+    ///    this way and must register again.
+    /// 3. Only if every remaining slot is held by a client with a completed
+    ///    authorization (or the built-in client, which never counts and is
+    ///    never pruned or evicted) does this return
+    ///    [`RegisterClientOutcome::CapReached`] without inserting anything.
+    ///
+    /// Steps 1-3 commit as one transaction. Pruning and eviction commit even
+    /// when the outcome is still `CapReached`.
     async fn prune_and_create_oauth_client(
         &self,
         client: &OAuthClientRow,

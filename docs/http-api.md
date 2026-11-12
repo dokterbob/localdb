@@ -129,15 +129,21 @@ stores and their jobs.
 
 **Abuse limits on the public auth routes** (`server.abuse_limits`, defaults on): every route in the
 first table row above _except_ the two `GET /.well-known/*` discovery documents shares a
-per-client-IP token bucket (default 5 requests/second, burst 20) — loopback callers are always
-exempt, and behind a reverse proxy every client shares the proxy's address. Over the limit: `429`
-with `Retry-After` (seconds); `/token` and `/register` keep their existing OAuth-style
-`{"error", "error_description"}` body (`slow_down` / `temporarily_unavailable` respectively), every
-other route uses the standard `{"code": "rate_limited", "message": "..."}` shape below.
-`POST /register` also enforces a separate cap on how many dynamically registered clients may exist
-at once (default 1000, the built-in `localdb-cli` client never counts toward it) — once that cap is
-still reached after pruning clients that are both unused and past `unused_client_ttl_secs` (default
-24h), registration is refused the same way: `429`, `Retry-After`,
+per-client-address token bucket (default 5 requests/second, burst 20) — loopback callers are always
+exempt. The limiter keys on the real TCP peer address unless that peer is listed in
+`server.abuse_limits.trusted_proxies` (default empty), in which case it instead honors
+`X-Forwarded-For` (walked right to left, trusting only entries that aren't themselves a configured
+proxy); without a configured trusted proxy, every client behind a reverse proxy shares the proxy's
+address, same as always. A genuine IPv6 address is keyed on its /64 network prefix, not the full
+address. Over the limit: `429` with `Retry-After` (seconds); `/token` and `/register` both keep
+their existing OAuth-style `{"error", "error_description"}` body with
+`error: "temporarily_unavailable"`, every other route uses the standard
+`{"code": "rate_limited", "message": "..."}` shape below. `POST /register` also enforces a separate
+cap on how many dynamically registered clients may exist at once (default 1000, the built-in
+`localdb-cli` client never counts toward it) — once that cap is still reached after pruning clients
+that are both unused and past `unused_client_ttl_secs` (default 24h), the oldest remaining unused
+client is evicted to make room; only once every slot is held by a client with a completed
+authorization does registration get refused the same way: `429`, `Retry-After`,
 `{"error": "temporarily_unavailable", ...}`. See
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.1 and
 [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md) §1 for the

@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    config::{platform::PlatformPaths, schema::RawConfig},
+    config::{platform::PlatformPaths, schema::parse_ip_cidr, schema::RawConfig},
     Error,
 };
 
@@ -231,6 +231,20 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         return Err(Error::InvalidConfig {
             message: "server.abuse_limits.burst must be greater than zero".to_string(),
         });
+    }
+
+    for (i, entry) in config
+        .server
+        .abuse_limits
+        .trusted_proxies
+        .iter()
+        .enumerate()
+    {
+        if let Err(reason) = parse_ip_cidr(entry) {
+            return Err(Error::InvalidConfig {
+                message: format!("server.abuse_limits.trusted_proxies[{i}]: {reason}"),
+            });
+        }
     }
 
     // Rejected here rather than at first use: `user_agent` is handed to

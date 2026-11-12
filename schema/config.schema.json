@@ -59,7 +59,8 @@
               "max_dynamic_clients": 1000,
               "unused_client_ttl_secs": 86400,
               "requests_per_second": 5,
-              "burst": 20
+              "burst": 20,
+              "trusted_proxies": []
             }
           }
         },
@@ -167,7 +168,8 @@
             "max_dynamic_clients": 1000,
             "unused_client_ttl_secs": 86400,
             "requests_per_second": 5,
-            "burst": 20
+            "burst": 20,
+            "trusted_proxies": []
           }
         }
       },
@@ -229,6 +231,14 @@
           "minimum": 1,
           "description": "Maximum burst size above the sustained rate (token bucket capacity).\nMust be at least 1 — `validate_config` rejects `0`.",
           "default": 20
+        },
+        "trusted_proxies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Peer addresses this daemon forwards from, each a single IPv4/IPv6\naddress or that address with a CIDR prefix length (`203.0.113.5`,\n`203.0.113.0/24`, `::1`, `2001:db8::/32`). Default empty: no peer is\ntrusted, so every request is limited and exempted by its own TCP\npeer address and `X-Forwarded-For` is never consulted. When the TCP\npeer address falls inside one of these ranges, the client address\nused for the rate limit and the loopback exemption is instead taken\nfrom `X-Forwarded-For` (walked right to left, skipping entries that\nare themselves trusted proxies) — see\n[05-surfaces.md §3.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#31-authentication).\nListing a proxy here that does not itself overwrite or correctly\nappend to `X-Forwarded-For` lets any client spoof its own address —\nonly list proxies you control and that set the header correctly.\n`validate_config` rejects any entry that does not parse as an\naddress or CIDR range.",
+          "default": []
         }
       },
       "description": "Abuse limits for the daemon's public, unauthenticated auth routes\n(specs/05-surfaces.md §3.1): `/authorize`, `/join`, `/token`, `/revoke`,\n`/register`, `/v1/invites/redeem`, `/v1/invites/requests/{id}/poll`. The\n`/.well-known/*` discovery documents are never limited — they are static,\ncheap to serve, and a client needs them before it can even attempt any\nof the routes above.\n\nMirrors `HttpConfig`/`RateLimitConfig`'s naming for the outbound\nper-host limiter (`requests_per_second`/`burst`), since both are the\nsame token-bucket shape applied in the opposite direction (inbound here,\nkeyed on client IP instead of destination host)."

@@ -363,6 +363,23 @@ async fn perform_invite_login(
     Err(crate::daemon_client::daemon_response_error(status, &body))
 }
 
+/// Upper bound on how long a single `Retry-After`-driven wait may stretch
+/// this poll loop, regardless of what value the header carries — a
+/// hostile or merely broken daemon must not be able to stall `login`
+/// indefinitely with one absurd value (e.g. `Retry-After: 315360000`).
+const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many consecutive `429`s this loop tolerates before giving up.
+/// Waiting for a human's approval is legitimately open-ended, so this loop
+/// has no overall deadline on `pending` — but a `429` means this loop
+/// itself is being throttled, not that the request is still undecided, and
+/// repeated `429`s must not be able to extend the wait without bound
+/// either (a `Retry-After: 0`, honored literally, would otherwise hot-loop
+/// forever just as easily as a huge one stalls forever). After this many
+/// in a row — each one waited out in full — the loop gives up with a
+/// clear, retryable error instead of continuing forever.
+const MAX_CONSECUTIVE_RATE_LIMITS: u32 = 20;
+
 /// Poll `POST /v1/invites/requests/{id}/poll` every `poll_interval` until
 /// the request is decided. Returns the credential on approval; `denied` is
 /// a terminal `Unauthorized` with a clear message, per specs/05-surfaces.md
@@ -376,6 +393,7 @@ async fn poll_until_decided(
     poll_interval: std::time::Duration,
 ) -> Result<String, Error> {
     let encoded_id = encode_path_segment(request_id);
+    let mut consecutive_rate_limits = 0u32;
     loop {
         let resp = client
             .post(format!("{base_url}/v1/invites/requests/{encoded_id}/poll"))
@@ -387,14 +405,31 @@ async fn poll_until_decided(
         // A 429 from the daemon's per-IP rate limiter (specs/05-surfaces.md
         // §3.1) is not a decision failure — it means this poll loop itself
         // is the thing being throttled (e.g. several concurrent logins
-        // sharing one IP behind NAT). Wait the suggested delay and keep
-        // polling rather than surfacing an error for a condition this loop
-        // caused and can resolve by itself.
+        // sharing one IP behind NAT). Wait the suggested delay, clamped to
+        // a sane range, and keep polling rather than surfacing an error for
+        // a condition this loop caused and can resolve by itself — unless
+        // it keeps happening (see `MAX_CONSECUTIVE_RATE_LIMITS`).
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = retry_after_duration(resp.headers()).unwrap_or(poll_interval);
+            consecutive_rate_limits += 1;
+            if consecutive_rate_limits > MAX_CONSECUTIVE_RATE_LIMITS {
+                return Err(Error::RateLimited {
+                    message: format!(
+                        "the daemon rate-limited this poll {consecutive_rate_limits} times in a \
+                         row; retry login later"
+                    ),
+                });
+            }
+            // The minimum is `poll_interval` itself (never busy-loop faster
+            // than this login would poll anyway, even on `Retry-After: 0`
+            // or a missing header); the maximum is `MAX_RATE_LIMIT_WAIT`
+            // (never one absurd value away from a login that looks hung).
+            let wait = retry_after_duration(resp.headers())
+                .unwrap_or(poll_interval)
+                .clamp(poll_interval, MAX_RATE_LIMIT_WAIT);
             tokio::time::sleep(wait).await;
             continue;
         }
+        consecutive_rate_limits = 0;
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
             return Err(crate::daemon_client::daemon_response_error(status, &body));
@@ -438,7 +473,8 @@ async fn poll_until_decided(
 /// only form this daemon's rate limiter sends — `server::auth::rate_limit`).
 /// `None` for a missing or unparseable header, so the caller can fall back
 /// to its own poll interval rather than fail outright on a header shape
-/// this server never actually sends.
+/// this server never actually sends. The returned duration is not yet
+/// clamped — callers apply their own bound (see `MAX_RATE_LIMIT_WAIT`).
 fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)

@@ -154,6 +154,13 @@ fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
         }
         inner.tokens.retain(|t| t.user_id != id);
         inner.grants.retain(|g| g.user_id != id);
+        // Mirrors the real schema's `auth_codes.user_id ... ON DELETE
+        // CASCADE`: a code issued to the deleted user is removed outright,
+        // not left behind as a dangling "used" marker for whatever client
+        // it named — `prune_and_create_oauth_client`'s eviction depends on
+        // `auth_codes` to decide which clients are unused, so leaving these
+        // rows behind would make a client prunable in libsql but not here.
+        inner.auth_codes.retain(|c| c.user_id != id);
         for r in inner.access_requests.iter_mut() {
             if r.resulting_user_id.as_deref() == Some(id) {
                 r.resulting_user_id = None;
@@ -568,8 +575,9 @@ impl AuthStore for FakeAuthStore {
         max_dynamic_clients: u64,
     ) -> Result<RegisterClientOutcome, Error> {
         let mut inner = self.inner.write().await;
-        // Held across both the prune and the cap check/insert below, the
-        // same atomicity a real transaction gives the libsql store.
+        // Held across the prune, the eviction, and the cap check/insert
+        // below, the same atomicity a real transaction gives the libsql
+        // store.
         let used_client_ids: std::collections::HashSet<String> = inner
             .auth_codes
             .iter()
@@ -586,7 +594,25 @@ impl AuthStore for FakeAuthStore {
             .filter(|c| c.id != builtin_client_id)
             .count() as u64;
         if dynamic_count >= max_dynamic_clients {
-            return Ok(RegisterClientOutcome::CapReached);
+            // Evict the oldest unused dynamic client (ties broken by id,
+            // matching the libsql store's `ORDER BY created_at ASC, id
+            // ASC`) to free exactly the one slot this registration needs.
+            // Only refuse if no unused client is left to evict — every
+            // remaining slot is held by a client with a completed
+            // authorization (or the built-in client, excluded above).
+            let victim = inner
+                .oauth_clients
+                .iter()
+                .filter(|c| c.id != builtin_client_id && !used_client_ids.contains(&c.id))
+                .min_by(|a, b| {
+                    (a.created_at.as_str(), a.id.as_str())
+                        .cmp(&(b.created_at.as_str(), b.id.as_str()))
+                })
+                .map(|c| c.id.clone());
+            match victim {
+                Some(id) => inner.oauth_clients.retain(|c| c.id != id),
+                None => return Ok(RegisterClientOutcome::CapReached),
+            }
         }
         inner.oauth_clients.push(client.clone());
         Ok(RegisterClientOutcome::Created)
