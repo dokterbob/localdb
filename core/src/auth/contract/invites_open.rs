@@ -84,31 +84,49 @@ pub async fn max_uses_enforced_under_concurrent_burst<S: AuthStore>(store: Arc<S
         .await
         .unwrap();
 
+    let barrier = Arc::new(tokio::sync::Barrier::new(BURST));
     let mut handles = Vec::new();
     for i in 0..BURST {
         let store = store.clone();
         let secret = issued.secret.clone();
+        let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
+            barrier.wait().await;
             AuthService::new(store)
                 .redeem_invite(&secret, &format!("invites-open-burst-{i}"))
                 .await
         }));
     }
     let mut successes = 0u32;
+    let mut losses = 0u32;
     for h in handles {
-        if h.await.unwrap().is_ok() {
-            successes += 1;
+        match h.await.unwrap() {
+            Ok(_) => successes += 1,
+            Err(Error::Unauthorized { .. }) => losses += 1,
+            Err(other) => panic!("unexpected redemption error under a concurrent burst: {other}"),
         }
     }
     assert_eq!(
         successes, MAX_USES,
         "exactly max_uses redemptions must succeed"
     );
+    assert_eq!(losses, BURST as u32 - MAX_USES);
 
     let reloaded = store.find_invite(&issued.row.id).await.unwrap().unwrap();
     assert_eq!(
         reloaded.uses, MAX_USES,
         "uses must never exceed max_uses, even under a concurrent burst"
+    );
+    let user_count = store
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.name.starts_with("invites-open-burst-"))
+        .count();
+    assert_eq!(
+        user_count as u32, MAX_USES,
+        "exactly max_uses users must have been created"
     );
 }
 

@@ -126,25 +126,49 @@ pub async fn demoting_unknown_id_reports_not_found<S: AuthStore>(store: Arc<S>) 
 }
 
 pub async fn two_admins_demote_and_delete_succeed<S: AuthStore>(store: Arc<S>) {
-    let svc = AuthService::new(store);
+    let svc = AuthService::new(store.clone());
 
-    // Demoting one of two admins succeeds.
-    let a1 = svc
-        .create_user("users-two-admins-demote-a1", Role::Admin)
-        .await
-        .unwrap();
-    svc.create_user("users-two-admins-demote-a2", Role::Admin)
-        .await
-        .unwrap();
-    svc.set_user_role(&a1.id, Role::Member).await.unwrap();
-
-    // Deleting one of two (freshly independent) admins succeeds too.
+    // Deletion phase, with exactly two admins: deleting one must succeed
+    // and leave exactly one admin — not zero, not still two.
     let b1 = svc
         .create_user("users-two-admins-delete-b1", Role::Admin)
         .await
         .unwrap();
-    svc.create_user("users-two-admins-delete-b2", Role::Admin)
+    let b2 = svc
+        .create_user("users-two-admins-delete-b2", Role::Admin)
         .await
         .unwrap();
     assert!(svc.delete_user(&b1.id).await.unwrap());
+    let admins_remaining = store
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.role == Role::Admin)
+        .count();
+    assert_eq!(
+        admins_remaining, 1,
+        "deleting one of exactly two admins must leave exactly one"
+    );
+
+    // `b2` is now the sole admin: both guards must refuse it.
+    assert!(svc.delete_user(&b2.id).await.is_err());
+    assert!(svc.set_user_role(&b2.id, Role::Member).await.is_err());
+
+    // Demotion phase, with a fresh pair of exactly two admins (`b2` plus a
+    // newly promoted one): demoting one must succeed, read back as a
+    // member, and leave the other still an admin.
+    let a1 = svc
+        .create_user("users-two-admins-demote-a1", Role::Admin)
+        .await
+        .unwrap();
+    svc.set_user_role(&a1.id, Role::Member).await.unwrap();
+    assert_eq!(
+        store.get_user(&a1.id).await.unwrap().unwrap().role,
+        Role::Member
+    );
+    assert_eq!(
+        store.get_user(&b2.id).await.unwrap().unwrap().role,
+        Role::Admin
+    );
 }

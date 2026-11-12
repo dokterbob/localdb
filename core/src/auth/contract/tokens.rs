@@ -113,20 +113,36 @@ pub async fn rotating_already_rotated_unexpired_token_revokes_family<S: AuthStor
 
 pub async fn rotating_unknown_token_fails_without_revocation<S: AuthStore>(store: Arc<S>) {
     let svc = AuthService::new(store);
+    let user = make_user(&svc, "tokens-unknown-rotate").await;
+    // A live, unrelated session must stay completely unaffected by an
+    // unknown-token rotation attempt — otherwise this case would pass
+    // against a store that revoked something on every rotation call,
+    // known or not.
+    let (live_access, live_refresh) = svc.issue_session(&user.id, None).await.unwrap();
+
     let err = svc.rotate_refresh_token("ldb_totally-unknown-secret").await;
     assert!(matches!(err.unwrap_err(), Error::Unauthorized { .. }));
+
+    assert!(svc.authenticate(&live_access.secret).await.is_ok());
+    assert!(svc.rotate_refresh_token(&live_refresh.secret).await.is_ok());
 }
 
 pub async fn rotating_wrong_kind_token_fails_without_revocation<S: AuthStore>(store: Arc<S>) {
     let svc = AuthService::new(store);
     let user = make_user(&svc, "tokens-wrong-kind").await;
-    let access = svc.issue_access_token(&user.id).await.unwrap();
+    // A family-bearing access token (minted via `issue_session`, not the
+    // family-less `issue_access_token`) so this case also proves the wrong
+    // kind check doesn't key off "has a family_id" — the refresh token
+    // sharing that same family must still rotate normally afterwards.
+    let (access, refresh) = svc.issue_session(&user.id, None).await.unwrap();
 
     let err = svc.rotate_refresh_token(&access.secret).await.unwrap_err();
     assert!(matches!(err, Error::Unauthorized { .. }));
     // Presenting the wrong kind is not reuse evidence: the access token
-    // itself must remain perfectly usable as a bearer credential.
+    // itself must remain perfectly usable as a bearer credential, and the
+    // family's refresh token must still rotate normally afterwards.
     assert!(svc.authenticate(&access.secret).await.is_ok());
+    assert!(svc.rotate_refresh_token(&refresh.secret).await.is_ok());
 }
 
 pub async fn rotating_expired_token_fails_without_revocation<S: AuthStore>(store: Arc<S>) {
@@ -199,13 +215,18 @@ pub async fn rotating_expired_and_rotated_token_fails_without_revocation<S: Auth
 /// make `AuthService` (which treats this as `Err`) behave inconsistently
 /// across stores.
 pub async fn insert_after_family_compromised_refused_identically<S: AuthStore>(store: Arc<S>) {
+    let svc = AuthService::new(store.clone());
+    // A real, persisted user so a refusal here is attributable to the
+    // compromise guard alone, never to an unrelated foreign-key failure
+    // over a random, unknown `user_id`.
+    let user = make_user(&svc, "tokens-compromised-insert-user").await;
     let family = new_ulid();
     store.revoke_compromised_family(&family).await.unwrap();
 
     let minted = mint_secret();
     let row = AuthTokenRow {
         id: new_ulid(),
-        user_id: new_ulid(),
+        user_id: user.id,
         kind: TokenKind::ApiKey,
         secret_hash: minted.hash.clone(),
         expires_at: None,
