@@ -791,6 +791,32 @@ macro_rules! auth_store_contract_tests {
             .await;
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn invites_closed_store_collect_access_request_direct_twice_sequential_succeeds_then_refuses(
+        ) {
+            let (store, _guard) = ($factory)().await;
+            $crate::auth::contract::invites_closed_store::collect_access_request_direct_twice_sequential_succeeds_then_refuses(
+                store,
+            )
+            .await;
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn invites_closed_store_collect_access_request_direct_concurrent_collect_yields_one_credential(
+        ) {
+            let (store, _guard) = ($factory)().await;
+            $crate::auth::contract::invites_closed_store::collect_access_request_direct_concurrent_collect_yields_one_credential(
+                store,
+            )
+            .await;
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn invites_closed_store_approve_vs_deny_direct_concurrent_yields_one_decision() {
+            let (store, _guard) = ($factory)().await;
+            $crate::auth::contract::invites_closed_store::approve_vs_deny_direct_concurrent_yields_one_decision(
+                store,
+            )
+            .await;
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn invites_closed_store_concurrent_closed_redemption_enforces_max_uses() {
             let (store, _guard) = ($factory)().await;
             $crate::auth::contract::invites_closed_store::concurrent_closed_redemption_enforces_max_uses(

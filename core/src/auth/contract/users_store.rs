@@ -185,24 +185,31 @@ pub async fn concurrent_demote_of_two_last_admins_never_reaches_zero<S: AuthStor
 
     let outcome1 = task1.await.unwrap().unwrap();
     let outcome2 = task2.await.unwrap().unwrap();
-    let dones = [outcome1, outcome2]
-        .into_iter()
-        .filter(|o| *o == DemoteOutcome::Done)
-        .count();
+    let mut outcomes = [outcome1, outcome2];
+    outcomes.sort_by_key(|o| matches!(o, DemoteOutcome::LastAdmin));
     assert_eq!(
-        dones, 1,
-        "exactly one of the two racing demotions must succeed"
+        outcomes,
+        [DemoteOutcome::Done, DemoteOutcome::LastAdmin],
+        "the race must yield exactly one Done and one LastAdmin — never NotFound, and never \
+         two Dones"
     );
 
-    let admins_remaining = store
-        .list_users()
-        .await
-        .unwrap()
+    let reloaded_1 = store.get_user(&a1.id).await.unwrap().unwrap();
+    let reloaded_2 = store.get_user(&a2.id).await.unwrap().unwrap();
+    let admins_remaining = [&reloaded_1, &reloaded_2]
         .into_iter()
         .filter(|u| u.role == Role::Admin)
+        .count();
+    let members_remaining = [&reloaded_1, &reloaded_2]
+        .into_iter()
+        .filter(|u| u.role == Role::Member)
         .count();
     assert_eq!(
         admins_remaining, 1,
         "zero admins must never result from the race"
+    );
+    assert_eq!(
+        members_remaining, 1,
+        "the losing racer must actually be demoted to member, not left an admin"
     );
 }

@@ -106,10 +106,28 @@ pub async fn concurrent_consume_same_code_yields_exactly_one_success<S: AuthStor
         }));
     }
     let mut successes = 0u32;
+    let mut refusals = 0u32;
     for h in handles {
-        if h.await.unwrap().unwrap() {
-            successes += 1;
+        match h.await.unwrap() {
+            Ok(true) => successes += 1,
+            Ok(false) => refusals += 1,
+            Err(e) => panic!("unexpected error racing consume_auth_code: {e:?}"),
         }
     }
     assert_eq!(successes, 1, "exactly one concurrent consume must succeed");
+    assert_eq!(
+        refusals,
+        CONTENDERS as u32 - 1,
+        "every other contender must have been refused, not errored"
+    );
+
+    let reloaded = store
+        .find_auth_code_by_hash(&code.code_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reloaded.consumed_at.is_some(),
+        "the code must end up consumed regardless of which contender won"
+    );
 }

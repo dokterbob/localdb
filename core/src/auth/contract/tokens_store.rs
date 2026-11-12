@@ -251,29 +251,68 @@ pub async fn concurrent_rotate_same_refresh_token_yields_one_rotation<S: AuthSto
     let old = refresh_row(&user.id, &family, |_| {});
     store.insert_token(&old).await.unwrap();
 
+    // Prepare every contender's own replacement pair before the barrier, and
+    // keep the ids, so the end state can tell exactly which pair (if any)
+    // the store actually persisted.
     let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS));
     let mut handles = Vec::new();
+    let mut prepared_ids = Vec::new();
     for _ in 0..CONTENDERS {
         let store = store.clone();
         let old = old.clone();
         let barrier = barrier.clone();
+        let (access, refresh) = replacements(&old);
+        let ids = (access.id.clone(), refresh.id.clone());
+        prepared_ids.push(ids.clone());
         handles.push(tokio::spawn(async move {
-            let (access, refresh) = replacements(&old);
             barrier.wait().await;
-            store.rotate_tokens(&old.id, &access, &refresh).await
+            (store.rotate_tokens(&old.id, &access, &refresh).await, ids)
         }));
     }
     let mut rotated = 0u32;
     let mut already_rotated = 0u32;
+    let mut winner_ids = None;
     for h in handles {
-        match h.await.unwrap().unwrap() {
-            RotateOutcome::Rotated => rotated += 1,
+        let (outcome, ids) = h.await.unwrap();
+        match outcome.unwrap() {
+            RotateOutcome::Rotated => {
+                rotated += 1;
+                winner_ids = Some(ids);
+            }
             RotateOutcome::AlreadyRotated => already_rotated += 1,
             other => panic!("unexpected rotation outcome under a concurrent burst: {other:?}"),
         }
     }
     assert_eq!(rotated, 1, "exactly one concurrent rotation must win");
     assert_eq!(already_rotated, CONTENDERS as u32 - 1);
+
+    let reloaded_old = store.find_token(&old.id).await.unwrap().unwrap();
+    assert!(
+        reloaded_old.revoked_at.is_some(),
+        "the old refresh token must end up revoked regardless of which contender won"
+    );
+
+    let (winner_access_id, winner_refresh_id) =
+        winner_ids.expect("the one winning rotation must have replacement ids");
+    for (access_id, refresh_id) in &prepared_ids {
+        let access_exists = store.find_token(access_id).await.unwrap().is_some();
+        let refresh_exists = store.find_token(refresh_id).await.unwrap().is_some();
+        if *access_id == winner_access_id {
+            assert_eq!(
+                *refresh_id, winner_refresh_id,
+                "the prepared access/refresh ids must stay paired"
+            );
+            assert!(
+                access_exists && refresh_exists,
+                "the winner's own replacement pair must be the one persisted"
+            );
+        } else {
+            assert!(
+                !access_exists && !refresh_exists,
+                "a loser's replacement pair must never exist, id {access_id}/{refresh_id}"
+            );
+        }
+    }
 }
 
 /// `mark_token_used` must set `last_used_at` and leave everything else

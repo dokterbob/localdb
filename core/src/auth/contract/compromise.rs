@@ -48,11 +48,39 @@ pub async fn reuse_on_root_revokes_two_levels_of_descendants<S: AuthStore>(store
         .await
         .unwrap();
 
-    // Negative control: an entirely unrelated session and key must survive
-    // the compromise sweep below untouched.
+    // Negative control: an entirely unrelated user's session and key must
+    // survive the compromise sweep below untouched.
     let other = make_user(&svc, "compromise-transitive-unrelated").await;
     let (other_access, _other_refresh) = svc.issue_session(&other.id, None).await.unwrap();
     let other_key = svc.issue_api_key(&other.id).await.unwrap();
+
+    // Negative control scoped to FAMILY rather than USER: an unrelated
+    // session for the SAME user as the one about to be compromised, a key
+    // minted under that unrelated session, and a standalone key with no
+    // session at all. A store that revoked everything belonging to `user`
+    // (instead of following `family_id`/`minted_by_family` ancestry) would
+    // still pass every assertion above, since those only ever touch
+    // `user`'s own rows — these three must survive the sweep even though
+    // they belong to the same account the sweep targets.
+    let (unrelated_access, unrelated_refresh) = svc.issue_session(&user.id, None).await.unwrap();
+    let unrelated_family = unrelated_refresh.row.family_id.clone().unwrap();
+    let unrelated_key = svc
+        .issue_api_key_minted_by(&user.id, Some(unrelated_family))
+        .await
+        .unwrap();
+    let standalone_key = svc.issue_api_key(&user.id).await.unwrap();
+
+    // Positive control for the other side of the same scope distinction: a
+    // key minted for a DIFFERENT user while authenticated by the
+    // soon-to-be-compromised root session (the "admin whose stolen session
+    // minted a key for someone else" case `revoke_compromised_family`'s own
+    // doc comment calls out) must be revoked too, even though it belongs to
+    // `other`, not `user` — a store that scoped revocation to `user`'s
+    // account would miss it.
+    let cross_user_key = svc
+        .issue_api_key_minted_by(&other.id, Some(root_family.clone()))
+        .await
+        .unwrap();
 
     // Legitimate rotation first — the old root refresh secret is still
     // "known" (e.g. to an attacker who captured it earlier) but no longer
@@ -112,9 +140,32 @@ pub async fn reuse_on_root_revokes_two_levels_of_descendants<S: AuthStore>(store
     let err = store.insert_token(&fresh).await.unwrap_err();
     assert!(matches!(err, Error::Unauthorized { .. }));
 
-    // The unrelated session and key are untouched.
+    // The unrelated user's session and key are untouched.
     assert!(svc.authenticate(&other_access.secret).await.is_ok());
     assert!(svc.authenticate(&other_key.secret).await.is_ok());
+
+    // The same-user, different-family controls are untouched — revocation
+    // follows family ancestry, not the account it happens to belong to.
+    assert!(
+        svc.authenticate(&unrelated_access.secret).await.is_ok(),
+        "an unrelated session for the same user, under a different family, must survive"
+    );
+    assert!(
+        svc.authenticate(&unrelated_key.secret).await.is_ok(),
+        "a key minted under an unrelated session for the same user must survive"
+    );
+    assert!(
+        svc.authenticate(&standalone_key.secret).await.is_ok(),
+        "a standalone key with no session ancestry at all must survive"
+    );
+
+    // The cross-user key minted under the compromised session is revoked —
+    // the closure follows the credential's ancestry, reaching into another
+    // user's account, not the compromised user's account as a whole.
+    assert!(
+        svc.authenticate(&cross_user_key.secret).await.is_err(),
+        "a key minted for a different user under the compromised session must be revoked too"
+    );
 }
 
 /// `revoke_compromised_family`'s closure must be computed to a fixed
@@ -171,11 +222,31 @@ pub async fn revoke_compromised_family_direct_reaches_closure_regardless_of_row_
     let leaf = link(&leaf_family, &mid_family);
     let grandleaf = link(&grandleaf_family, &leaf_family);
 
+    // Unrelated-family control: a fifth token, under its own family with no
+    // tie to `root_family` at all, must survive the sweep below — proves
+    // the closure stops at the chain's true boundary rather than, say,
+    // revoking every token the user happens to own.
+    let unrelated_family = new_ulid();
+    let unrelated = AuthTokenRow {
+        id: new_ulid(),
+        user_id: user.id.clone(),
+        kind: TokenKind::Refresh,
+        secret_hash: mint_secret().hash,
+        expires_at: Some(rfc3339_from_now(3600)),
+        last_used_at: None,
+        revoked_at: None,
+        created_at: rfc3339_from_now(0),
+        family_id: Some(unrelated_family),
+        rotated_from: None,
+        minted_by_family: None,
+    };
+
     // Deliberately adversarial order: each row before the one it depends
     // on, ending with `root` itself last.
     store.insert_token(&grandleaf).await.unwrap();
     store.insert_token(&leaf).await.unwrap();
     store.insert_token(&mid).await.unwrap();
+    store.insert_token(&unrelated).await.unwrap();
     store.insert_token(&root).await.unwrap();
 
     store.revoke_compromised_family(&root_family).await.unwrap();
@@ -210,5 +281,15 @@ pub async fn revoke_compromised_family_direct_reaches_closure_regardless_of_row_
             .revoked_at
             .is_some(),
         "the fourth-level family must be reached regardless of insertion order"
+    );
+    assert!(
+        store
+            .find_token(&unrelated.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none(),
+        "a token under an unrelated family must never be revoked by this sweep"
     );
 }
