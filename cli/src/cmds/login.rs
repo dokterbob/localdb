@@ -409,27 +409,25 @@ async fn poll_until_decided(
         // a sane range, and keep polling rather than surfacing an error for
         // a condition this loop caused and can resolve by itself — unless
         // it keeps happening (see `MAX_CONSECUTIVE_RATE_LIMITS`).
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            consecutive_rate_limits += 1;
-            if consecutive_rate_limits >= MAX_CONSECUTIVE_RATE_LIMITS {
+        let retry_after = retry_after_duration(resp.headers());
+        match next_poll_step(status, retry_after, poll_interval, consecutive_rate_limits) {
+            PollStep::GiveUp => {
                 return Err(Error::RateLimited {
                     message: format!(
-                        "the daemon rate-limited this poll {consecutive_rate_limits} times in a \
-                         row; retry login later"
+                        "the daemon rate-limited this poll {MAX_CONSECUTIVE_RATE_LIMITS} times \
+                         in a row; retry login later"
                     ),
                 });
             }
-            // The minimum is `poll_interval` itself (never busy-loop faster
-            // than this login would poll anyway, even on `Retry-After: 0`
-            // or a missing header); the maximum is `MAX_RATE_LIMIT_WAIT`
-            // (never one absurd value away from a login that looks hung).
-            let wait = retry_after_duration(resp.headers())
-                .unwrap_or(poll_interval)
-                .clamp(poll_interval, MAX_RATE_LIMIT_WAIT);
-            tokio::time::sleep(wait).await;
-            continue;
+            PollStep::WaitAndRetry { wait, new_count } => {
+                consecutive_rate_limits = new_count;
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            PollStep::Proceed => {
+                consecutive_rate_limits = 0;
+            }
         }
-        consecutive_rate_limits = 0;
         let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
             return Err(crate::daemon_client::daemon_response_error(status, &body));
@@ -481,6 +479,51 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<std::tim
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
+}
+
+/// What `poll_until_decided`'s loop does next for one poll response. Pure
+/// (no I/O, no clock), so the decision — clamping, the give-up threshold,
+/// the counter reset on a non-429 — is unit-testable without a socket or
+/// paused time.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+enum PollStep {
+    /// Sleep `wait`, then poll again; the loop's consecutive-429 counter
+    /// becomes `new_count`.
+    WaitAndRetry {
+        wait: std::time::Duration,
+        new_count: u32,
+    },
+    /// Too many consecutive `429`s — give up.
+    GiveUp,
+    /// Not rate-limited: interpret the response body; the counter resets.
+    Proceed,
+}
+
+/// Decide the next `PollStep` for a poll response with the given `status`
+/// and parsed `Retry-After` (`retry_after`), given the poll loop's
+/// `poll_interval` and how many `429`s it has already seen in a row
+/// (`consecutive_rate_limits`, before this response).
+fn next_poll_step(
+    status: reqwest::StatusCode,
+    retry_after: Option<std::time::Duration>,
+    poll_interval: std::time::Duration,
+    consecutive_rate_limits: u32,
+) -> PollStep {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return PollStep::Proceed;
+    }
+    let new_count = consecutive_rate_limits + 1;
+    if new_count >= MAX_CONSECUTIVE_RATE_LIMITS {
+        return PollStep::GiveUp;
+    }
+    // The minimum is `poll_interval` itself (never busy-loop faster than
+    // this login would poll anyway, even on `Retry-After: 0` or a missing
+    // header); the maximum is `MAX_RATE_LIMIT_WAIT` (never one absurd value
+    // away from a login that looks hung).
+    let wait = retry_after
+        .unwrap_or(poll_interval)
+        .clamp(poll_interval, MAX_RATE_LIMIT_WAIT);
+    PollStep::WaitAndRetry { wait, new_count }
 }
 
 /// Persist a redeemed invite's API key into `credentials.json` under the
@@ -803,5 +846,7 @@ fn classify_token_error(status: reqwest::StatusCode, message: String) -> Error {
     }
 }
 
+#[cfg(test)]
+mod rate_limit_tests;
 #[cfg(test)]
 mod tests;
