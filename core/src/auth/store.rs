@@ -275,10 +275,11 @@ pub trait AuthStore: Send + Sync + 'static {
     /// Pending first-admin setup; absence never implies an established admin needs recovery.
     async fn pending_bootstrap_user(&self) -> Result<Option<UserRow>, Error>;
     /// Atomically reuse the pending admin or create the first admin and its recovery marker.
-    /// Reject when an established admin already exists. `user.name` is the *desired* name
-    /// (`"admin"`); if a member already holds it, the stored user gets the first unused
-    /// `"admin-2"`, `"admin-3"`, … variant instead (`first_unused_name`) — `users.name` is
-    /// UNIQUE, so insisting on the literal name would make setup unable to complete.
+    /// Reject with `Error::Unauthorized` when an established admin already exists. `user.name`
+    /// is the *desired* name (`"admin"`); if a member already holds it, the stored user gets
+    /// the first unused `"admin-2"`, `"admin-3"`, … variant instead (`first_unused_name`) —
+    /// `users.name` is UNIQUE, so insisting on the literal name would make setup unable to
+    /// complete.
     async fn begin_bootstrap(&self, user: &UserRow) -> Result<UserRow, Error>;
     async fn complete_bootstrap(&self, user_id: &str) -> Result<(), Error>;
     /// Atomically delete `id` unless it is currently the *sole* admin (D7's
@@ -473,3 +474,8 @@ pub use fake::FakeAuthStore;
 
 #[cfg(test)]
 mod tests;
+
+/// Runs the shared `AuthStore` contract suite (`crate::auth::contract`)
+/// against `FakeAuthStore` — see that module's doc comment.
+#[cfg(test)]
+mod contract_tests;
