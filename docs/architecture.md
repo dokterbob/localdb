@@ -285,7 +285,7 @@ agreement), so switching backends needs no reindex. See
 `load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and instead
 `dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads Microsoft's
 official NuGet package `Microsoft.ML.OnnxRuntime` (pinned to 1.24.4), verifies it against a pinned
-sha256, extracts the shared library for the build's target platform (`linux-x64`, `linux-aarch64`,
+sha256, extracts the shared library for the build's target platform (`linux-x64`, `linux-arm64`,
 `osx-arm64`) from it, and embeds that library into the `embed` crate via `include_bytes!`. On first
 construction of any local-ONNX embedder, `embed::ort_runtime::ensure_ort_initialized` extracts that
 embedded library to `<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention;
