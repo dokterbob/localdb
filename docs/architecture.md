@@ -283,16 +283,16 @@ agreement), so switching backends needs no reindex. See
 
 **ONNX Runtime loading (`local-onnx`, all platforms).** `embed`'s `ort` dependency uses the
 `load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and instead
-`dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads _Microsoft's
-official_ ONNX Runtime release (pinned to 1.24.4) for the build's target platform (`linux-x64`,
-`linux-aarch64`, `osx-arm64`), verifies it against a pinned sha256, and embeds it into the `embed`
-crate via `include_bytes!`. On first construction of any local-ONNX embedder,
-`embed::ort_runtime::ensure_ort_initialized` extracts that embedded library to
-`<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention; idempotent — skipped if
-an up-to-date copy is already there) and calls `ort::init_from` on it before any other `ort` API is
-touched. Embedding the runtime grows the `localdb` binary by roughly 12–20 MB depending on platform
-(measured: +11.8 MiB on macOS arm64, where it also replaced the previous statically-linked archive);
-the compressed release tarballs grow less.
+`dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads Microsoft's
+official NuGet package `Microsoft.ML.OnnxRuntime` (pinned to 1.24.4), verifies it against a pinned
+sha256, extracts the shared library for the build's target platform (`linux-x64`, `linux-arm64`,
+`osx-arm64`) from it, and embeds that library into the `embed` crate via `include_bytes!`. On first
+construction of any local-ONNX embedder, `embed::ort_runtime::ensure_ort_initialized` extracts that
+embedded library to `<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention;
+idempotent — skipped if an up-to-date copy is already there) and calls `ort::init_from` on it before
+any other `ort` API is touched. Embedding the runtime grows the `localdb` binary by roughly 12–20 MB
+depending on platform (measured: +11.8 MiB on macOS arm64, where it also replaced the previous
+statically-linked archive); the compressed release tarballs grow less.
 
 Two overrides exist for power users / distro packagers who want to supply their own ONNX Runtime
 instead of the embedded one:

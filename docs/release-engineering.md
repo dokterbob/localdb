@@ -113,9 +113,10 @@ cached under `paths.models`. Nothing is bundled in the binary.
 
 ## Native deps and static-linking guarantees
 
-**ONNX Runtime is embedded, never system-provided** (issue #133): `embed/build.rs` downloads and
-sha256-verifies Microsoft's official build at compile time and embeds it; the binary extracts it to
-the user cache dir on first use (`embed::ort_runtime`). The Homebrew formula deliberately has **no**
+**ONNX Runtime is embedded, never system-provided**: `embed/build.rs` downloads and sha256-verifies
+Microsoft's official NuGet package `Microsoft.ML.OnnxRuntime` at compile time, extracts the target
+platform's shared library from it, and embeds that library; the binary extracts it to the user cache
+dir on first use (`embed::ort_runtime`). The Homebrew formula deliberately has **no**
 `depends_on "onnxruntime"` — brew's onnxruntime bumps every few weeks while `ort` v2 pins 1.24.x,
 and Ubuntu 24.04 has no apt package, so a system-lib approach would fork the build per channel and
 accept untested version skew. Embedded keeps one artifact and one tested combo everywhere.
