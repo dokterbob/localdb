@@ -102,15 +102,16 @@ first if it is wrong.
   API key or license click-through is required. Alternative local model: `model: bge-small-en-v1.5`
   (384-dim, much smaller). Hosted alternatives: `provider: perplexity` with
   `model: pplx-embed-context-v1` (requires API key), or `provider: openai-compatible`.
-- **ONNX Runtime is loaded dynamically, never statically linked** (issue #133): `embed`'s `ort`
-  dependency uses `load-dynamic`, and `embed/build.rs` embeds Microsoft's _official_ ONNX Runtime
-  build (pinned version, sha256-verified) for every `local-onnx` target — Linux x64, Linux aarch64,
-  and macOS aarch64 alike. `embed::ort_runtime::ensure_ort_initialized` extracts it to the user's
-  cache dir and calls `ort::init_from` before any other `ort` API is touched. Never re-enable
-  `ort`'s `download-binaries` or any `api-*` default feature (`embed/Cargo.toml` pins
+- **ONNX Runtime is loaded dynamically, never statically linked**: `embed`'s `ort` dependency uses
+  `load-dynamic`, and `embed/build.rs` downloads Microsoft's official NuGet package
+  `Microsoft.ML.OnnxRuntime` (pinned version, sha256-verified) and extracts the shared library for
+  every `local-onnx` target — Linux x64, Linux aarch64, and macOS aarch64 alike.
+  `embed::ort_runtime::ensure_ort_initialized` extracts it to the user's cache dir and calls
+  `ort::init_from` before any other `ort` API is touched. Never re-enable `ort`'s
+  `download-binaries` or any `api-*` default feature (`embed/Cargo.toml` pins
   `default-features = false` deliberately) — `download-binaries` reintroduces pyke.io's prebuilt
   archive, which gave release binaries a `GLIBC_2.38` floor and broke startup on glibc-2.35 distros
-  (Mint 21, Ubuntu 22.04); see `docs/architecture.md` §"ONNX Runtime loading" and `pykeio/ort#523`.
+  (Mint 21, Ubuntu 22.04); see `docs/architecture.md` §"ONNX Runtime loading".
 - **HTTP daemon is experimental**: reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see
   CLI-indexed data — the daemon opens the same unified `localdb.db` as the CLI, not an in-memory
   store, and there is no separate write-lock (SQLite WAL + `busy_timeout=5000` serialise concurrent
